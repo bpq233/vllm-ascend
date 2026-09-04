@@ -174,6 +174,41 @@ class RejectionSamplerConfig:
 
 
 @config
+class ViaSdConfig:
+    """Configuration for the MRv2 VIA-SD q' observation pass.
+
+    ``layer_ids`` names the target decoder layers retained by q'.  q' is a
+    structural view of the already loaded target model: its parameters are
+    aliases of target parameters and no second checkpoint is loaded.  The
+    feature is observation-only for now; target rejection sampling remains
+    the sole owner of the generated token.
+    """
+
+    enabled: bool = False
+    # Leave empty to retain a deterministic, evenly spaced fraction of the
+    # target layers.  Supplying IDs makes a layer-search result reproducible.
+    layer_ids: list[int] = dataclasses.field(default_factory=list)
+    layer_fraction: float = 0.4
+    # q' attention receives its own physical KV pages when enabled.  Turning
+    # this off runs q' from scratch for every draft block and allocates no q'
+    # KV pages.
+    kv_cache_enabled: bool = True
+    fail_open: bool = True
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if any(layer_id < 0 for layer_id in self.layer_ids):
+            raise ValueError("via_sd_config.layer_ids must contain non-negative layer IDs")
+        if len(set(self.layer_ids)) != len(self.layer_ids):
+            raise ValueError("via_sd_config.layer_ids must not contain duplicates")
+        if self.layer_ids != sorted(self.layer_ids):
+            raise ValueError("via_sd_config.layer_ids must be sorted in ascending order")
+        if not 0 < self.layer_fraction <= 1:
+            raise ValueError("via_sd_config.layer_fraction must be in (0, 1]")
+        return self
+
+
+@config
 class RlConfig:
     """Unified defaults for reinforcement-learning workloads.
 
@@ -264,6 +299,7 @@ class AscendConfig:
     ascend_fusion_config: AscendFusionConfig = dataclasses.field(default_factory=AscendFusionConfig)
     eplb_config: EplbConfig = dataclasses.field(default_factory=EplbConfig)
     rejection_sampler_config: RejectionSamplerConfig = dataclasses.field(default_factory=RejectionSamplerConfig)
+    via_sd_config: ViaSdConfig = dataclasses.field(default_factory=ViaSdConfig)
     rl_config: RlConfig = dataclasses.field(default_factory=RlConfig)
 
     # ---- sub-configs declared later in this module ----

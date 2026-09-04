@@ -73,6 +73,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `enable_transpose_kv_cache_by_block`| bool | `True`  | Whether to enable transpose KV cache by block. Can also be configured via the `VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK` environment variable during the migration period. |
 | `enable_dsa_cp`                     | bool | `False` | Whether to enable dsa_cp for DeepSeek V3.2, DeepSeek V4, and other models with the same architecture. This feature requires sequence parallelism to be enabled.|
 | `rejection_sampler_config`          | dict | `{}`    | Configuration options for rejection sampler (block verify and entropy verify). |
+| `via_sd_config`                     | dict | `{}`    | MRv2 VIA-SD q' side-pass configuration. Disabled by default; q' logits never alter target verification. |
 | `dynamic_spec_config`               | dict | `{}`    | Configuration options for Dynamic Speculative Decoding. See [Dynamic Speculative Decoding](../feature_guide/speculative_decoding.md#dynamic-speculative-decoding). |
 | `multistream_dsv4_dsa_overlap`      | bool | `True`  | Whether to enable dsa multi-stream overlap for DeepSeek V4.  |
 | `rl_config`                        | dict | `{}`    | One-click RL mode configuration. See <a href="#rl_config">rl_config</a> for all fields, the two deployment modes, usage examples, and the migration guide. |
@@ -183,6 +184,27 @@ settings; enabling both selects the combined DyntraLB recompute scheduler.
 | `enable_entropy_verify` | bool  | `False` | Whether to enable entropy verify mode. Entropy verify adjusts the acceptance threshold based on the entropy of the target distribution — higher entropy (uncertain) tokens get a lower threshold (easier to accept), while lower entropy (confident) tokens get a stricter threshold. |
 | `posterior_threshold`   | float | `0.95`  | Upper bound for the entropy-adjusted acceptance threshold. Must be in (0, 1]. The effective threshold is `min(exp(-entropy * posterior_alpha), posterior_threshold)`. |
 | `posterior_alpha`       | float | `0.4`   | Scaling factor for entropy in the threshold computation. Must be >= 0. Higher values make the threshold more sensitive to entropy — high-entropy tokens become much easier to accept, improving performance but reducing precision. |
+
+**via_sd_config**
+
+The MRv2 VIA-SD pass runs after the proposer has produced a draft block. It
+executes a sparse q' view made from layers of the already loaded target model
+and returns per-position logits. It is observation-only in this release: q'
+never rewrites tokens, changes scheduler state, or supplies logits to the
+target rejection sampler.
+
+| Name | Type | Default | Description |
+| ---- | ---- | ------- | ----------- |
+| `enabled` | bool | `False` | Enable the MRv2 q' side pass. |
+| `layer_ids` | list[int] | `[]` | Explicit sorted target decoder layers retained by q'. Empty selects an evenly spaced fraction. |
+| `layer_fraction` | float | `0.4` | Fraction used when `layer_ids` is empty. Must be in `(0, 1]`. |
+| `kv_cache_enabled` | bool | `True` | Allocate and manage separate q' KV pages. When false, run q' from scratch for every block. |
+| `fail_open` | bool | `True` | Disable only q' after a side-pass error and continue target q validation. |
+
+The first adapter supports dense Qwen3 and Qwen2 decoder layers on a single
+pipeline-parallel rank. q' parameters alias the corresponding target
+parameters; no extra model checkpoint is loaded. The runner exposes only
+`get_via_sd_last_logits()` and keeps the target path unchanged.
 
 **dynamic_spec_config**
 

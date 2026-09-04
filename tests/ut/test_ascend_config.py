@@ -38,6 +38,7 @@ from vllm_ascend.ascend_config import (
     SchedulerConfig,
     ShortRequestFirstConfig,
     SparseKVOffloadConfig,
+    ViaSdConfig,
     clear_ascend_config,
     get_ascend_config,
     init_ascend_config,
@@ -177,6 +178,31 @@ class TestAscendConfig(TestBase):
         )
         with self.assertRaisesRegex(ValueError, "load_collection_phase must be one of"):
             EplbConfig(load_collection_phase="prompt")
+
+    def test_via_sd_config_defaults_and_layer_validation(self):
+        defaults = ViaSdConfig()
+        self.assertFalse(defaults.enabled)
+        self.assertEqual(defaults.layer_ids, [])
+        self.assertEqual(defaults.layer_fraction, 0.4)
+        self.assertTrue(defaults.kv_cache_enabled)
+
+        configured = ViaSdConfig(
+            enabled=True,
+            layer_ids=[1, 3],
+            layer_fraction=0.5,
+            kv_cache_enabled=False,
+        )
+        self.assertTrue(configured.enabled)
+        self.assertEqual(configured.layer_ids, [1, 3])
+        self.assertEqual(configured.layer_fraction, 0.5)
+        self.assertFalse(configured.kv_cache_enabled)
+
+        with self.assertRaisesRegex(ValueError, "layer_ids"):
+            ViaSdConfig(layer_ids=[-1])
+        with self.assertRaisesRegex(ValueError, "layer_ids"):
+            ViaSdConfig(layer_ids=[2, 1])
+        with self.assertRaisesRegex(ValueError, "layer_fraction"):
+            ViaSdConfig(layer_fraction=0)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

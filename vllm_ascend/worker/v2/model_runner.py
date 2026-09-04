@@ -24,6 +24,7 @@ import torch
 from vllm.compilation import breakable_cudagraph
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -68,6 +69,7 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffe
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
+from vllm_ascend.worker.v2.spec_decode.via_sd import ViaSdModel, ViaSdVerifier, build_via_sd_model
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
 
@@ -76,6 +78,8 @@ class NPUModelRunner(GPUModelRunner):
     """Model runner for Ascend NPUs."""
 
     execute_model_state: ExecuteModelState | None
+    via_sd_model: ViaSdModel | None
+    via_sd_verifier: ViaSdVerifier | None
 
     @property
     def pcp_manager_cls(self) -> type[AscendPCPManager]:
@@ -157,6 +161,15 @@ class NPUModelRunner(GPUModelRunner):
             device=self.device,
         )
 
+        # VIA-SD is an opt-in, read-only q' side pass.  The structural q' view
+        # is installed in load_model(), before KV-cache planning, so its
+        # optional attention pages are accounted for by MRv2.
+        self.via_sd_model = None
+        self.via_sd_verifier = None
+        self.via_sd_last_logits = None
+        self._via_sd_disabled = False
+        self._via_sd_error_reported = False
+
         # we need to copy num_computed_tokens back to cpu to help
         # update actual seq_lens_cpu. gpu attention backend doesn't need these
         # attributes, cause their attention backends doesn't use seq_lens_cpu.
@@ -180,14 +193,156 @@ class NPUModelRunner(GPUModelRunner):
         set_mc2_mask(vllm_config, self.device)
         set_potential_max_tokens(vllm_config)
 
+    def _via_sd_config(self):
+        return getattr(self.ascend_config, "via_sd_config", None)
+
+    def _via_sd_enabled(self) -> bool:
+        config = self._via_sd_config()
+        return bool(config is not None and getattr(config, "enabled", False))
+
+    def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+        """Load target q, then construct q' without loading another checkpoint."""
+
+        super().load_model(load_dummy_weights=load_dummy_weights, *args, **kwargs)
+        if not self._via_sd_enabled() or self._via_sd_disabled:
+            return
+        if self.speculator is None:
+            logger.warning_once("VIA-SD q' is enabled but no draft speculator is configured; disabling q'.")
+            self._via_sd_disabled = True
+            return
+        try:
+            if self.parallel_config.pipeline_parallel_size != 1:
+                raise NotImplementedError("VIA-SD q' currently requires pipeline_parallel_size=1")
+            if self.lora_config is not None:
+                raise NotImplementedError("VIA-SD q' currently does not support LoRA")
+            if getattr(self.vllm_config, "kv_transfer_config", None) is not None:
+                raise NotImplementedError("VIA-SD q' currently does not support KV transfer")
+            config = self._via_sd_config()
+            assert config is not None
+            self.via_sd_model = build_via_sd_model(
+                self.model,
+                self.vllm_config,
+                config.layer_ids,
+                config.layer_fraction,
+            )
+            logger.info(
+                "VIA-SD q' enabled on MRv2: retained %d/%d target layers (%s), kv_cache=%s",
+                len(self.via_sd_model.layer_ids),
+                len(self.model.model.layers),
+                ",".join(str(index) for index in self.via_sd_model.layer_ids),
+                config.kv_cache_enabled,
+            )
+        except Exception as exc:
+            self._disable_via_sd(str(exc))
+
+    def get_kv_cache_spec(self):
+        specs = super().get_kv_cache_spec()
+        config = self._via_sd_config()
+        if (
+            self.via_sd_model is not None
+            and config is not None
+            and not config.kv_cache_enabled
+        ):
+            qprime_names = set(self.via_sd_model.attention_layer_names)
+            specs = {name: spec for name, spec in specs.items() if name not in qprime_names}
+        return specs
+
     def sample_tokens(self, grammar_output):
+        # The parent clears execute_model_state before returning.  Keep this
+        # batch object so q' can use the same request ordering after propose().
+        input_batch = self.execute_model_state.input_batch if self.execute_model_state is not None else None
         output = super().sample_tokens(grammar_output)
+        if output is not None and input_batch is not None:
+            self._run_via_sd_validation(input_batch)
 
         if self.use_spec_pp and self.is_last_pp_rank:
             assert self.pp_handler is not None
-            # Wait until propose() has populated this step's draft tokens.
             self.pp_handler.broadcast_draft_tokens()
         return output
+
+    def _run_via_sd_validation(self, input_batch) -> None:
+        if self._via_sd_disabled or self.via_sd_verifier is None or not self.is_last_pp_rank:
+            return
+        draft_state = self.req_states.draft_tokens
+        num_reqs = int(input_batch.num_reqs)
+        if num_reqs <= 0 or self.num_speculative_steps <= 0:
+            return
+        idx_mapping = input_batch.idx_mapping[:num_reqs].to(dtype=torch.long)
+        request_indices = [int(index) for index in idx_mapping.detach().cpu().tolist()]
+        request_ids = list(input_batch.req_ids[:num_reqs])
+        draft_tokens = draft_state[idx_mapping]
+        table_indices = list(range(num_reqs))
+
+        lengths = self.req_states.total_len.gpu[idx_mapping]
+        lengths_cpu = [int(length) for length in lengths.detach().cpu().tolist()]
+        prefixes: list[list[int]] = []
+        for state_index, length in zip(request_indices, lengths_cpu):
+            if length <= 0:
+                prefixes.append([])
+                continue
+            tokens = self.req_states.all_token_ids.gpu[state_index, :length]
+            prefixes.append([int(token) for token in tokens.detach().cpu().tolist()])
+
+        # MRv2 has already gathered the current batch block tables for target
+        # attention.  q' uses the same page IDs, while its layer names select
+        # separate physical pages when caching is enabled.
+        block_tables = getattr(self.block_tables, "input_block_tables", None)
+        backend = self.via_sd_verifier.backend
+        setter = getattr(backend, "set_request_block_tables", None)
+        if setter is not None:
+            # ``block_tables`` rows are gathered in batch order, whereas the
+            # allocator's ``num_blocks`` uses request-state indices.
+            setter(block_tables, request_indices=request_indices)
+        try:
+            self.via_sd_last_logits = self.via_sd_verifier.verify(
+                draft_tokens,
+                request_ids=request_ids,
+                request_indices=request_indices,
+                prefix_token_ids=prefixes,
+                valid_lengths=[self.num_speculative_steps] * num_reqs,
+                table_indices=table_indices,
+            )
+        except Exception as exc:
+            config = self._via_sd_config()
+            if config is not None and not config.fail_open:
+                raise
+            self._disable_via_sd(str(exc))
+
+    def _disable_via_sd(self, reason: str) -> None:
+        """Disable only q'; target sampling and rejection remain untouched."""
+
+        if self._via_sd_disabled:
+            return
+        self._via_sd_disabled = True
+        if self.via_sd_verifier is not None:
+            self.via_sd_verifier.clear()
+        if self.via_sd_model is not None:
+            self.via_sd_model.unregister_attention_layers(self.vllm_config)
+        self.via_sd_verifier = None
+        self.via_sd_model = None
+        if not self._via_sd_error_reported:
+            logger.warning(
+                "VIA-SD q' side pass disabled; target verification continues unchanged: %s",
+                reason,
+            )
+            self._via_sd_error_reported = True
+
+    def get_via_sd_last_logits(self):
+        """Return the latest ``[batch, draft_steps, vocab]`` q' logits tensor."""
+
+        return self.via_sd_last_logits
+
+    def shutdown(self) -> None:
+        # Remove q' registrations before the parent clears target model state
+        # and the shared static forward context.
+        if self.via_sd_verifier is not None:
+            self.via_sd_verifier.clear()
+        if self.via_sd_model is not None:
+            self.via_sd_model.unregister_attention_layers(self.vllm_config)
+        self.via_sd_verifier = None
+        self.via_sd_model = None
+        self.via_sd_last_logits = None
+        super().shutdown()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
@@ -196,6 +351,17 @@ class NPUModelRunner(GPUModelRunner):
                 assert isinstance(self.pcp_manager, AscendPCPManager)
                 self.pcp_manager.vllm_config = self.vllm_config
                 self.model_state.pcp_manager = self.pcp_manager
+        if self.via_sd_model is not None and not self._via_sd_disabled:
+            try:
+                config = self._via_sd_config()
+                assert config is not None
+                self.via_sd_verifier = ViaSdVerifier(
+                    self,
+                    self.via_sd_model,
+                    config,
+                )
+            except Exception as exc:
+                self._disable_via_sd(str(exc))
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
 
