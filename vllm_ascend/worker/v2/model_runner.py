@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import time
 from contextlib import contextmanager
 
 import numpy as np
@@ -169,6 +170,8 @@ class NPUModelRunner(GPUModelRunner):
         self.via_sd_last_logits = None
         self._via_sd_disabled = False
         self._via_sd_error_reported = False
+        self._via_sd_qprime_validation_count = 0
+        self._via_sd_target_validation_count = 0
 
         # we need to copy num_computed_tokens back to cpu to help
         # update actual seq_lens_cpu. gpu attention backend doesn't need these
@@ -200,6 +203,14 @@ class NPUModelRunner(GPUModelRunner):
         config = self._via_sd_config()
         return bool(config is not None and getattr(config, "enabled", False))
 
+    def _via_sd_timing_enabled(self) -> bool:
+        config = self._via_sd_config()
+        return bool(
+            config is not None
+            and getattr(config, "enabled", False)
+            and getattr(config, "log_validation_timing", True)
+        )
+
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         """Load target q, then construct q' without loading another checkpoint."""
 
@@ -226,11 +237,13 @@ class NPUModelRunner(GPUModelRunner):
                 config.layer_fraction,
             )
             logger.info(
-                "VIA-SD q' enabled on MRv2: retained %d/%d target layers (%s), kv_cache=%s",
+                "VIA-SD q' enabled on MRv2: retained %d/%d target layers (%s), "
+                "kv_cache=%s, validation_timing=%s",
                 len(self.via_sd_model.layer_ids),
                 len(self.model.model.layers),
                 ",".join(str(index) for index in self.via_sd_model.layer_ids),
                 config.kv_cache_enabled,
+                config.log_validation_timing,
             )
         except Exception as exc:
             self._disable_via_sd(str(exc))
@@ -263,6 +276,16 @@ class NPUModelRunner(GPUModelRunner):
     def _run_via_sd_validation(self, input_batch) -> None:
         if self._via_sd_disabled or self.via_sd_verifier is None or not self.is_last_pp_rank:
             return
+        try:
+            self._run_via_sd_validation_once(input_batch)
+        except Exception as exc:
+            config = self._via_sd_config()
+            if config is not None and not config.fail_open:
+                raise
+            self._disable_via_sd(str(exc))
+
+    def _run_via_sd_validation_once(self, input_batch) -> None:
+        assert self.via_sd_verifier is not None
         draft_state = self.req_states.draft_tokens
         num_reqs = int(input_batch.num_reqs)
         if num_reqs <= 0 or self.num_speculative_steps <= 0:
@@ -293,20 +316,49 @@ class NPUModelRunner(GPUModelRunner):
             # ``block_tables`` rows are gathered in batch order, whereas the
             # allocator's ``num_blocks`` uses request-state indices.
             setter(block_tables, request_indices=request_indices)
-        try:
-            self.via_sd_last_logits = self.via_sd_verifier.verify(
-                draft_tokens,
-                request_ids=request_ids,
-                request_indices=request_indices,
-                prefix_token_ids=prefixes,
-                valid_lengths=[self.num_speculative_steps] * num_reqs,
-                table_indices=table_indices,
-            )
-        except Exception as exc:
-            config = self._via_sd_config()
-            if config is not None and not config.fail_open:
-                raise
-            self._disable_via_sd(str(exc))
+
+        validation_start = None
+        if self._via_sd_timing_enabled():
+            # NPU execution is asynchronous. Synchronizing at both boundaries
+            # makes this a real per-validation latency rather than enqueue time.
+            torch.npu.synchronize()
+            validation_start = time.perf_counter()
+        self.via_sd_last_logits = self.via_sd_verifier.verify(
+            draft_tokens,
+            request_ids=request_ids,
+            request_indices=request_indices,
+            prefix_token_ids=prefixes,
+            table_indices=table_indices,
+        )
+        if validation_start is None:
+            return
+        torch.npu.synchronize()
+        elapsed_ms = (time.perf_counter() - validation_start) * 1000.0
+        self._via_sd_qprime_validation_count += 1
+        stats = self.via_sd_verifier.last_stats
+        logger.info(
+            "[VIA-SD] q' validation #%d: elapsed_ms=%.3f, cache=%s, "
+            "requests=%d, scored_requests=%d, draft_tokens=%d, "
+            "cache_hits=%d, cache_misses=%d, cached_prefix_tokens=%d, "
+            "recomputed_prefix_tokens=%d, model_input_tokens=%d, layers=%d, "
+            "request_ids=%s, draft_token_ids=%s, draft_positions=%s, logits_shape=%s",
+            self._via_sd_qprime_validation_count,
+            elapsed_ms,
+            "on" if stats.cache_enabled else "off",
+            stats.request_count,
+            stats.scored_request_count,
+            stats.draft_tokens,
+            stats.cache_hits,
+            stats.cache_misses,
+            stats.cached_prefix_tokens,
+            stats.recomputed_prefix_tokens,
+            stats.model_input_tokens,
+            len(self.via_sd_model.layer_ids) if self.via_sd_model is not None else 0,
+            stats.request_ids,
+            stats.draft_token_ids,
+            stats.positions,
+            tuple(self.via_sd_last_logits.shape),
+        )
 
     def _disable_via_sd(self, reason: str) -> None:
         """Disable only q'; target sampling and rejection remain untouched."""
@@ -331,6 +383,14 @@ class NPUModelRunner(GPUModelRunner):
         """Return the latest ``[batch, draft_steps, vocab]`` q' logits tensor."""
 
         return self.via_sd_last_logits
+
+    def _discard_via_sd_requests(self, scheduler_output: SchedulerOutput) -> None:
+        if self.via_sd_verifier is None:
+            return
+        request_ids = set(getattr(scheduler_output, "finished_req_ids", None) or ())
+        request_ids.update(getattr(scheduler_output, "preempted_req_ids", None) or ())
+        if request_ids:
+            self.via_sd_verifier.discard(tuple(request_ids))
 
     def shutdown(self) -> None:
         # Remove q' registrations before the parent clears target model state
@@ -376,11 +436,32 @@ class NPUModelRunner(GPUModelRunner):
         context_len: int = 0,
     ):
         self._cpp_execution_time_ms = None
+        if not dummy_run:
+            self._discard_via_sd_requests(scheduler_output)
+
+        scheduled_drafts = getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
+        target_request_ids = tuple(
+            request_id for request_id, tokens in scheduled_drafts.items() if len(tokens) > 0
+        )
+        target_draft_token_ids = tuple(
+            tuple(int(token) for token in scheduled_drafts[request_id])
+            for request_id in target_request_ids
+        )
+        target_draft_tokens = sum(len(tokens) for tokens in target_draft_token_ids)
         profiling_config = self.ascend_config.scheduler_config.profiling_chunk_config
         execution_start_time = _start_profiling_chunk_timing(
             profiling_config,
             scheduler_output,
         )
+        target_validation_start = None
+        if (
+            self._via_sd_timing_enabled()
+            and not dummy_run
+            and not is_profile
+            and target_draft_tokens > 0
+        ):
+            torch.npu.synchronize()
+            target_validation_start = time.perf_counter()
 
         if vllm_version_is("0.27.1"):
             output = super().execute_model(
@@ -398,6 +479,22 @@ class NPUModelRunner(GPUModelRunner):
                 skip_attn_for_dummy_run=skip_attn_for_dummy_run,
                 is_profile=is_profile,
                 context_len=context_len,
+            )
+
+        if target_validation_start is not None:
+            torch.npu.synchronize()
+            elapsed_ms = (time.perf_counter() - target_validation_start) * 1000.0
+            self._via_sd_target_validation_count += 1
+            logger.info(
+                "[VIA-SD] target validation #%d: elapsed_ms=%.3f, "
+                "requests=%d, draft_tokens=%d, request_ids=%s, "
+                "draft_token_ids=%s, scope=execute_model",
+                self._via_sd_target_validation_count,
+                elapsed_ms,
+                len(target_request_ids),
+                target_draft_tokens,
+                target_request_ids,
+                target_draft_token_ids,
             )
 
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(

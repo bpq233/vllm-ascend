@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Hashable, Sequence
+from typing import Hashable
 
 
 @dataclass
@@ -33,6 +34,19 @@ class ViaSdKVCacheManager:
             index += 1
         return index
 
+    @staticmethod
+    def _signature_covers_prefix(
+        stored: tuple[tuple[int, ...], ...] | None,
+        prefix: tuple[tuple[int, ...], ...],
+    ) -> bool:
+        if stored is None or len(stored) != len(prefix):
+            return False
+        return all(
+            len(stored_pages) >= len(prefix_pages)
+            and stored_pages[: len(prefix_pages)] == prefix_pages
+            for stored_pages, prefix_pages in zip(stored, prefix)
+        )
+
     def reusable_prefix(
         self,
         request_id: Hashable,
@@ -46,7 +60,14 @@ class ViaSdKVCacheManager:
         entry = self._entries.get(request_id)
         if entry is None or entry.request_index != request_index:
             return 0
-        if block_signature is not None and entry.block_signature != block_signature:
+        # A growing request normally appends block IDs. Requiring equality
+        # between the old full table and the new full table turns every block
+        # boundary into a false miss. Only the pages covering the candidate
+        # reusable prefix must still be backed by the same physical blocks.
+        if block_signature is not None and not self._signature_covers_prefix(
+            entry.block_signature,
+            block_signature,
+        ):
             return 0
         common = self._common_prefix(entry.tokens, input_tokens)
         return min(common, max_reusable)
@@ -65,12 +86,11 @@ class ViaSdKVCacheManager:
                 block_signature=block_signature,
             )
 
-    def retain(self, request_ids: set[Hashable]) -> None:
+    def discard(self, request_ids: Iterable[Hashable]) -> None:
         if not self.enabled:
             return
-        for request_id in tuple(self._entries):
-            if request_id not in request_ids:
-                del self._entries[request_id]
+        for request_id in request_ids:
+            self._entries.pop(request_id, None)
 
     def clear(self) -> None:
         self._entries.clear()

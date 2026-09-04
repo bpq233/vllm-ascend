@@ -185,17 +185,20 @@ class TestAscendConfig(TestBase):
         self.assertEqual(defaults.layer_ids, [])
         self.assertEqual(defaults.layer_fraction, 0.4)
         self.assertTrue(defaults.kv_cache_enabled)
+        self.assertTrue(defaults.log_validation_timing)
 
         configured = ViaSdConfig(
             enabled=True,
             layer_ids=[1, 3],
             layer_fraction=0.5,
             kv_cache_enabled=False,
+            log_validation_timing=False,
         )
         self.assertTrue(configured.enabled)
         self.assertEqual(configured.layer_ids, [1, 3])
         self.assertEqual(configured.layer_fraction, 0.5)
         self.assertFalse(configured.kv_cache_enabled)
+        self.assertFalse(configured.log_validation_timing)
 
         with self.assertRaisesRegex(ValueError, "layer_ids"):
             ViaSdConfig(layer_ids=[-1])
@@ -203,6 +206,38 @@ class TestAscendConfig(TestBase):
             ViaSdConfig(layer_ids=[2, 1])
         with self.assertRaisesRegex(ValueError, "layer_fraction"):
             ViaSdConfig(layer_fraction=0)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_via_sd_flat_aliases_are_normalized(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "enable_via_sd": True,
+            "via_sd_layer_ids": [0, 3, 5],
+            "via_sd_layer_ratio": 0.5,
+            "via_sd_enable_kv_cache": False,
+            "via_sd_log_validation_timing": False,
+        }
+
+        config = init_ascend_config(test_vllm_config).via_sd_config
+
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.layer_ids, [0, 3, 5])
+        self.assertEqual(config.layer_fraction, 0.5)
+        self.assertFalse(config.kv_cache_enabled)
+        self.assertFalse(config.log_validation_timing)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_via_sd_flat_alias_conflict_is_rejected(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "via_sd_layer_ratio": 0.5,
+            "via_sd_config": {"layer_fraction": 0.4},
+        }
+
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            init_ascend_config(test_vllm_config)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

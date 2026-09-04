@@ -87,9 +87,23 @@ additional_config = {
         "layer_ids": [],
         "layer_fraction": 0.4,
         "kv_cache_enabled": True,
+        "log_validation_timing": True,
     }
 }
 ```
+
+If `layer_ids` is non-empty, it takes precedence and `layer_fraction` is
+ignored. Otherwise, q' rounds `total_layers * layer_fraction` to the nearest
+layer count and spreads those layers across the complete target depth; it does
+not select a prefix of the first N layers. The selection is resolved once when
+the runner loads q'. Changing it while requests are running has no effect;
+recreate or restart the engine to use a new selection.
+
+The flat names from the VIA-SD feature specification are also accepted in
+`additional_config`: `enable_via_sd`, `via_sd_layer_ids`,
+`via_sd_layer_ratio`, `via_sd_enable_kv_cache`, and
+`via_sd_log_validation_timing`. Do not provide a flat name and its nested
+equivalent with different values.
 
 When `kv_cache_enabled` is true, q' attention receives separate physical KV
 pages through MRv2's normal allocator and maintains its own request-prefix
@@ -98,6 +112,23 @@ no q' KV pages are allocated. The latest output is a tensor of shape
 `[batch, draft_steps, vocab]`, available from the MRv2 runner through
 `get_via_sd_last_logits()`. Invalid padded draft positions are filled with
 `-inf`. q' never returns a replacement token to target sampling in this stage.
+
+With VIA-SD enabled, every q' pass and every target forward that verifies a
+draft block emits a synchronized `elapsed_ms` log. The q' log also reports
+`cache_hits`, `cache_misses`, `cached_prefix_tokens`,
+`recomputed_prefix_tokens`, and `model_input_tokens`. The first q' pass for a
+request is necessarily a cold-cache miss, so compare cache on/off from the
+second pass onward and verify that cache-on reduces `model_input_tokens`. The
+q' timer covers `ViaSdVerifier.verify()`; the target timer covers the parent
+runner's complete `execute_model()` call and does not include rejection
+sampling. Since the target verifies the previous draft before the proposer
+creates the next one, match the two log streams by `request_ids` and
+`draft_token_ids`, not by their independent counters. Set
+`log_validation_timing` to false after diagnosis to remove the per-pass
+synchronization overhead.
+
+`kv_cache_enabled` changes only q' work. Target validation uses its original
+KV path in both cases, so similar target timings are expected.
 
 ## Speculating by matching n-grams in the prompt
 

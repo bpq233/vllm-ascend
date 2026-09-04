@@ -193,6 +193,9 @@ class ViaSdConfig:
     # this off runs q' from scratch for every draft block and allocates no q'
     # KV pages.
     kv_cache_enabled: bool = True
+    # Accurate per-pass timing synchronizes the NPU and is intended for the
+    # current observation/debug stage. It can be disabled for throughput runs.
+    log_validation_timing: bool = True
     fail_open: bool = True
 
     @model_validator(mode="after")
@@ -1188,7 +1191,34 @@ def _is_ascend_config_initialized(config: AscendConfig | None) -> bool:
 
 
 def init_ascend_config(vllm_config):
-    additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
+    additional_config = dict(vllm_config.additional_config or {})
+    # The feature specification uses flat VIA-SD names. Normalize them into
+    # the existing typed sub-config instead of maintaining two runtime paths.
+    via_sd_aliases = {
+        "enable_via_sd": "enabled",
+        "via_sd_layer_ids": "layer_ids",
+        "via_sd_layer_ratio": "layer_fraction",
+        "via_sd_enable_kv_cache": "kv_cache_enabled",
+        "via_sd_log_validation_timing": "log_validation_timing",
+    }
+    if any(alias in additional_config for alias in via_sd_aliases):
+        raw_via_sd_config = additional_config.get("via_sd_config", {})
+        if not isinstance(raw_via_sd_config, dict):
+            raise ValueError(
+                "additional_config.via_sd_config must be a dictionary when VIA-SD flat aliases are used"
+            )
+        normalized_via_sd_config = dict(raw_via_sd_config)
+        for alias, field_name in via_sd_aliases.items():
+            if alias not in additional_config:
+                continue
+            alias_value = additional_config.pop(alias)
+            if field_name in normalized_via_sd_config and normalized_via_sd_config[field_name] != alias_value:
+                raise ValueError(
+                    f"additional_config.{alias} conflicts with "
+                    f"additional_config.via_sd_config.{field_name}"
+                )
+            normalized_via_sd_config[field_name] = alias_value
+        additional_config["via_sd_config"] = normalized_via_sd_config
     if "enable_flashcomm1" in additional_config or os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1") is not None:
         logger.warning(
             "FlashComm is deprecated; remove enable_flashcomm1 and "

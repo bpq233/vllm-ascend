@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, Hashable
 
 import torch
@@ -15,6 +16,24 @@ def _as_token_list(tokens: Sequence[int] | torch.Tensor) -> list[int]:
     if isinstance(tokens, torch.Tensor):
         return [int(token) for token in tokens.detach().cpu().flatten().tolist()]
     return [int(token) for token in tokens]
+
+
+@dataclass
+class ViaSdValidationStats:
+    """Work counters for one q' validation call."""
+
+    cache_enabled: bool
+    request_count: int = 0
+    scored_request_count: int = 0
+    draft_tokens: int = 0
+    cached_prefix_tokens: int = 0
+    recomputed_prefix_tokens: int = 0
+    model_input_tokens: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    request_ids: tuple[Hashable, ...] = ()
+    draft_token_ids: tuple[tuple[int, ...], ...] = ()
+    positions: tuple[tuple[int, ...], ...] = ()
 
 
 class ViaSdVerifier:
@@ -39,6 +58,7 @@ class ViaSdVerifier:
         self.max_num_tokens = int(runner.max_num_tokens)
         self.cache = ViaSdKVCacheManager(self.cache_enabled)
         self.backend = backend or ViaSdPagedBackend(runner, model, self.cache_enabled)
+        self.last_stats = ViaSdValidationStats(cache_enabled=self.cache_enabled)
 
     @staticmethod
     def build_scoring_input(
@@ -67,34 +87,50 @@ class ViaSdVerifier:
         draft_tokens: Sequence[int],
         valid_length: int | None = None,
         table_index: int | None = None,
+        stats: ViaSdValidationStats | None = None,
     ) -> torch.Tensor | None:
+        sentinel_length = self._valid_length(draft_tokens)
         valid_length = (
-            self._valid_length(draft_tokens)
+            sentinel_length
             if valid_length is None
-            else max(0, min(int(valid_length), len(draft_tokens)))
+            else min(sentinel_length, max(0, min(int(valid_length), len(draft_tokens))))
         )
         if valid_length <= 0:
             return None
         draft = list(draft_tokens[:valid_length])
         input_tokens, score_start = self.build_scoring_input(prefix_tokens, draft)
         table_index = request_index if table_index is None else int(table_index)
-        signature_fn = getattr(self.backend, "block_signature", None)
-        block_signature = (
-            signature_fn(table_index, len(input_tokens)) if signature_fn is not None else None
-        )
         if not self.cache_enabled:
             logits = self.backend.forward(input_tokens, 0, table_index, return_logits=True)
             if logits is None:
                 raise RuntimeError("q' backend returned no logits")
+            if stats is not None:
+                stats.recomputed_prefix_tokens += score_start
+                stats.model_input_tokens += len(input_tokens)
             return logits[score_start : score_start + valid_length]
 
+        signature_fn = getattr(self.backend, "block_signature", None)
+        # Find the logical token match first, then validate only the physical
+        # pages that cover that match. Comparing full page tables makes an
+        # append at a block boundary look like a cache invalidation.
         cached = self.cache.reusable_prefix(
             request_id,
             request_index,
             input_tokens,
             score_start,
-            block_signature=block_signature,
         )
+        if cached > 0 and signature_fn is not None:
+            prefix_signature = signature_fn(table_index, cached)
+            if prefix_signature is None:
+                cached = 0
+            else:
+                cached = self.cache.reusable_prefix(
+                    request_id,
+                    request_index,
+                    input_tokens,
+                    cached,
+                    block_signature=prefix_signature,
+                )
         cursor = cached
         while cursor < score_start:
             chunk_end = min(score_start, cursor + self.max_num_tokens)
@@ -114,7 +150,18 @@ class ViaSdVerifier:
         )
         if logits is None:
             raise RuntimeError("q' backend returned no logits")
+        block_signature = (
+            signature_fn(table_index, len(input_tokens)) if signature_fn is not None else None
+        )
         self.cache.commit(request_id, request_index, input_tokens, block_signature=block_signature)
+        if stats is not None:
+            stats.cached_prefix_tokens += cached
+            stats.recomputed_prefix_tokens += score_start - cached
+            stats.model_input_tokens += len(input_tokens) - cached
+            if cached > 0:
+                stats.cache_hits += 1
+            else:
+                stats.cache_misses += 1
         return logits[:valid_length]
 
     @torch.inference_mode()
@@ -138,8 +185,35 @@ class ViaSdVerifier:
             raise ValueError("q' table-index metadata does not match draft-token batch")
 
         draft_cpu = draft_token_ids.detach().cpu().tolist()
+        sentinel_lengths = [self._valid_length(tokens) for tokens in draft_cpu]
+        resolved_valid_lengths = [
+            sentinel_length
+            if valid_lengths is None
+            else min(
+                sentinel_length,
+                max(0, min(int(valid_lengths[row]), len(draft_cpu[row]))),
+            )
+            for row, sentinel_length in enumerate(sentinel_lengths)
+        ]
+        stats = ViaSdValidationStats(
+            cache_enabled=self.cache_enabled,
+            request_count=batch,
+            scored_request_count=sum(length > 0 for length in resolved_valid_lengths),
+            draft_tokens=sum(resolved_valid_lengths),
+            request_ids=tuple(request_ids),
+            draft_token_ids=tuple(
+                tuple(int(token) for token in tokens[: resolved_valid_lengths[row]])
+                for row, tokens in enumerate(draft_cpu)
+            ),
+            positions=tuple(
+                tuple(range(len(prefix_token_ids[row]), len(prefix_token_ids[row]) + length))
+                if length > 0 and len(prefix_token_ids[row]) > 0
+                else ()
+                for row, length in enumerate(resolved_valid_lengths)
+            ),
+        )
+        self.last_stats = stats
         rows: list[torch.Tensor | None] = []
-        active_ids = set(request_ids)
         for row in range(batch):
             rows.append(
                 self._score_request(
@@ -147,11 +221,11 @@ class ViaSdVerifier:
                     int(request_indices[row]),
                     prefix_token_ids[row],
                     draft_cpu[row],
-                    None if valid_lengths is None else int(valid_lengths[row]),
+                    resolved_valid_lengths[row],
                     None if table_indices is None else int(table_indices[row]),
+                    stats=stats,
                 )
             )
-        self.cache.retain(active_ids)
 
         vocab_size = int(self.runner.vocab_size)
         dtype = next((row.dtype for row in rows if row is not None), torch.float32)
@@ -170,5 +244,8 @@ class ViaSdVerifier:
     def clear(self) -> None:
         self.cache.clear()
 
+    def discard(self, request_ids: Sequence[Hashable]) -> None:
+        self.cache.discard(request_ids)
 
-__all__ = ["ViaSdVerifier"]
+
+__all__ = ["ViaSdValidationStats", "ViaSdVerifier"]
