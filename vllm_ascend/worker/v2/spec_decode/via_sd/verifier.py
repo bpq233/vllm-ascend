@@ -18,6 +18,17 @@ def _as_token_list(tokens: Sequence[int] | torch.Tensor) -> list[int]:
     return [int(token) for token in tokens]
 
 
+def normalize_draft_tokens(tokens: Sequence[int] | torch.Tensor) -> tuple[int, ...]:
+    """Return the real draft prefix before the ``-1`` padding sentinel."""
+
+    normalized: list[int] = []
+    for token in _as_token_list(tokens):
+        if token < 0:
+            break
+        normalized.append(token)
+    return tuple(normalized)
+
+
 @dataclass
 class ViaSdValidationStats:
     """Work counters for one q' validation call."""
@@ -72,12 +83,7 @@ class ViaSdVerifier:
 
     @staticmethod
     def _valid_length(tokens: Sequence[int]) -> int:
-        length = 0
-        for token in tokens:
-            if token < 0:
-                break
-            length += 1
-        return length
+        return len(normalize_draft_tokens(tokens))
 
     def _score_request(
         self,
@@ -398,4 +404,4 @@ class ViaSdVerifier:
         self.cache.discard(request_ids)
 
 
-__all__ = ["ViaSdValidationStats", "ViaSdVerifier"]
+__all__ = ["ViaSdValidationStats", "ViaSdVerifier", "normalize_draft_tokens"]

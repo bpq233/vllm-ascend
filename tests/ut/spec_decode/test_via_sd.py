@@ -4,7 +4,15 @@ import torch
 
 from vllm_ascend.worker.v2.spec_decode.via_sd.kv_cache import ViaSdKVCacheManager
 from vllm_ascend.worker.v2.spec_decode.via_sd.model import resolve_layer_ids
-from vllm_ascend.worker.v2.spec_decode.via_sd.verifier import ViaSdVerifier
+from vllm_ascend.worker.v2.spec_decode.via_sd.verifier import (
+    ViaSdVerifier,
+    normalize_draft_tokens,
+)
+
+
+def test_via_sd_normalizes_scheduler_padding_without_dropping_real_tokens():
+    assert normalize_draft_tokens([-1, -1]) == ()
+    assert normalize_draft_tokens([4, 5, -1, -1]) == (4, 5)
 
 
 def test_resolve_layer_ids_uses_evenly_spaced_fraction_and_explicit_override():

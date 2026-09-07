@@ -70,7 +70,12 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffe
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
-from vllm_ascend.worker.v2.spec_decode.via_sd import ViaSdModel, ViaSdVerifier, build_via_sd_model
+from vllm_ascend.worker.v2.spec_decode.via_sd import (
+    ViaSdModel,
+    ViaSdVerifier,
+    build_via_sd_model,
+    normalize_draft_tokens,
+)
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
 
@@ -224,6 +229,16 @@ class NPUModelRunner(GPUModelRunner):
             and getattr(config, "log_enabled", True)
         )
 
+    @staticmethod
+    def _via_sd_real_drafts(scheduled_drafts) -> dict[object, tuple[int, ...]]:
+        """Drop scheduler padding and retain only real draft-token prefixes."""
+
+        return {
+            request_id: valid_tokens
+            for request_id, tokens in scheduled_drafts.items()
+            if (valid_tokens := normalize_draft_tokens(tokens))
+        }
+
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         """Load target q, then construct q' without loading another checkpoint."""
 
@@ -316,7 +331,7 @@ class NPUModelRunner(GPUModelRunner):
         scheduled_drafts: dict[object, tuple[int, ...]] | None = None,
     ) -> None:
         assert self.via_sd_verifier is not None
-        scheduled_drafts = (
+        scheduled_drafts = self._via_sd_real_drafts(
             self._via_sd_pending_target_drafts
             if scheduled_drafts is None
             else scheduled_drafts
@@ -330,9 +345,9 @@ class NPUModelRunner(GPUModelRunner):
             request_id: row for row, request_id in enumerate(batch_request_ids)
         }
         selected = [
-            (row, request_id, tuple(int(token) for token in scheduled_drafts[request_id]))
+            (row, request_id, scheduled_drafts[request_id])
             for request_id in batch_request_ids
-            if request_id in scheduled_drafts and scheduled_drafts[request_id]
+            if request_id in scheduled_drafts
             for row in [batch_rows[request_id]]
         ]
         if not selected:
@@ -537,19 +552,12 @@ class NPUModelRunner(GPUModelRunner):
             self._discard_via_sd_requests(scheduler_output)
 
         scheduled_drafts = getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
-        target_request_ids = tuple(
-            request_id for request_id, tokens in scheduled_drafts.items() if len(tokens) > 0
-        )
-        target_draft_token_ids = tuple(
-            tuple(int(token) for token in scheduled_drafts[request_id])
-            for request_id in target_request_ids
-        )
+        real_scheduled_drafts = self._via_sd_real_drafts(scheduled_drafts)
+        target_request_ids = tuple(real_scheduled_drafts)
+        target_draft_token_ids = tuple(real_scheduled_drafts.values())
         target_draft_tokens = sum(len(tokens) for tokens in target_draft_token_ids)
         if not dummy_run and not is_profile:
-            self._via_sd_pending_target_drafts = {
-                request_id: tokens
-                for request_id, tokens in zip(target_request_ids, target_draft_token_ids)
-            }
+            self._via_sd_pending_target_drafts = real_scheduled_drafts
         else:
             self._via_sd_pending_target_drafts = {}
         profiling_config = self.ascend_config.scheduler_config.profiling_chunk_config
