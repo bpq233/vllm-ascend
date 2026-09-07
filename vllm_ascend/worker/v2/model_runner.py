@@ -553,9 +553,12 @@ class NPUModelRunner(GPUModelRunner):
 
         scheduled_drafts = getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
         real_scheduled_drafts = self._via_sd_real_drafts(scheduled_drafts)
-        target_request_ids = tuple(real_scheduled_drafts)
-        target_draft_token_ids = tuple(real_scheduled_drafts.values())
-        target_draft_tokens = sum(len(tokens) for tokens in target_draft_token_ids)
+        target_request_ids = tuple(scheduled_drafts.keys())
+
+        target_draft_tokens = sum(
+            len(tokens)
+            for tokens in scheduled_drafts.values()
+        )
         if not dummy_run and not is_profile:
             self._via_sd_pending_target_drafts = real_scheduled_drafts
         else:
@@ -603,13 +606,12 @@ class NPUModelRunner(GPUModelRunner):
                 logger.info(
                     "[VIA-SD] target validation #%d: elapsed_ms=%s, "
                     "requests=%d, draft_tokens=%d, request_ids=%s, "
-                    "draft_token_ids=%s, scope=execute_model",
+                    "scope=execute_model",
                     self._via_sd_target_validation_count,
                     "disabled" if elapsed_ms is None else f"{elapsed_ms:.3f}",
                     len(target_request_ids),
                     target_draft_tokens,
                     target_request_ids,
-                    target_draft_token_ids,
                 )
 
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
@@ -692,11 +694,6 @@ class NPUModelRunner(GPUModelRunner):
                 expanded_idx_mapping = idx_mapping
                 expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
             else:
-                num_draft_tokens_per_req = np.fromiter(
-                    (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
-                    dtype=np.int32,
-                    count=num_reqs,
-                )
                 num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
                 total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
                 total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
@@ -914,6 +911,41 @@ class NPUModelRunner(GPUModelRunner):
                     dtype=np.int32,
                     count=num_reqs,
                 )
+                if self._via_sd_enabled():
+                    real_drafts = {}
+
+                    for batch_row, req_id in enumerate(req_ids):
+                        num_drafts = int(
+                            num_draft_tokens_per_req[batch_row]
+                        )
+
+                        if num_drafts <= 0:
+                            continue
+
+                        state_index = int(
+                            idx_mapping_np[batch_row]
+                        )
+
+                        tokens = (
+                            self.req_states.draft_tokens[
+                                state_index, :num_drafts
+                            ]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        )
+
+                        real_drafts[req_id] = tuple(
+                            int(token) for token in tokens
+                        )
+
+                    self._via_sd_pending_target_drafts = real_drafts
+
+                    # logger.warning(
+                    #     "[VIA DEBUG] real worker drafts1=%s",
+                    #     real_drafts,
+                    # )
+                # ===== VIA-SD end =====
                 num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
                 total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
                 total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
