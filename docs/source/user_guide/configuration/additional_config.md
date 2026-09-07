@@ -200,6 +200,7 @@ target rejection sampler.
 | `layer_fraction` | float | `0.4` | Fraction used when `layer_ids` is empty. Must be in `(0, 1]`. |
 | `kv_cache_enabled` | bool | `True` | Allocate and manage separate q' KV pages. When false, run q' from scratch for every block. |
 | `log_validation_timing` | bool | `True` | Log synchronized per-pass q' and target validation latency. Disable after diagnosis to avoid synchronization overhead. |
+| `log_enabled` | bool | `True` | Emit VIA-SD q' and target validation statistics. Set false to suppress these logs; validation itself is unchanged. |
 | `fail_open` | bool | `True` | Disable only q' after a side-pass error and continue target q validation. |
 
 When `layer_ids` is non-empty it takes precedence over `layer_fraction`.
@@ -208,8 +209,9 @@ the full target depth, not from the first N layers. The resolved layer set is
 fixed when q' is loaded; restart the engine to change it. Flat aliases
 `enable_via_sd`, `via_sd_layer_ids`, `via_sd_layer_ratio`,
 `via_sd_enable_kv_cache`, and `via_sd_log_validation_timing` are accepted at
-the top level of `additional_config`. Conflicting flat and nested values are
-rejected.
+the top level of `additional_config`. `via_sd_log_enabled` (or
+`via_sd_enable_log`) controls VIA-SD log output independently of timing.
+Conflicting flat and nested values are rejected.
 
 The first adapter supports dense Qwen3 and Qwen2 decoder layers on a single
 pipeline-parallel rank. q' parameters alias the corresponding target

@@ -65,7 +65,8 @@ vllm serve path/to/target/model \
 
 ## VIA-SD q' observation pass on MRv2
 
-MRv2 can run an optional q' side pass after the proposer writes a draft block.
+MRv2 can run an optional q' side pass for the same draft block scheduled for
+target verification.
 The first implementation is a sparse view of the already loaded target model:
 it reuses target parameters, embedding, and output head, and does not load a
 second checkpoint. q' logits are observation-only. The existing target forward,
@@ -88,6 +89,7 @@ additional_config = {
         "layer_fraction": 0.4,
         "kv_cache_enabled": True,
         "log_validation_timing": True,
+        "log_enabled": True,
     }
 }
 ```
@@ -102,8 +104,9 @@ recreate or restart the engine to use a new selection.
 The flat names from the VIA-SD feature specification are also accepted in
 `additional_config`: `enable_via_sd`, `via_sd_layer_ids`,
 `via_sd_layer_ratio`, `via_sd_enable_kv_cache`, and
-`via_sd_log_validation_timing`. Do not provide a flat name and its nested
-equivalent with different values.
+`via_sd_log_validation_timing`. `via_sd_log_enabled` (or
+`via_sd_enable_log`) controls VIA-SD log output independently. Do not provide
+a flat name and its nested equivalent with different values.
 
 When `kv_cache_enabled` is true, q' attention receives separate physical KV
 pages through MRv2's normal allocator and maintains its own request-prefix
@@ -121,11 +124,11 @@ request is necessarily a cold-cache miss, so compare cache on/off from the
 second pass onward and verify that cache-on reduces `model_input_tokens`. The
 q' timer covers `ViaSdVerifier.verify()`; the target timer covers the parent
 runner's complete `execute_model()` call and does not include rejection
-sampling. Since the target verifies the previous draft before the proposer
-creates the next one, match the two log streams by `request_ids` and
-`draft_token_ids`, not by their independent counters. Set
-`log_validation_timing` to false after diagnosis to remove the per-pass
-synchronization overhead.
+sampling. q' consumes the same scheduled request/draft block as the target,
+so the two counters should advance together when both passes succeed. Set
+`log_enabled` to false to suppress VIA-SD statistics; set
+`log_validation_timing` to false separately to keep logs without the
+per-pass synchronization overhead.
 
 `kv_cache_enabled` changes only q' work. Target validation uses its original
 KV path in both cases, so similar target timings are expected.

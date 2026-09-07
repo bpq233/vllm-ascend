@@ -186,6 +186,7 @@ class TestAscendConfig(TestBase):
         self.assertEqual(defaults.layer_fraction, 0.4)
         self.assertTrue(defaults.kv_cache_enabled)
         self.assertTrue(defaults.log_validation_timing)
+        self.assertTrue(defaults.log_enabled)
 
         configured = ViaSdConfig(
             enabled=True,
@@ -193,12 +194,14 @@ class TestAscendConfig(TestBase):
             layer_fraction=0.5,
             kv_cache_enabled=False,
             log_validation_timing=False,
+            log_enabled=False,
         )
         self.assertTrue(configured.enabled)
         self.assertEqual(configured.layer_ids, [1, 3])
         self.assertEqual(configured.layer_fraction, 0.5)
         self.assertFalse(configured.kv_cache_enabled)
         self.assertFalse(configured.log_validation_timing)
+        self.assertFalse(configured.log_enabled)
 
         with self.assertRaisesRegex(ValueError, "layer_ids"):
             ViaSdConfig(layer_ids=[-1])
@@ -217,6 +220,7 @@ class TestAscendConfig(TestBase):
             "via_sd_layer_ratio": 0.5,
             "via_sd_enable_kv_cache": False,
             "via_sd_log_validation_timing": False,
+            "via_sd_log_enabled": False,
         }
 
         config = init_ascend_config(test_vllm_config).via_sd_config
@@ -226,6 +230,7 @@ class TestAscendConfig(TestBase):
         self.assertEqual(config.layer_fraction, 0.5)
         self.assertFalse(config.kv_cache_enabled)
         self.assertFalse(config.log_validation_timing)
+        self.assertFalse(config.log_enabled)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

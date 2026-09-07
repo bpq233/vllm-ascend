@@ -164,6 +164,140 @@ class ViaSdVerifier:
                 stats.cache_misses += 1
         return logits[:valid_length]
 
+    def _score_batch(
+        self,
+        request_ids: Sequence[Hashable],
+        request_indices: Sequence[int],
+        prefix_token_ids: Sequence[Sequence[int]],
+        draft_cpu: Sequence[Sequence[int]],
+        resolved_valid_lengths: Sequence[int],
+        table_indices: Sequence[int],
+        stats: ViaSdValidationStats,
+    ) -> list[torch.Tensor | None]:
+        """Score all non-empty rows with one packed backend invocation."""
+
+        signature_fn = getattr(self.backend, "block_signature", None)
+        prepared: list[dict[str, Any]] = []
+        rows: list[torch.Tensor | None] = [None] * len(request_ids)
+        for row, valid_length in enumerate(resolved_valid_lengths):
+            if valid_length <= 0:
+                continue
+            input_tokens, score_start = self.build_scoring_input(
+                prefix_token_ids[row], draft_cpu[row][:valid_length]
+            )
+            table_index = int(table_indices[row])
+            if self.cache_enabled:
+                cached = self.cache.reusable_prefix(
+                    request_ids[row],
+                    int(request_indices[row]),
+                    input_tokens,
+                    score_start,
+                )
+                if cached > 0 and signature_fn is not None:
+                    prefix_signature = signature_fn(table_index, cached)
+                    if prefix_signature is None:
+                        cached = 0
+                    else:
+                        cached = self.cache.reusable_prefix(
+                            request_ids[row],
+                            int(request_indices[row]),
+                            input_tokens,
+                            cached,
+                            block_signature=prefix_signature,
+                        )
+                start = cached
+            else:
+                cached = 0
+                start = 0
+            prepared.append(
+                {
+                    "row": row,
+                    "input_tokens": input_tokens,
+                    "score_start": score_start,
+                    "start": start,
+                    "cached": cached,
+                    "table_index": table_index,
+                }
+            )
+
+        if not prepared:
+            return rows
+        # A cold long-context request may need several warm-up chunks. Keep
+        # that established path instead of exceeding MRv2's per-forward or
+        # total batched-token budget; normal decode batches still take the
+        # single ragged forward below.
+        batch_token_limit = self.max_num_tokens
+        batch_token_count = sum(
+            len(entry["input_tokens"]) - entry["start"] for entry in prepared
+        )
+        if (
+            any(
+                len(entry["input_tokens"]) - entry["start"] > batch_token_limit
+                for entry in prepared
+            )
+            or batch_token_count > batch_token_limit
+        ):
+            for entry in prepared:
+                row = entry["row"]
+                rows[row] = self._score_request(
+                    request_ids[row],
+                    int(request_indices[row]),
+                    prefix_token_ids[row],
+                    draft_cpu[row],
+                    resolved_valid_lengths[row],
+                    entry["table_index"],
+                    stats=stats,
+                )
+            return rows
+        outputs = self.backend.forward_batch(
+            [entry["input_tokens"][entry["start"] :] for entry in prepared],
+            [entry["start"] for entry in prepared],
+            [entry["table_index"] for entry in prepared],
+        )
+        if len(outputs) != len(prepared):
+            raise RuntimeError(
+                "q' backend returned an unexpected number of ragged batch outputs: "
+                f"expected={len(prepared)}, got={len(outputs)}"
+            )
+        for entry, logits in zip(prepared, outputs):
+            if logits is None:
+                raise RuntimeError("q' backend returned no logits for a ragged batch row")
+            local_score_start = entry["score_start"] - entry["start"]
+            valid_length = resolved_valid_lengths[entry["row"]]
+            row_logits = logits[local_score_start : local_score_start + valid_length]
+            if row_logits.shape[0] < valid_length:
+                raise RuntimeError(
+                    "q' backend returned too few logits for a ragged batch row: "
+                    f"expected={valid_length}, got={row_logits.shape[0]}"
+                )
+            rows[entry["row"]] = row_logits
+
+            if self.cache_enabled:
+                block_signature = (
+                    signature_fn(entry["table_index"], len(entry["input_tokens"]))
+                    if signature_fn is not None
+                    else None
+                )
+                self.cache.commit(
+                    request_ids[entry["row"]],
+                    int(request_indices[entry["row"]]),
+                    entry["input_tokens"],
+                    block_signature=block_signature,
+                )
+                stats.cached_prefix_tokens += entry["cached"]
+                stats.recomputed_prefix_tokens += (
+                    entry["score_start"] - entry["cached"]
+                )
+                stats.model_input_tokens += len(entry["input_tokens"]) - entry["cached"]
+                if entry["cached"] > 0:
+                    stats.cache_hits += 1
+                else:
+                    stats.cache_misses += 1
+            else:
+                stats.recomputed_prefix_tokens += entry["score_start"]
+                stats.model_input_tokens += len(entry["input_tokens"])
+        return rows
+
     @torch.inference_mode()
     def verify(
         self,
@@ -213,19 +347,35 @@ class ViaSdVerifier:
             ),
         )
         self.last_stats = stats
-        rows: list[torch.Tensor | None] = []
-        for row in range(batch):
-            rows.append(
-                self._score_request(
-                    request_ids[row],
-                    int(request_indices[row]),
-                    prefix_token_ids[row],
-                    draft_cpu[row],
-                    resolved_valid_lengths[row],
-                    None if table_indices is None else int(table_indices[row]),
-                    stats=stats,
-                )
+        resolved_table_indices = (
+            [int(index) for index in table_indices]
+            if table_indices is not None
+            else [int(index) for index in request_indices]
+        )
+        if hasattr(self.backend, "forward_batch"):
+            rows = self._score_batch(
+                request_ids,
+                request_indices,
+                prefix_token_ids,
+                draft_cpu,
+                resolved_valid_lengths,
+                resolved_table_indices,
+                stats,
             )
+        else:
+            rows = []
+            for row in range(batch):
+                rows.append(
+                    self._score_request(
+                        request_ids[row],
+                        int(request_indices[row]),
+                        prefix_token_ids[row],
+                        draft_cpu[row],
+                        resolved_valid_lengths[row],
+                        resolved_table_indices[row],
+                        stats=stats,
+                    )
+                )
 
         vocab_size = int(self.runner.vocab_size)
         dtype = next((row.dtype for row in rows if row is not None), torch.float32)

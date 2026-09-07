@@ -53,6 +53,24 @@ class _FakeBackend:
         return rows[:, None].expand(-1, 5)
 
 
+class _FakeBatchBackend:
+    def __init__(self):
+        self.batch_calls = []
+
+    def block_signature(self, table_index, end):
+        num_pages = (end + 3) // 4
+        return ((table_index, *range(num_pages)),)
+
+    def forward_batch(self, token_ids, starts, table_indices):
+        self.batch_calls.append(
+            ([list(tokens) for tokens in token_ids], list(starts), list(table_indices))
+        )
+        return [
+            torch.arange(start, start + len(tokens), dtype=torch.float32)[:, None].expand(-1, 5)
+            for tokens, start in zip(token_ids, starts)
+        ]
+
+
 def test_via_sd_verifier_returns_only_aligned_per_position_logits():
     backend = _FakeBackend()
     runner = SimpleNamespace(max_num_tokens=16, vocab_size=5, device=torch.device("cpu"))
@@ -73,6 +91,37 @@ def test_via_sd_verifier_returns_only_aligned_per_position_logits():
     # input = prefix + draft[:-1], so rows 2, 3, 4 predict draft[0:3].
     assert torch.equal(logits[0, :, 0], torch.tensor([2.0, 3.0, 4.0]))
     assert all(len(call) == 4 for call in backend.calls)
+
+
+def test_via_sd_verifier_packs_ragged_batch_into_one_backend_call():
+    backend = _FakeBatchBackend()
+    runner = SimpleNamespace(max_num_tokens=16, vocab_size=5, device=torch.device("cpu"))
+    verifier = ViaSdVerifier(
+        runner,
+        object(),
+        SimpleNamespace(kv_cache_enabled=True),
+        backend=backend,
+    )
+
+    logits = verifier.verify(
+        torch.tensor([[4, 5, 6], [7, 8, -1]], dtype=torch.int64),
+        request_ids=["r0", "r1"],
+        request_indices=[0, 1],
+        prefix_token_ids=[[10, 11, 12], [20, 21]],
+        valid_lengths=[3, 2],
+        table_indices=[0, 1],
+    )
+
+    assert len(backend.batch_calls) == 1
+    assert backend.batch_calls[0] == (
+        [[10, 11, 12, 4, 5], [20, 21, 7]],
+        [0, 0],
+        [0, 1],
+    )
+    assert logits.shape == (2, 3, 5)
+    assert torch.equal(logits[0, :, 0], torch.tensor([2.0, 3.0, 4.0]))
+    assert torch.equal(logits[1, :2, 0], torch.tensor([1.0, 2.0]))
+    assert torch.isneginf(logits[1, 2]).all()
 
 
 def test_via_sd_cache_reuses_warm_prefix_and_matches_cache_off_logits():

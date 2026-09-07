@@ -231,6 +231,7 @@ def build_attn_metadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             seq_lens=seq_lens[:num_reqs],
             num_reqs=num_reqs,

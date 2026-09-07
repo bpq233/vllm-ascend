@@ -172,6 +172,10 @@ class NPUModelRunner(GPUModelRunner):
         self._via_sd_error_reported = False
         self._via_sd_qprime_validation_count = 0
         self._via_sd_target_validation_count = 0
+        # ``sample_tokens`` runs after the parent target forward.  Keep the
+        # exact draft block scheduled for that forward so q' never validates
+        # a stale block produced for the next iteration.
+        self._via_sd_pending_target_drafts: dict[object, tuple[int, ...]] = {}
 
         # we need to copy num_computed_tokens back to cpu to help
         # update actual seq_lens_cpu. gpu attention backend doesn't need these
@@ -208,7 +212,16 @@ class NPUModelRunner(GPUModelRunner):
         return bool(
             config is not None
             and getattr(config, "enabled", False)
+            and getattr(config, "log_enabled", True)
             and getattr(config, "log_validation_timing", True)
+        )
+
+    def _via_sd_logging_enabled(self) -> bool:
+        config = self._via_sd_config()
+        return bool(
+            config is not None
+            and getattr(config, "enabled", False)
+            and getattr(config, "log_enabled", True)
         )
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
@@ -236,15 +249,16 @@ class NPUModelRunner(GPUModelRunner):
                 config.layer_ids,
                 config.layer_fraction,
             )
-            logger.info(
-                "VIA-SD q' enabled on MRv2: retained %d/%d target layers (%s), "
-                "kv_cache=%s, validation_timing=%s",
-                len(self.via_sd_model.layer_ids),
-                len(self.model.model.layers),
-                ",".join(str(index) for index in self.via_sd_model.layer_ids),
-                config.kv_cache_enabled,
-                config.log_validation_timing,
-            )
+            if self._via_sd_logging_enabled():
+                logger.info(
+                    "VIA-SD q' enabled on MRv2: retained %d/%d target layers (%s), "
+                    "kv_cache=%s, validation_timing=%s",
+                    len(self.via_sd_model.layer_ids),
+                    len(self.model.model.layers),
+                    ",".join(str(index) for index in self.via_sd_model.layer_ids),
+                    config.kv_cache_enabled,
+                    config.log_validation_timing,
+                )
         except Exception as exc:
             self._disable_via_sd(str(exc))
 
@@ -261,43 +275,96 @@ class NPUModelRunner(GPUModelRunner):
         return specs
 
     def sample_tokens(self, grammar_output):
-        # The parent clears execute_model_state before returning.  Keep this
-        # batch object so q' can use the same request ordering after propose().
+        # The parent clears execute_model_state before returning. Keep this
+        # batch object so q' can use the target batch ordering after sampling.
         input_batch = self.execute_model_state.input_batch if self.execute_model_state is not None else None
+        pending_drafts = self._via_sd_pending_target_drafts
         output = super().sample_tokens(grammar_output)
-        if output is not None and input_batch is not None:
-            self._run_via_sd_validation(input_batch)
+        if output is not None and input_batch is not None and pending_drafts:
+            try:
+                self._run_via_sd_validation(input_batch, pending_drafts)
+            finally:
+                self._via_sd_pending_target_drafts = {}
+        elif pending_drafts:
+            # Do not carry a target block into a later execute if sampling was
+            # skipped by the parent runner.
+            self._via_sd_pending_target_drafts = {}
 
         if self.use_spec_pp and self.is_last_pp_rank:
             assert self.pp_handler is not None
             self.pp_handler.broadcast_draft_tokens()
         return output
 
-    def _run_via_sd_validation(self, input_batch) -> None:
+    def _run_via_sd_validation(
+        self,
+        input_batch,
+        scheduled_drafts: dict[object, tuple[int, ...]] | None = None,
+    ) -> None:
         if self._via_sd_disabled or self.via_sd_verifier is None or not self.is_last_pp_rank:
             return
         try:
-            self._run_via_sd_validation_once(input_batch)
+            self._run_via_sd_validation_once(input_batch, scheduled_drafts)
         except Exception as exc:
             config = self._via_sd_config()
             if config is not None and not config.fail_open:
                 raise
             self._disable_via_sd(str(exc))
 
-    def _run_via_sd_validation_once(self, input_batch) -> None:
+    def _run_via_sd_validation_once(
+        self,
+        input_batch,
+        scheduled_drafts: dict[object, tuple[int, ...]] | None = None,
+    ) -> None:
         assert self.via_sd_verifier is not None
-        draft_state = self.req_states.draft_tokens
+        scheduled_drafts = (
+            self._via_sd_pending_target_drafts
+            if scheduled_drafts is None
+            else scheduled_drafts
+        )
         num_reqs = int(input_batch.num_reqs)
-        if num_reqs <= 0 or self.num_speculative_steps <= 0:
+        if num_reqs <= 0 or self.num_speculative_steps <= 0 or not scheduled_drafts:
             return
-        idx_mapping = input_batch.idx_mapping[:num_reqs].to(dtype=torch.long)
-        request_indices = [int(index) for index in idx_mapping.detach().cpu().tolist()]
-        request_ids = list(input_batch.req_ids[:num_reqs])
-        draft_tokens = draft_state[idx_mapping]
-        table_indices = list(range(num_reqs))
 
-        lengths = self.req_states.total_len.gpu[idx_mapping]
-        lengths_cpu = [int(length) for length in lengths.detach().cpu().tolist()]
+        batch_request_ids = list(input_batch.req_ids[:num_reqs])
+        batch_rows = {
+            request_id: row for row, request_id in enumerate(batch_request_ids)
+        }
+        selected = [
+            (row, request_id, tuple(int(token) for token in scheduled_drafts[request_id]))
+            for request_id in batch_request_ids
+            if request_id in scheduled_drafts and scheduled_drafts[request_id]
+            for row in [batch_rows[request_id]]
+        ]
+        if not selected:
+            return
+        selected_rows = [item[0] for item in selected]
+        all_request_indices = [
+            int(index)
+            for index in input_batch.idx_mapping[:num_reqs]
+            .detach()
+            .cpu()
+            .tolist()
+        ]
+        idx_mapping = input_batch.idx_mapping[selected_rows].to(dtype=torch.long)
+        request_indices = [int(index) for index in idx_mapping.detach().cpu().tolist()]
+        request_ids = [item[1] for item in selected]
+        table_indices = selected_rows
+
+        # ``num_computed_tokens_np`` is captured while preparing the target
+        # batch and therefore names the committed prefix *before* rejection
+        # sampling mutates request state.  Falling back to total_len keeps the
+        # helper usable with lightweight test batches.
+        batch_lengths = getattr(input_batch, "num_computed_tokens_np", None)
+        if batch_lengths is None:
+            lengths = self.req_states.total_len.gpu[idx_mapping]
+            lengths_cpu = [int(length) for length in lengths.detach().cpu().tolist()]
+        elif isinstance(batch_lengths, torch.Tensor):
+            lengths_cpu = [
+                int(length)
+                for length in batch_lengths[selected_rows].detach().cpu().tolist()
+            ]
+        else:
+            lengths_cpu = [int(batch_lengths[row]) for row in selected_rows]
         prefixes: list[list[int]] = []
         for state_index, length in zip(request_indices, lengths_cpu):
             if length <= 0:
@@ -305,6 +372,30 @@ class NPUModelRunner(GPUModelRunner):
                 continue
             tokens = self.req_states.all_token_ids.gpu[state_index, :length]
             prefixes.append([int(token) for token in tokens.detach().cpu().tolist()])
+
+        # q' needs one committed token to align the first predicted row.  A
+        # target draft on an empty prefix is not a valid validation request.
+        valid_rows = [row for row, prefix in enumerate(prefixes) if prefix]
+        if not valid_rows:
+            return
+        request_ids = [request_ids[row] for row in valid_rows]
+        request_indices = [request_indices[row] for row in valid_rows]
+        table_indices = [table_indices[row] for row in valid_rows]
+        prefixes = [prefixes[row] for row in valid_rows]
+        selected = [selected[row] for row in valid_rows]
+        draft_steps = max(len(item[2]) for item in selected)
+        draft_tokens = torch.full(
+            (len(selected), draft_steps),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        valid_lengths: list[int] = []
+        for row, (_, _, tokens) in enumerate(selected):
+            valid_lengths.append(len(tokens))
+            draft_tokens[row, : len(tokens)] = torch.as_tensor(
+                tokens, dtype=torch.long, device=self.device
+            )
 
         # MRv2 has already gathered the current batch block tables for target
         # attention.  q' uses the same page IDs, while its layer names select
@@ -315,7 +406,9 @@ class NPUModelRunner(GPUModelRunner):
         if setter is not None:
             # ``block_tables`` rows are gathered in batch order, whereas the
             # allocator's ``num_blocks`` uses request-state indices.
-            setter(block_tables, request_indices=request_indices)
+            # Keep the complete batch mapping because ``table_indices`` still
+            # refer to the original input-batch rows after filtering requests.
+            setter(block_tables, request_indices=all_request_indices)
 
         validation_start = None
         if self._via_sd_timing_enabled():
@@ -328,37 +421,39 @@ class NPUModelRunner(GPUModelRunner):
             request_ids=request_ids,
             request_indices=request_indices,
             prefix_token_ids=prefixes,
+            valid_lengths=valid_lengths,
             table_indices=table_indices,
         )
-        if validation_start is None:
-            return
-        torch.npu.synchronize()
-        elapsed_ms = (time.perf_counter() - validation_start) * 1000.0
         self._via_sd_qprime_validation_count += 1
         stats = self.via_sd_verifier.last_stats
-        logger.info(
-            "[VIA-SD] q' validation #%d: elapsed_ms=%.3f, cache=%s, "
-            "requests=%d, scored_requests=%d, draft_tokens=%d, "
-            "cache_hits=%d, cache_misses=%d, cached_prefix_tokens=%d, "
-            "recomputed_prefix_tokens=%d, model_input_tokens=%d, layers=%d, "
-            "request_ids=%s, draft_token_ids=%s, draft_positions=%s, logits_shape=%s",
-            self._via_sd_qprime_validation_count,
-            elapsed_ms,
-            "on" if stats.cache_enabled else "off",
-            stats.request_count,
-            stats.scored_request_count,
-            stats.draft_tokens,
-            stats.cache_hits,
-            stats.cache_misses,
-            stats.cached_prefix_tokens,
-            stats.recomputed_prefix_tokens,
-            stats.model_input_tokens,
-            len(self.via_sd_model.layer_ids) if self.via_sd_model is not None else 0,
-            stats.request_ids,
-            stats.draft_token_ids,
-            stats.positions,
-            tuple(self.via_sd_last_logits.shape),
-        )
+        elapsed_ms = None
+        if validation_start is not None:
+            torch.npu.synchronize()
+            elapsed_ms = (time.perf_counter() - validation_start) * 1000.0
+        if self._via_sd_logging_enabled():
+            logger.info(
+                "[VIA-SD] q' validation #%d: elapsed_ms=%s, cache=%s, "
+                "requests=%d, scored_requests=%d, draft_tokens=%d, "
+                "cache_hits=%d, cache_misses=%d, cached_prefix_tokens=%d, "
+                "recomputed_prefix_tokens=%d, model_input_tokens=%d, layers=%d, "
+                "request_ids=%s, draft_token_ids=%s, draft_positions=%s, logits_shape=%s",
+                self._via_sd_qprime_validation_count,
+                "disabled" if elapsed_ms is None else f"{elapsed_ms:.3f}",
+                "on" if stats.cache_enabled else "off",
+                stats.request_count,
+                stats.scored_request_count,
+                stats.draft_tokens,
+                stats.cache_hits,
+                stats.cache_misses,
+                stats.cached_prefix_tokens,
+                stats.recomputed_prefix_tokens,
+                stats.model_input_tokens,
+                len(self.via_sd_model.layer_ids) if self.via_sd_model is not None else 0,
+                stats.request_ids,
+                stats.draft_token_ids,
+                stats.positions,
+                tuple(self.via_sd_last_logits.shape),
+            )
 
     def _disable_via_sd(self, reason: str) -> None:
         """Disable only q'; target sampling and rejection remain untouched."""
@@ -366,6 +461,7 @@ class NPUModelRunner(GPUModelRunner):
         if self._via_sd_disabled:
             return
         self._via_sd_disabled = True
+        self._via_sd_pending_target_drafts = {}
         if self.via_sd_verifier is not None:
             self.via_sd_verifier.clear()
         if self.via_sd_model is not None:
@@ -402,6 +498,7 @@ class NPUModelRunner(GPUModelRunner):
         self.via_sd_verifier = None
         self.via_sd_model = None
         self.via_sd_last_logits = None
+        self._via_sd_pending_target_drafts = {}
         super().shutdown()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
@@ -448,6 +545,13 @@ class NPUModelRunner(GPUModelRunner):
             for request_id in target_request_ids
         )
         target_draft_tokens = sum(len(tokens) for tokens in target_draft_token_ids)
+        if not dummy_run and not is_profile:
+            self._via_sd_pending_target_drafts = {
+                request_id: tokens
+                for request_id, tokens in zip(target_request_ids, target_draft_token_ids)
+            }
+        else:
+            self._via_sd_pending_target_drafts = {}
         profiling_config = self.ascend_config.scheduler_config.profiling_chunk_config
         execution_start_time = _start_profiling_chunk_timing(
             profiling_config,
@@ -481,21 +585,24 @@ class NPUModelRunner(GPUModelRunner):
                 context_len=context_len,
             )
 
+        elapsed_ms = None
         if target_validation_start is not None:
             torch.npu.synchronize()
             elapsed_ms = (time.perf_counter() - target_validation_start) * 1000.0
+        if target_draft_tokens > 0 and not dummy_run and not is_profile:
             self._via_sd_target_validation_count += 1
-            logger.info(
-                "[VIA-SD] target validation #%d: elapsed_ms=%.3f, "
-                "requests=%d, draft_tokens=%d, request_ids=%s, "
-                "draft_token_ids=%s, scope=execute_model",
-                self._via_sd_target_validation_count,
-                elapsed_ms,
-                len(target_request_ids),
-                target_draft_tokens,
-                target_request_ids,
-                target_draft_token_ids,
-            )
+            if self._via_sd_logging_enabled():
+                logger.info(
+                    "[VIA-SD] target validation #%d: elapsed_ms=%s, "
+                    "requests=%d, draft_tokens=%d, request_ids=%s, "
+                    "draft_token_ids=%s, scope=execute_model",
+                    self._via_sd_target_validation_count,
+                    "disabled" if elapsed_ms is None else f"{elapsed_ms:.3f}",
+                    len(target_request_ids),
+                    target_draft_tokens,
+                    target_request_ids,
+                    target_draft_token_ids,
+                )
 
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
             profiling_config,

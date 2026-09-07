@@ -196,6 +196,10 @@ class ViaSdConfig:
     # Accurate per-pass timing synchronizes the NPU and is intended for the
     # current observation/debug stage. It can be disabled for throughput runs.
     log_validation_timing: bool = True
+    # Runtime q'/target statistics are useful while diagnosing VIA-SD, but
+    # should be removable without changing validation behavior or adding log
+    # overhead to production serving.
+    log_enabled: bool = True
     fail_open: bool = True
 
     @model_validator(mode="after")
@@ -1200,6 +1204,10 @@ def init_ascend_config(vllm_config):
         "via_sd_layer_ratio": "layer_fraction",
         "via_sd_enable_kv_cache": "kv_cache_enabled",
         "via_sd_log_validation_timing": "log_validation_timing",
+        "via_sd_log_enabled": "log_enabled",
+        # Keep the enable_* spelling accepted for consistency with the other
+        # VIA-SD flat switches.
+        "via_sd_enable_log": "log_enabled",
     }
     if any(alias in additional_config for alias in via_sd_aliases):
         raw_via_sd_config = additional_config.get("via_sd_config", {})
