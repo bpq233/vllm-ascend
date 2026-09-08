@@ -282,6 +282,20 @@ class ViaSdRuntime:
             (begin, hidden[local].clone(), [value[local].clone() for value in aux] if aux else None)
         )
 
+    def _save_target_feature_slice(self, request_id, start, hidden, aux):
+        batch = self.pending[0]
+        row = batch.req_ids.index(request_id)
+        lo, hi = map(int, batch.query_start_loc_np[row : row + 2])
+        query_start = int(batch.positions[lo].item())
+        begin = max(start, query_start)
+        end = min(start + hidden.shape[0], query_start + hi - lo)
+        if begin >= end:
+            return
+        local = slice(begin - start, end - start)
+        self.target_features.setdefault(request_id, []).append(
+            (begin, hidden[local].clone(), [value[local].clone() for value in aux] if aux else None)
+        )
+
     def _draft_features(self, batch, hidden, aux):
         # Only replace features inside the valid causal prefix after routing.
         selected_hidden = hidden.clone() if self.target_features else hidden
@@ -355,17 +369,33 @@ class ViaSdRuntime:
             first = group[0]
             state = self.coordinator.states[request_id]
             tokens = list(first.prefix_tokens) + [event.draft_token for event in group]
-            start = min(state.target_computed_len, max(0, len(tokens) - 1))
+            # Keep the causal anchor row used to predict the first LOW token.
+            start = min(max(0, state.target_computed_len - 1), max(0, len(tokens) - 1))
             requests.append(tokens[start:])
             metadata.append((request_id, group, tokens, start))
         started = self._clock()
         rows = backend.forward_batch(
-            requests, [item[3] for item in metadata], [self.pending[0].req_ids.index(item[0]) for item in metadata]
+            requests,
+            [item[3] for item in metadata],
+            [self.pending[0].req_ids.index(item[0]) for item in metadata],
         )
         self._record("target", sum(len(row) for row in requests), started)
         decisions = {}
+        packed_offset = 0
         for row, (request_id, group, tokens, start) in zip(rows, metadata):
             self.coordinator.states[request_id].record_target_forward(len(tokens))
+            count = len(requests[metadata.index((request_id, group, tokens, start))])
+            packed_hidden = getattr(backend, 'last_forward_hidden', None)
+            packed_aux = getattr(backend, 'last_forward_aux', None)
+            if packed_hidden is not None:
+                self._save_target_feature_slice(
+                    request_id,
+                    start,
+                    packed_hidden[packed_offset : packed_offset + count],
+                    [value[packed_offset : packed_offset + count] for value in packed_aux]
+                    if packed_aux else None,
+                )
+            packed_offset += count
             for event in group:
                 index = len(event.prefix_tokens) - 1 - start
                 if index < 0 or index >= len(row):
@@ -399,7 +429,9 @@ class ViaSdRuntime:
             view.idx_mapping.repeat(2),
             local,
         )
-        return ViaSdTargetDecision(int(count[0].item()) > 1, int(output[0, 0].item()), len(event.prefix_tokens))
+        # The batched forward already records the complete target computed
+        # length for this request. Do not return the single-position length.
+        return ViaSdTargetDecision(int(count[0].item()) > 1, int(output[0, 0].item()))
 
     @torch.inference_mode()
     def sample(self, grammar_output):
@@ -422,7 +454,7 @@ class ViaSdRuntime:
             draft = drafts[row]
             if draft:
                 score = logits[hi - len(draft) - 1 : hi - 1]
-                result = self.coordinator.run(
+                result = r.execute_via_sd_hierarchical(
                     [rid],
                     [prefixes[row]],
                     [draft],

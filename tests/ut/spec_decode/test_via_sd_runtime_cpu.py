@@ -45,8 +45,16 @@ class RuntimeTests(unittest.TestCase):
             last_hidden_states=torch.tensor([[9.0, 8.0, 7.0]]),
             last_aux_hidden_states=[torch.tensor([[19.0, 18.0, 17.0]])],
         )
+        def target_batch(token_ids, starts, table_indices):
+            runtime._target_backend.last_forward_hidden = torch.tensor([[9.0, 8.0, 7.0]]).repeat(sum(map(len, token_ids)), 1)
+            runtime._target_backend.last_forward_aux = [torch.tensor([[19.0, 18.0, 17.0]]).repeat(sum(map(len, token_ids)), 1)]
+            return [torch.tensor([[0.0, 3.0, 0.0]]).repeat(len(tokens), 1) for tokens in token_ids]
+
         runtime._target_backend = NS(
-            model=target, set_request_block_tables=Mock(), forward=Mock(return_value=torch.tensor([[0.0, 3.0, 0.0]]))
+            model=target,
+            set_request_block_tables=Mock(),
+            forward=Mock(return_value=torch.tensor([[0.0, 3.0, 0.0]])),
+            forward_batch=Mock(side_effect=target_batch),
         )
         r.rejection_sampler = NS(_verify=Mock(return_value=(None, torch.tensor([[1, 0, -1]]), torch.tensor([2]))))
         result = runtime.sample(None)
@@ -100,6 +108,9 @@ class RuntimeTests(unittest.TestCase):
             cache_enabled=True,
             set_request_block_tables=Mock(),
             forward_features=Mock(return_value=(logits, [logits + 10])),
+            forward_batch=Mock(side_effect=lambda token_ids, starts, table_indices: [
+                logits[: len(tokens)] for tokens in token_ids
+            ]),
             _request_block_tables=[],
             _request_state_indices=[index],
         )
@@ -144,6 +155,7 @@ class RuntimeTests(unittest.TestCase):
             setattr(r, name, Mock())
         runtime = ViaSdRuntime(r)
         runtime.validate = Mock()
+        r.execute_via_sd_hierarchical = lambda *args, **kwargs: runtime.coordinator.run(*args, **kwargs)
         scheduled = NS(
             finished_req_ids=set(),
             preempted_req_ids=set(),
@@ -211,7 +223,13 @@ class RuntimeTests(unittest.TestCase):
             writes.append((tuple(tokens), start, row))
             return torch.tensor([[0.0, 3.0, 0.0]]).repeat(len(tokens), 1)
 
-        runtime._target_backend = NS(set_request_block_tables=Mock(), forward=forward)
+        runtime._target_backend = NS(
+            set_request_block_tables=Mock(),
+            forward=forward,
+            forward_batch=Mock(side_effect=lambda token_ids, starts, table_indices: [
+                torch.tensor([[0.0, 3.0, 0.0]]).repeat(len(tokens), 1) for tokens in token_ids
+            ]),
+        )
         runtime.pending = (batch,)
         event = NS(request_id="r", prefix_tokens=(0, 1, 2), committed_len=3, target_computed_len=0)
         self.assertEqual(runtime._catchup(event), 3)
@@ -279,11 +297,17 @@ class RuntimeTests(unittest.TestCase):
             writes.append((tuple(tokens), start, row))
             return torch.tensor([[0.0, 3.0, 0.0]])
 
-        runtime._target_backend = NS(set_request_block_tables=Mock(), forward=forward)
+        runtime._target_backend = NS(
+            set_request_block_tables=Mock(),
+            forward=forward,
+            forward_batch=Mock(side_effect=lambda token_ids, starts, table_indices: [
+                torch.tensor([[0.0, 3.0, 0.0]]).repeat(len(tokens), 1) for tokens in token_ids
+            ]),
+        )
         r.rejection_sampler = NS(_verify=Mock(return_value=(None, torch.tensor([[1, 0, -1]]), torch.tensor([2]))))
         output = runtime.sample(None)
         self.assertEqual(output.sampled_token_ids, [[1, 2], [0], [1, 2]])
-        self.assertEqual(writes, [((0,), 0, 2), ((1,), 1, 2)])
+        self.assertEqual(writes, [])
         self.assertEqual(r.rejection_sampler._verify.call_args.args[5].tolist(), [2])
         self.assertEqual(r.speculator.propose.call_args.args[6].tolist(), [1, 2, 1])
         self.assertEqual(r.req_states.draft_tokens[[3, 0, 2]].tolist(), [[1, 1], [2, 2], [0, 0]])

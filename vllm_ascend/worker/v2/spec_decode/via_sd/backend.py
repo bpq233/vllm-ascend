@@ -353,6 +353,12 @@ class ViaSdPagedBackend:
             is_padding=torch.zeros(num_tokens, dtype=torch.bool, device=device),
         ):
             hidden_states = self.model(input_ids=inputs, positions=positions)
+        self.last_forward_hidden = hidden_states
+        try:
+            aux_hidden = self.model.last_aux_hidden_states
+        except AttributeError:
+            aux_hidden = None
+        self.last_forward_aux = list(aux_hidden or [])
         self.last_forward_metadata = metadata
         self.last_slot_mappings = slots_by_layer
         if return_features:
