@@ -74,7 +74,9 @@ second checkpoint. The pass supports two execution modes:
 - `observe` (the default) records q' logits and timing only. The existing
   target forward, rejection sampler, scheduler, and target KV cache remain the
   source of truth.
-- `hierarchical` applies a per-position route before target verification. A
+- `hierarchical` uses q' features for the existing drafter and runs target
+  only for LOW positions. The initial runtime requires eager vLLM 0.27.1,
+  one device, synchronous scheduling, and prefix caching disabled. A
   HIGH position (relative confidence `>= accept_ratio`) is accepted on q'. A
   MEDIUM position (between `escalate_ratio` and `accept_ratio`) is sampled from
   q', replaces the draft token, and terminates the remaining stale suffix. A
@@ -132,27 +134,58 @@ no q' KV pages are allocated. The latest output is a tensor of shape
 `[batch, draft_steps, vocab]`, available from the MRv2 runner through
 `get_via_sd_last_logits()`. Invalid padded draft positions are filled with
 `-inf`. In `observe` mode q' never returns a replacement token to target
-sampling. In `hierarchical` mode use the route plan exposed by
+sampling. Integration code can use the route plan exposed by
 `get_via_sd_route_plan()` (and its `fallback_rows`) to drive the compact
 target adapter; `execute_via_sd_hierarchical()` provides the device-independent
 coordinator interface for integrations and tests.
 
-With VIA-SD enabled, every q' pass and every target forward that verifies a
-draft block emits a synchronized `elapsed_ms` log. The q' log also reports
+With VIA-SD enabled, each q' pass and parent target execution for a scheduled
+draft block emits an `elapsed_ms` log when timing is enabled. The q' log also reports
 `cache_hits`, `cache_misses`, `cached_prefix_tokens`,
 `recomputed_prefix_tokens`, and `model_input_tokens`. The first q' pass for a
 request is necessarily a cold-cache miss, so compare cache on/off from the
 second pass onward and verify that cache-on reduces `model_input_tokens`. The
 q' timer covers `ViaSdVerifier.verify()`; the target timer covers the parent
 runner's complete `execute_model()` call and does not include rejection
-sampling. q' consumes the same scheduled request/draft block as the target,
-so the two counters should advance together when both passes succeed. Set
+sampling. These scopes are different and their ratio is not a model speedup.
+In observe mode q' consumes the same scheduled request/draft block as the target,
+so the two counters advance together when both passes succeed. This is expected
+for observation and does not demonstrate target skipping. Set
 `log_enabled` to false to suppress VIA-SD statistics; set
 `log_validation_timing` to false separately to keep logs without the
 per-pass synchronization overhead.
 
+The hierarchical runtime bypasses parent target execution and sampling.
+The existing drafter receives normalized final hidden states and its configured
+auxiliary feature boundaries from q'. A skipped layer is an identity operation
+at its original depth; auxiliary features are unnormalized residual streams.
+No replacement drafter or checkpoint is loaded. These features have a different
+distribution from the target features used to train the drafter, so draft quality
+must be evaluated separately from routing and KV correctness.
+HIGH and MEDIUM never call target. LOW fills missing target KV with a real
+forward before rejection sampling. q' features after the accepted prefix are
+masked using the existing drafter's rejection metadata.
+
+Draft features prefer target outputs wherever LOW catch-up has actually
+produced them for a still-valid position; uncovered positions retain q' outputs.
+This applies to both final and auxiliary hidden states and never transfers KV
+between models or triggers an extra target forward. Captured features are
+limited to the current proposal's input interval.
+Both MEDIUM and LOW terminate the current draft block. LOW commits the token
+accepted or rewritten by target and discards every later draft token, even
+when target accepts the original token.
+
+Hierarchical logs report `work.qprime_calls`, `work.qprime_tokens`,
+`work.target_calls`, and `work.target_tokens`, plus separate forward timings.
+An all-HIGH or MEDIUM-only batch has `target_calls=0` and `target_tokens=0`.
+These counters count actual forward chunks, not validation rounds. LOW
+fallbacks currently use compact single-request forwards rather than a joint
+multi-request target batch. Disable graph execution and asynchronous scheduling
+for this initial runtime; logprobs, history penalties, custom processors,
+grammars, LoRA, multimodal inputs and KV transfer are not supported.
+
 `kv_cache_enabled` changes only q' work. Target validation uses its original
-KV path in both cases, so similar target timings are expected. In hierarchical
+KV path in observe mode, so similar target timings are expected. In hierarchical
 mode q' and target maintain separate logical lengths (`qprime_computed_len`
 and `target_computed_len`) in addition to the scheduler-visible
 `committed_len`; a q' acceptance does not advance target KV. Before a LOW

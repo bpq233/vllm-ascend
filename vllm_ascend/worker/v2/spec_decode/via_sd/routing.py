@@ -50,9 +50,7 @@ def validate_thresholds(
     if not math.isfinite(accept) or not math.isfinite(escalate):
         raise ValueError("VIA-SD thresholds must be finite")
     if not 0.0 <= escalate < accept <= 1.0:
-        raise ValueError(
-            "VIA-SD thresholds must satisfy 0 <= escalate_ratio < accept_ratio <= 1"
-        )
+        raise ValueError("VIA-SD thresholds must satisfy 0 <= escalate_ratio < accept_ratio <= 1")
     return accept, escalate
 
 
@@ -197,9 +195,7 @@ def relative_confidences(
     logit_rows = _as_float_rows(logits)
     draft_rows = _as_draft_rows(draft_token_ids)
     if len(logit_rows) != len(draft_rows):
-        raise ValueError(
-            f"q' batch mismatch: logits={len(logit_rows)}, drafts={len(draft_rows)}"
-        )
+        raise ValueError(f"q' batch mismatch: logits={len(logit_rows)}, drafts={len(draft_rows)}")
     if valid_lengths is not None and len(valid_lengths) != len(draft_rows):
         raise ValueError("VIA-SD valid_lengths must match the batch")
     result: list[list[float]] = []
@@ -208,12 +204,8 @@ def relative_confidences(
         if valid_lengths is not None:
             limit = min(limit, max(0, int(valid_lengths[batch_index])))
         if limit > len(position_rows):
-            raise ValueError(
-                f"q' logits row {batch_index} has {len(position_rows)} positions, need {limit}"
-            )
-        result.append(
-            [relative_confidence(position_rows[pos], draft_row[pos]) for pos in range(limit)]
-        )
+            raise ValueError(f"q' logits row {batch_index} has {len(position_rows)} positions, need {limit}")
+        result.append([relative_confidence(position_rows[pos], draft_row[pos]) for pos in range(limit)])
     return result
 
 
@@ -263,7 +255,7 @@ class ViaSdRoutePlan:
     scores: tuple[tuple[float, ...], ...]
     decisions: tuple[tuple[ViaSdDecision, ...], ...]
     fallbacks: tuple[ViaSdFallback, ...]
-    logits: tuple[tuple[tuple[float, ...], ...], ...] | None = None
+    logits: Any = None
     batch_rows: tuple[int, ...] = ()
 
     @property
@@ -289,17 +281,13 @@ class ViaSdRoutePlan:
     @property
     def all_high(self) -> bool:
         return bool(self.decisions) and all(
-            decision.route is ViaSdRoute.HIGH
-            for row in self.decisions
-            for decision in row
+            decision.route is ViaSdRoute.HIGH for row in self.decisions for decision in row
         )
 
     @property
     def all_low(self) -> bool:
         return bool(self.decisions) and all(
-            decision.route is ViaSdRoute.LOW
-            for row in self.decisions
-            for decision in row
+            decision.route is ViaSdRoute.LOW for row in self.decisions for decision in row
         )
 
     @property
@@ -312,7 +300,7 @@ class ViaSdRoutePlan:
                 return decision
         return None
 
-    def logits_for(self, row: int, position: int) -> tuple[float, ...] | None:
+    def logits_for(self, row: int, position: int) -> Any:
         if self.logits is None:
             return None
         return self.logits[row][position]
@@ -340,12 +328,21 @@ def build_route_plan(
     """Build a ragged route plan and compact LOW fallback list."""
 
     accept, escalate = validate_thresholds(accept_ratio, escalate_ratio)
-    logit_rows = _as_float_rows(qprime_logits)
+    # Keep vocabulary-sized logits on device; copy only routing scores to CPU.
+    tensor_scores = None
+    if hasattr(qprime_logits, "gather") and hasattr(qprime_logits, "detach"):
+        import torch
+
+        logit_rows = qprime_logits.detach()
+        if logit_rows.ndim == 2:
+            logit_rows = logit_rows.unsqueeze(0)
+        if logit_rows.ndim != 3 or logit_rows.shape[-1] == 0:
+            raise ValueError("qprime logits must be a non-empty rank-2 or rank-3 tensor")
+    else:
+        logit_rows = _as_float_rows(qprime_logits)
     draft_rows = _as_draft_rows(draft_token_ids)
     if len(logit_rows) != len(draft_rows):
-        raise ValueError(
-            f"q' batch mismatch: logits={len(logit_rows)}, drafts={len(draft_rows)}"
-        )
+        raise ValueError(f"q' batch mismatch: logits={len(logit_rows)}, drafts={len(draft_rows)}")
     batch_size = len(draft_rows)
     ids = tuple(range(batch_size)) if request_ids is None else tuple(request_ids)
     if len(ids) != batch_size:
@@ -356,25 +353,48 @@ def build_route_plan(
     if valid_lengths is not None and len(valid_lengths) != batch_size:
         raise ValueError("VIA-SD valid_lengths must match the q' batch")
 
+    if hasattr(logit_rows, "gather"):
+        lengths = [
+            len(row) if valid_lengths is None else min(len(row), max(0, int(valid_lengths[i])))
+            for i, row in enumerate(draft_rows)
+        ]
+        if any(length > logit_rows.shape[1] for length in lengths):
+            raise ValueError("qprime logits have fewer positions than the draft block")
+        tokens = torch.zeros(logit_rows.shape[:2], dtype=torch.long, device=logit_rows.device)
+        mask = torch.zeros_like(tokens, dtype=torch.bool)
+        for i, length in enumerate(lengths):
+            row = draft_rows[i][:length]
+            if any(token < 0 or token >= logit_rows.shape[-1] for token in row):
+                raise ValueError("draft token is outside qprime vocabulary")
+            tokens[i, :length] = torch.as_tensor(row, device=tokens.device)
+            mask[i, :length] = True
+        maximum = logit_rows.amax(dim=-1)
+        selected = logit_rows.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+        invalid = (
+            torch.isnan(logit_rows).any(dim=-1) | torch.isposinf(logit_rows).any(dim=-1) | torch.isneginf(maximum)
+        ) & mask
+        if invalid.any().item():
+            raise ValueError("qprime logits contain NaN, positive infinity, or an all -inf row")
+        tensor_scores = (selected.float() - maximum.float()).exp().cpu().tolist()
+
     all_scores: list[tuple[float, ...]] = []
     all_decisions: list[tuple[ViaSdDecision, ...]] = []
     all_drafts: list[tuple[int, ...]] = []
-    all_logits: list[tuple[tuple[float, ...], ...]] = []
+    all_logits: list[Any] = []
     fallbacks: list[ViaSdFallback] = []
     for index, (logits_row, draft_row) in enumerate(zip(logit_rows, draft_rows)):
         limit = len(draft_row)
         if valid_lengths is not None:
             limit = min(limit, max(0, int(valid_lengths[index])))
         if limit > len(logits_row):
-            raise ValueError(
-                f"q' logits row {index} has {len(logits_row)} positions, need {limit}"
-            )
+            raise ValueError(f"q' logits row {index} has {len(logits_row)} positions, need {limit}")
         draft = tuple(draft_row[:limit])
-        position_logits = tuple(tuple(row) for row in logits_row[:limit])
-        scores = tuple(
-            relative_confidence(position_logits[position], draft[position])
-            for position in range(limit)
-        )
+        if tensor_scores is not None:
+            position_logits = logits_row[:limit]
+            scores = tuple(tensor_scores[index][:limit])
+        else:
+            position_logits = tuple(tuple(row) for row in logits_row[:limit])
+            scores = tuple(relative_confidence(position_logits[position], draft[position]) for position in range(limit))
         decisions = tuple(
             ViaSdDecision(
                 position=position,
@@ -452,9 +472,7 @@ def sample_from_logits(
             scaled = scaled.masked_fill(scaled < threshold, float("-inf"))
         probabilities = torch.softmax(scaled, dim=-1)
         if min_p > 0.0:
-            probabilities = probabilities.masked_fill(
-                probabilities < probabilities.max() * min_p, 0.0
-            )
+            probabilities = probabilities.masked_fill(probabilities < probabilities.max() * min_p, 0.0)
             total = probabilities.sum()
             if total <= 0:
                 probabilities = torch.softmax(scaled, dim=-1)

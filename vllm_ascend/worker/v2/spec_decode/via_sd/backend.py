@@ -230,7 +230,9 @@ class ViaSdPagedBackend:
         token_ids: Sequence[Sequence[int]],
         starts: Sequence[int],
         table_indices: Sequence[int],
-    ) -> list[torch.Tensor]:
+        *,
+        return_features: bool = False,
+    ) -> list[torch.Tensor] | tuple[torch.Tensor, list[torch.Tensor]]:
         """Run all q' requests in one ragged MRv2 forward.
 
         Each row may start at a different cached prefix length.  The model sees
@@ -240,6 +242,8 @@ class ViaSdPagedBackend:
         """
 
         if not token_ids:
+            if return_features:
+                raise ValueError('Feature forward requires at least one request')
             return []
         if not (len(token_ids) == len(starts) == len(table_indices)):
             raise ValueError("q' batch token, start, and table metadata must have equal length")
@@ -349,6 +353,10 @@ class ViaSdPagedBackend:
             is_padding=torch.zeros(num_tokens, dtype=torch.bool, device=device),
         ):
             hidden_states = self.model(input_ids=inputs, positions=positions)
+        self.last_forward_metadata = metadata
+        self.last_slot_mappings = slots_by_layer
+        if return_features:
+            return hidden_states, list(self.model.last_aux_hidden_states)
         logits = self.model.compute_logits(hidden_states)
         return [
             logits[start:end]
@@ -356,6 +364,14 @@ class ViaSdPagedBackend:
                 query_start_cpu[:-1].tolist(), query_start_cpu[1:].tolist()
             )
         ]
+
+    def forward_features(self, token_ids, starts, table_indices):
+        previous = self.model.capture_draft_features
+        self.model.capture_draft_features = True
+        try:
+            return self.forward_batch(token_ids, starts, table_indices, return_features=True)
+        finally:
+            self.model.capture_draft_features = previous
 
     @torch.inference_mode()
     def forward(

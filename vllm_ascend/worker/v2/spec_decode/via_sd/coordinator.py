@@ -567,10 +567,8 @@ class ViaSdExecutionCoordinator:
                         target_computed_len=self.states[request_id].target_computed_len,
                     )
                 )
-                # If this target position accepts, the next LOW event will
-                # include its draft token.  If it rewrites, that later event is
-                # ignored by the causal loop below.
-                working_prefix.append(decision.draft_token)
+                # LOW ends this block even when target accepts the token.
+                break
         compact_requests = tuple(compact_events)
         batch_decisions = self._target_batch_decisions(compact_requests, target_verify_batch)
         results: list[ViaSdRequestResult] = []
@@ -677,7 +675,8 @@ class ViaSdExecutionCoordinator:
                     target_accepted_positions.append(decision.position)
                     qprime_valid = len(working) - 1
                     source = "target_accept"
-                    continue
+                    stop_position = decision.position
+                    break
                 working.append(target_decision.token)
                 target_rewrite = (decision.draft_token, target_decision.token)
                 source = "target_rewrite"

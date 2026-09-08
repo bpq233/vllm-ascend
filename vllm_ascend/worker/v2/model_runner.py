@@ -185,11 +185,6 @@ class NPUModelRunner(GPUModelRunner):
         self._via_sd_pre_route_batch = None
         self._via_sd_pre_route_scheduler_output = None
         self._via_sd_coordinator: ViaSdExecutionCoordinator | None = None
-        # Integrators with a compact target executor may install this callback
-        # after runner construction.  The default path remains compatible
-        # with the existing MRv2 executor and uses the route plan as a
-        # correctness/observability boundary.
-        self._via_sd_hierarchical_executor = None
         # ``sample_tokens`` runs after the parent target forward.  Keep the
         # exact draft block scheduled for that forward so q' never validates
         # a stale block produced for the next iteration.
@@ -321,15 +316,15 @@ class NPUModelRunner(GPUModelRunner):
         return specs
 
     def sample_tokens(self, grammar_output):
+        if self._via_sd_mode() == 'hierarchical':
+            runtime = getattr(self, '_via_sd_runtime', None)
+            return runtime.sample(grammar_output) if runtime is not None else None
         # The parent clears execute_model_state before returning. Keep this
         # batch object so q' can use the target batch ordering after sampling.
         input_batch = self.execute_model_state.input_batch if self.execute_model_state is not None else None
         pending_drafts = self._via_sd_pending_target_drafts
         output = super().sample_tokens(grammar_output)
-        # In hierarchical mode q' is evaluated by the pre-target hook in
-        # ``prepare_inputs``.  Running the historical post-target pass again
-        # would score stale logits and could accidentally route a rejected
-        # suffix, so only observe mode uses this compatibility pass.
+        # Observe-mode verification runs after parent sampling and never routes.
         if (
             self._via_sd_mode() == "observe"
             and output is not None
@@ -514,7 +509,7 @@ class NPUModelRunner(GPUModelRunner):
                 tuple(self.via_sd_last_logits.shape),
             )
         config = self._via_sd_config()
-        if config is None:
+        if config is None or self._via_sd_mode() == 'observe':
             return None
         # Keep the original InputBatch row in the plan.  The q' verifier may
         # compact requests with ragged prefixes, but target fallback must be
@@ -528,64 +523,6 @@ class NPUModelRunner(GPUModelRunner):
         )
         self._via_sd_route_plan = plan
         return plan
-
-    def _via_sd_pre_target_route(self, input_batch, scheduler_output):
-        """Run q' at the first point where the prepared batch is available.
-
-        ``GPUModelRunner.execute_model`` invokes this runner's
-        ``prepare_inputs`` immediately before preparing attention metadata and
-        calling the target model.  Calling the verifier here therefore keeps
-        q' causally before target verification even though the upstream method
-        is monolithic.  A compact executor can be installed to consume the
-        plan and replace the target-forward portion; the default runner keeps
-        the parent execution contract and exposes the plan for that adapter.
-        """
-
-        if not self._via_sd_is_hierarchical() or self.via_sd_verifier is None:
-            return None
-        if not getattr(scheduler_output, "scheduled_spec_decode_tokens", None):
-            return None
-        plan = self._run_via_sd_validation_once(
-            input_batch,
-            self._via_sd_pending_target_drafts,
-        )
-        self._via_sd_pre_route_batch = input_batch
-        self._via_sd_pre_route_scheduler_output = scheduler_output
-        if plan is None:
-            return None
-        executor = self._via_sd_hierarchical_executor
-        if executor is not None:
-            # Adapter callbacks commonly use one of these two signatures. Use
-            # signature inspection so a TypeError raised inside the callback is
-            # not mistaken for a signature mismatch.
-            try:
-                import inspect
-
-                parameters = list(inspect.signature(executor).parameters.values())
-                positional = [
-                    parameter
-                    for parameter in parameters
-                    if parameter.kind
-                    in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-                ]
-                count = len(positional)
-            except (TypeError, ValueError):
-                count = 1
-            values = (input_batch, scheduler_output, plan)
-            self._via_sd_execution_result = executor(*values[: max(1, count)])
-        return plan
-
-    def set_via_sd_hierarchical_executor(self, executor) -> None:
-        """Install a compact target executor for hierarchical mode.
-
-        The callback is invoked as ``executor(input_batch, scheduler_output,
-        route_plan)`` (or with a shorter positional prefix).  It may return a
-        runner-specific execution result consumed by an accompanying
-        ``sample_tokens`` adapter.  Keeping this seam explicit prevents the
-        observation mode from accidentally changing target behavior.
-        """
-
-        self._via_sd_hierarchical_executor = executor
 
     def get_via_sd_route_plan(self) -> ViaSdRoutePlan | None:
         return self._via_sd_route_plan
@@ -678,6 +615,7 @@ class NPUModelRunner(GPUModelRunner):
             self._via_sd_execution_result = None
 
     def shutdown(self) -> None:
+        self._via_sd_runtime = None
         # Remove q' registrations before the parent clears target model state
         # and the shared static forward context.
         if self.via_sd_verifier is not None:
@@ -727,6 +665,15 @@ class NPUModelRunner(GPUModelRunner):
         is_profile: bool = False,
         context_len: int = 0,
     ):
+        if self._via_sd_mode() == 'hierarchical' and not dummy_run and not is_profile:
+            self._cpp_execution_time_ms = None
+            self._via_sd_route_plan = None
+            self._via_sd_execution_result = None
+            from vllm_ascend.worker.v2.spec_decode.via_sd.runtime import ViaSdRuntime
+
+            if getattr(self, '_via_sd_runtime', None) is None:
+                self._via_sd_runtime = ViaSdRuntime(self)
+            return self._via_sd_runtime.execute(scheduler_output)
         self._cpp_execution_time_ms = None
         if not dummy_run:
             self._discard_via_sd_requests(scheduler_output)
@@ -755,6 +702,8 @@ class NPUModelRunner(GPUModelRunner):
             profiling_config,
             scheduler_output,
         )
+        # This measures parent preparation and execution, not pure forward.
+        # Observe-mode q' runs later in sample_tokens, outside this interval.
         target_validation_start = None
         if (
             self._via_sd_timing_enabled()
@@ -791,9 +740,9 @@ class NPUModelRunner(GPUModelRunner):
             self._via_sd_target_validation_count += 1
             if self._via_sd_logging_enabled():
                 logger.info(
-                    "[VIA-SD] target validation #%d: elapsed_ms=%s, "
+                    "[VIA-SD] target execute #%d: elapsed_ms=%s, "
                     "requests=%d, draft_tokens=%d, request_ids=%s, "
-                    "scope=execute_model",
+                    "scope=parent_execute_model",
                     self._via_sd_target_validation_count,
                     "disabled" if elapsed_ms is None else f"{elapsed_ms:.3f}",
                     len(target_request_ids),
@@ -881,6 +830,11 @@ class NPUModelRunner(GPUModelRunner):
                 expanded_idx_mapping = idx_mapping
                 expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
             else:
+                num_draft_tokens_per_req = np.fromiter(
+                    (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
+                    dtype=np.int32,
+                    count=num_reqs,
+                )
                 num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
                 total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
                 total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
@@ -1030,9 +984,6 @@ class NPUModelRunner(GPUModelRunner):
             # For mla/sfa, update cos/sin. Here is for execute_model.
             update_cos_sin(input_batch.positions)
 
-            # q' must run after batch preparation (so row/index mappings are
-            # final) and before the parent executes target attention.
-            self._via_sd_pre_target_route(input_batch, scheduler_output)
             return input_batch
 
     else:
@@ -1286,9 +1237,6 @@ class NPUModelRunner(GPUModelRunner):
             # For mla/sfa, update cos/sin. Here is for execute_model.
             update_cos_sin(input_batch.positions)
 
-            # q' must run after batch preparation (so row/index mappings are
-            # final) and before the parent executes target attention.
-            self._via_sd_pre_target_route(input_batch, scheduler_output)
             return input_batch
 
     def postprocess_sampled(

@@ -106,6 +106,12 @@ class ViaSdModel(nn.Module):
             raise NotImplementedError("VIA-SD q' currently requires an unquantized target")
 
         total_layers = len(target_layers)
+        self.total_layers = total_layers
+        self.aux_hidden_state_layers = tuple(getattr(target_model, 'aux_hidden_state_layers', ()))
+        if any(index < 0 or index > total_layers for index in self.aux_hidden_state_layers):
+            raise ValueError('Draft auxiliary feature boundary is outside target depth')
+        self.last_aux_hidden_states: list[torch.Tensor] = []
+        self.capture_draft_features = False
         self.layer_ids = resolve_layer_ids(total_layers, layer_ids, layer_fraction)
         adapter = find_adapter(target_layers[self.layer_ids[0]])
         if adapter is None:
@@ -159,10 +165,20 @@ class ViaSdModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual: torch.Tensor | None = None
-        for layer in self.layers:
-            hidden_states, residual = self.adapter.forward(
-                layer, positions, hidden_states, residual
-            )
+        self.last_aux_hidden_states = []
+        requested = set(self.aux_hidden_state_layers) if self.capture_draft_features else set()
+        retained = dict(zip(self.layer_ids, self.layers))
+        # Boundary k is the residual stream after k original layers. Skipped
+        # layers are identity operations, including at auxiliary draft taps.
+        for boundary in range(self.total_layers + 1):
+            if boundary in requested:
+                value = hidden_states if residual is None else hidden_states + residual
+                self.last_aux_hidden_states.append(value.clone())
+            layer = retained.get(boundary)
+            if layer is not None:
+                hidden_states, residual = self.adapter.forward(
+                    layer, positions, hidden_states, residual
+                )
         normalized = self.norm(hidden_states, residual)
         if isinstance(normalized, tuple):
             hidden_states = normalized[0]

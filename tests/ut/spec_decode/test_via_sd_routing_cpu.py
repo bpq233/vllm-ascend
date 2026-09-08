@@ -18,14 +18,7 @@ from pathlib import Path
 
 def _load_pure_via_modules():
     package_name = "_via_sd_cpu_contract_tests"
-    source_dir = (
-        Path(__file__).resolve().parents[3]
-        / "vllm_ascend"
-        / "worker"
-        / "v2"
-        / "spec_decode"
-        / "via_sd"
-    )
+    source_dir = Path(__file__).resolve().parents[3] / "vllm_ascend" / "worker" / "v2" / "spec_decode" / "via_sd"
     package = sys.modules.get(package_name)
     if package is None:
         package = types.ModuleType(package_name)
@@ -70,6 +63,27 @@ def _logit_row(token_id: int, score: float, vocab_size: int = 4) -> list[float]:
 
 
 class ViaSdRoutingCpuTests(unittest.TestCase):
+    def test_tensor_routing_retains_device_logits_and_ignores_padding(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch is not installed")
+        from unittest.mock import patch
+
+        logits = torch.tensor(
+            [
+                [[0.0, -0.1, -2.0], [0.0, math.log(0.6), -2.0]],
+                [[0.0, -2.0, -3.0], [-math.inf, -math.inf, -math.inf]],
+            ]
+        )
+        with patch.object(_routing, "_as_float_rows", side_effect=AssertionError("full CPU copy")):
+            plan = _routing.build_route_plan(logits, [[1, 1], [1, -1]], valid_lengths=[2, 1], batch_rows=[4, 7])
+        self.assertEqual(plan.route_names, (("high", "medium"), ("low",)))
+        self.assertEqual(plan.fallback_rows, (7,))
+        self.assertEqual(plan.logits[0].data_ptr(), logits[0].data_ptr())
+        with self.assertRaises(ValueError):
+            _routing.build_route_plan(logits, [[1, 1], [1, 0]])
+
     def test_threshold_boundaries_and_stable_relative_confidence(self):
         route = _routing.route_from_score
         self.assertIs(route(0.7), _routing.ViaSdRoute.HIGH)
@@ -145,11 +159,13 @@ class ViaSdRoutingCpuTests(unittest.TestCase):
             ["r0"],
             [[10]],
             [[0, 1, 0]],
-            [[
-                _logit_row(0, 1.0),
-                _logit_row(1, 0.6),
-                _logit_row(0, 1.0),
-            ]],
+            [
+                [
+                    _logit_row(0, 1.0),
+                    _logit_row(1, 0.6),
+                    _logit_row(0, 1.0),
+                ]
+            ],
             target_verify=target,
             qprime_sampler=lambda *_args: 2,
         )
@@ -206,7 +222,7 @@ class ViaSdRoutingCpuTests(unittest.TestCase):
         self.assertEqual(result.target_calls, 1)
         self.assertEqual(request_result.target_fallback_positions, (0,))
         self.assertEqual(request_result.target_accepted_positions, (0,))
-        self.assertEqual(request_result.scheduler_tokens, (2, 0))
+        self.assertEqual(request_result.scheduler_tokens, (2,))
         self.assertEqual(request_result.target_computed_len, 3)
         self.assertEqual(state.target_computed_len, 3)
 
@@ -274,11 +290,14 @@ class ViaSdRoutingCpuTests(unittest.TestCase):
         self.assertEqual(state.target_computed_len, 1)
 
         manager.truncate("r0", 1)
-        self.assertEqual(manager.lengths("r0"), {
-            "committed_len": 1,
-            "qprime_computed_len": 1,
-            "target_computed_len": 1,
-        })
+        self.assertEqual(
+            manager.lengths("r0"),
+            {
+                "committed_len": 1,
+                "qprime_computed_len": 1,
+                "target_computed_len": 1,
+            },
+        )
         manager.discard(["r0"])
         self.assertIsNone(manager.state("r0"))
 

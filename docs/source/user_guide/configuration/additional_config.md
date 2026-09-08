@@ -188,6 +188,11 @@ settings; enabling both selects the combined DyntraLB recompute scheduler.
 **via_sd_config**
 
 The MRv2 VIA-SD pass runs after the proposer has produced a draft block. It
+supports `observe` and an eager, single-device vLLM 0.27.1 hierarchical runtime.
+The hierarchical drafter consumes q' features instead of target features;
+HIGH and MEDIUM do not run target. Prefix caching must be disabled and
+scheduling must be synchronous. See the VIA-SD feature guide for limitations.
+The pass
 executes a sparse q' view made from layers of the already loaded target model
 and returns per-position logits. `observe` mode keeps the original
 observation-only behavior. `hierarchical` mode uses the q' logits to route
@@ -228,7 +233,7 @@ parameters; no extra model checkpoint is loaded. The runner exposes
 current route plan and compact target rows through
 `get_via_sd_route_plan()` and `get_via_sd_target_fallback_rows()`.
 
-In `observe` mode the target path remains unchanged. In `hierarchical` mode,
+In `observe` mode the target path remains unchanged. In the hierarchical runtime,
 the route coordinator must consume the plan before target verification. A
 MEDIUM rewrite invalidates every later draft position; a LOW position first
 brings target KV up to the committed prefix using an actual target forward,
