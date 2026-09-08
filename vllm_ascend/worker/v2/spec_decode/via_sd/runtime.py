@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import time
 
 import numpy as np
@@ -25,15 +26,13 @@ class ViaSdRuntime:
         self.stats = {}
 
     def validate(self, scheduled):
-        from vllm_ascend.utils import vllm_version_is
-
         r = self.runner
         if r.vllm_config.scheduler_config.async_scheduling:
             raise NotImplementedError("VIA-SD requires synchronous scheduling")
         if getattr(r.model_config, "logits_processors", None):
             raise NotImplementedError("VIA-SD does not support custom logits processors")
-        if not vllm_version_is("0.27.1") or not r.model_config.enforce_eager:
-            raise NotImplementedError("VIA-SD requires eager vLLM 0.27.1")
+        if not r.model_config.enforce_eager:
+            raise NotImplementedError("VIA-SD currently requires eager execution")
         p = r.vllm_config.parallel_config
         if any(
             getattr(p, name, 1) != 1
@@ -109,7 +108,12 @@ class ViaSdRuntime:
             num_tokens=scheduled.total_num_scheduled_tokens,
             num_reqs=len(scheduled.num_scheduled_tokens),
         )
-        batch = r.prepare_inputs(scheduled, desc)
+        if 'batch_req_state' in inspect.signature(r.prepare_inputs).parameters:
+            # Ascend's newer override accepts this upstream argument but does
+            # not read it; request state has already been updated above.
+            batch = r.prepare_inputs(scheduled, batch_req_state=None, batch_desc=desc)
+        else:
+            batch = r.prepare_inputs(scheduled, desc)
         tables, slots = r.prepare_attn(batch)
         backend = r.via_sd_verifier.backend
         backend.set_request_block_tables(tables, batch.idx_mapping_np)

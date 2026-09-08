@@ -188,7 +188,7 @@ settings; enabling both selects the combined DyntraLB recompute scheduler.
 **via_sd_config**
 
 The MRv2 VIA-SD pass runs after the proposer has produced a draft block. It
-supports `observe` and an eager, single-device vLLM 0.27.1 hierarchical runtime.
+supports `observe` and an eager, single-device hierarchical runtime for DFlash.
 The hierarchical drafter consumes q' features instead of target features;
 HIGH and MEDIUM do not run target. Prefix caching must be disabled and
 scheduling must be synchronous. See the VIA-SD feature guide for limitations.

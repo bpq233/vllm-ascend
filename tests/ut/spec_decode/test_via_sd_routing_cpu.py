@@ -191,7 +191,7 @@ class ViaSdRoutingCpuTests(unittest.TestCase):
 
         def target_batch(events):
             batches.append(tuple(events))
-            self.assertEqual(len(events), 1)
+            self.assertEqual(len(events), 2)
             event = events[0]
             self.assertEqual(event.batch_row, 4)
             self.assertEqual(event.position, 0)
@@ -202,6 +202,7 @@ class ViaSdRoutingCpuTests(unittest.TestCase):
                     "token": event.draft_token,
                     "computed_len": event.committed_len + 1,
                 }
+                for event in events
             }
 
         result = coordinator.run(
@@ -218,13 +219,13 @@ class ViaSdRoutingCpuTests(unittest.TestCase):
 
         self.assertEqual(len(batches), 1)
         self.assertEqual(len(catchups), 1)
-        self.assertEqual(result.fallback_rows, (4,))
-        self.assertEqual(result.target_calls, 1)
-        self.assertEqual(request_result.target_fallback_positions, (0,))
-        self.assertEqual(request_result.target_accepted_positions, (0,))
-        self.assertEqual(request_result.scheduler_tokens, (2,))
-        self.assertEqual(request_result.target_computed_len, 3)
-        self.assertEqual(state.target_computed_len, 3)
+        self.assertEqual(result.fallback_rows, (4, 4))
+        self.assertEqual(result.target_calls, 2)
+        self.assertEqual(request_result.target_fallback_positions, (0, 1))
+        self.assertEqual(request_result.target_accepted_positions, (0, 1))
+        self.assertEqual(request_result.scheduler_tokens, (2, 0))
+        self.assertEqual(request_result.target_computed_len, 4)
+        self.assertEqual(state.target_computed_len, 4)
 
     def test_target_rewrite_stops_at_first_low_position(self):
         coordinator = _coordinator.ViaSdExecutionCoordinator()

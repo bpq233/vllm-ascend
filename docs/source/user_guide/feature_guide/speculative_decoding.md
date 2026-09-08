@@ -74,8 +74,8 @@ second checkpoint. The pass supports two execution modes:
 - `observe` (the default) records q' logits and timing only. The existing
   target forward, rejection sampler, scheduler, and target KV cache remain the
   source of truth.
-- `hierarchical` uses q' features for the existing drafter and runs target
-  only for LOW positions. The initial runtime requires eager vLLM 0.27.1,
+- `hierarchical` uses q' features for the existing DFlash drafter and runs target
+  only for LOW positions. The initial runtime requires eager execution,
   one device, synchronous scheduling, and prefix caching disabled. A
   HIGH position (relative confidence `>= accept_ratio`) is accepted on q'. A
   MEDIUM position (between `escalate_ratio` and `accept_ratio`) is sampled from

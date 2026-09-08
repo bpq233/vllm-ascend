@@ -550,12 +550,14 @@ class ViaSdExecutionCoordinator:
         compact_events: list[ViaSdTargetRequest] = []
         for row, request_id in enumerate(ids):
             working_prefix = list(prefixes[row])
+            target_suffix = False
             for decision in plan.decisions[row]:
-                if decision.route is ViaSdRoute.HIGH:
+                if not target_suffix and decision.route is ViaSdRoute.HIGH:
                     working_prefix.append(decision.draft_token)
                     continue
-                if decision.route is ViaSdRoute.MEDIUM:
+                if not target_suffix and decision.route is ViaSdRoute.MEDIUM:
                     break
+                target_suffix = True
                 compact_events.append(
                     ViaSdTargetRequest(
                         batch_row=plan.batch_rows[row] if plan.batch_rows else row,
@@ -567,8 +569,7 @@ class ViaSdExecutionCoordinator:
                         target_computed_len=self.states[request_id].target_computed_len,
                     )
                 )
-                # LOW ends this block even when target accepts the token.
-                break
+                working_prefix.append(decision.draft_token)
         compact_requests = tuple(compact_events)
         batch_decisions = self._target_batch_decisions(compact_requests, target_verify_batch)
         results: list[ViaSdRequestResult] = []
@@ -596,14 +597,15 @@ class ViaSdExecutionCoordinator:
                 and len(sampling_params) == len(ids)
                 else sampling_params
             )
+            target_suffix = False
             for decision in decisions:
-                if decision.route is ViaSdRoute.HIGH:
+                if not target_suffix and decision.route is ViaSdRoute.HIGH:
                     working.append(decision.draft_token)
                     accepted_drafts.append(decision.draft_token)
                     qprime_valid = len(working) - 1
                     source = "qprime_high"
                     continue
-                if decision.route is ViaSdRoute.MEDIUM:
+                if not target_suffix and decision.route is ViaSdRoute.MEDIUM:
                     logits = plan.logits_for(row, decision.position)
                     sampler = self.qprime_sampler if qprime_sampler is None else qprime_sampler
                     if sampler is None:
@@ -635,6 +637,7 @@ class ViaSdExecutionCoordinator:
 
                 # LOW: the target must own this position.  Catch up from the
                 # target's actual computed length before asking for logits.
+                target_suffix = True
                 fallback_positions.append(decision.position)
                 catchup_tokens += self._catch_up(state, working, target_catchup)
                 target_valid = state.target_computed_len
@@ -675,8 +678,7 @@ class ViaSdExecutionCoordinator:
                     target_accepted_positions.append(decision.position)
                     qprime_valid = len(working) - 1
                     source = "target_accept"
-                    stop_position = decision.position
-                    break
+                    continue
                 working.append(target_decision.token)
                 target_rewrite = (decision.draft_token, target_decision.token)
                 source = "target_rewrite"
@@ -685,7 +687,7 @@ class ViaSdExecutionCoordinator:
                 break
 
             else:
-                if decisions:
+                if decisions and not target_suffix:
                     source = "qprime_high"
                 stop_position = None
                 qprime_valid = min(qprime_valid, len(working) - 1)

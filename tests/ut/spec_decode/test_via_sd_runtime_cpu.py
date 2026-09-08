@@ -50,12 +50,12 @@ class RuntimeTests(unittest.TestCase):
         )
         r.rejection_sampler = NS(_verify=Mock(return_value=(None, torch.tensor([[1, 0, -1]]), torch.tensor([2]))))
         result = runtime.sample(None)
-        self.assertEqual(result.sampled_token_ids, [[1]])
+        self.assertEqual(result.sampled_token_ids, [[1, 2]])
         args = r.speculator.propose.call_args.args
         torch.testing.assert_close(args[3][0], torch.tensor([9., 8., 7.]))
         torch.testing.assert_close(args[4][0][0], torch.tensor([19., 18., 17.]))
         self.assertEqual(runtime.target_features, {})
-        self.assertEqual(runtime.stats["target_calls"], 1)
+        self.assertEqual(runtime.stats["target_calls"], 2)
 
     def setUp(self):
         self.modules = {}
@@ -282,10 +282,10 @@ class RuntimeTests(unittest.TestCase):
         runtime._target_backend = NS(set_request_block_tables=Mock(), forward=forward)
         r.rejection_sampler = NS(_verify=Mock(return_value=(None, torch.tensor([[1, 0, -1]]), torch.tensor([2]))))
         output = runtime.sample(None)
-        self.assertEqual(output.sampled_token_ids, [[1, 2], [0], [1]])
-        self.assertEqual(writes, [((0,), 0, 2)])
+        self.assertEqual(output.sampled_token_ids, [[1, 2], [0], [1, 2]])
+        self.assertEqual(writes, [((0,), 0, 2), ((1,), 1, 2)])
         self.assertEqual(r.rejection_sampler._verify.call_args.args[5].tolist(), [2])
-        self.assertEqual(r.speculator.propose.call_args.args[6].tolist(), [1, 2, 2])
+        self.assertEqual(r.speculator.propose.call_args.args[6].tolist(), [1, 2, 1])
         self.assertEqual(r.req_states.draft_tokens[[3, 0, 2]].tolist(), [[1, 1], [2, 2], [0, 0]])
         self.assertEqual(r._via_sd_route_plan.batch_rows, (0, 1, 2))
         self.assertEqual(len(r._via_sd_execution_result.results), 3)
