@@ -108,7 +108,7 @@ class ViaSdRuntime:
             num_tokens=scheduled.total_num_scheduled_tokens,
             num_reqs=len(scheduled.num_scheduled_tokens),
         )
-        if 'batch_req_state' in inspect.signature(r.prepare_inputs).parameters:
+        if "batch_req_state" in inspect.signature(r.prepare_inputs).parameters:
             # Ascend's newer override accepts this upstream argument but does
             # not read it; request state has already been updated above.
             batch = r.prepare_inputs(scheduled, batch_req_state=None, batch_desc=desc)
@@ -339,6 +339,68 @@ class ViaSdRuntime:
         )
         return ViaSdTargetDecision(int(count[0].item()) > 1, int(sampled[0, 0].item()), len(event.prefix_tokens))
 
+    def _verify_target_batch(self, events):
+        if not events:
+            return {}
+        if self._target_backend is None:
+            self._catchup(events[0])
+        backend = self._target_backend
+        qbackend = self.runner.via_sd_verifier.backend
+        backend.set_request_block_tables(qbackend._request_block_tables, qbackend._request_state_indices)
+        grouped = {}
+        for event in events:
+            grouped.setdefault(event.request_id, []).append(event)
+        requests, metadata = [], []
+        for request_id, group in grouped.items():
+            first = group[0]
+            state = self.coordinator.states[request_id]
+            tokens = list(first.prefix_tokens) + [event.draft_token for event in group]
+            start = min(state.target_computed_len, max(0, len(tokens) - 1))
+            requests.append(tokens[start:])
+            metadata.append((request_id, group, tokens, start))
+        started = self._clock()
+        rows = backend.forward_batch(
+            requests, [item[3] for item in metadata], [self.pending[0].req_ids.index(item[0]) for item in metadata]
+        )
+        self._record("target", sum(len(row) for row in requests), started)
+        decisions = {}
+        for row, (request_id, group, tokens, start) in zip(rows, metadata):
+            self.coordinator.states[request_id].record_target_forward(len(tokens))
+            for event in group:
+                index = len(event.prefix_tokens) - 1 - start
+                if index < 0 or index >= len(row):
+                    raise RuntimeError("target batch returned too few LOW logits")
+                decisions[(request_id, event.position)] = self._verify_target_logits(event, row[index])
+        return decisions
+
+    def _verify_target_logits(self, event, logits):
+        r = self.runner
+        batch = self.pending[0]
+        row = batch.req_ids.index(event.request_id)
+        view = self._single_batch(batch, row, len(event.prefix_tokens) - 1)
+        device = logits.device
+        pos = torch.tensor([len(event.prefix_tokens) - 1, len(event.prefix_tokens)], device=device)
+        sampled = torch.tensor([event.prefix_tokens[-1], event.draft_token], device=device)
+        local = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        cu = torch.tensor([0, 2], dtype=torch.int32, device=device)
+        draft_logits = r.speculator.draft_logits
+        if draft_logits is not None:
+            draft_logits = draft_logits.clone()
+            index = int(view.idx_mapping_np[0])
+            draft_logits[index, 0] = r.speculator.draft_logits[index, event.position]
+        _, output, count = r.rejection_sampler._verify(
+            torch.stack([logits, logits]),
+            draft_logits,
+            sampled,
+            pos,
+            cu,
+            view.idx_mapping,
+            view.idx_mapping_np,
+            view.idx_mapping.repeat(2),
+            local,
+        )
+        return ViaSdTargetDecision(int(count[0].item()) > 1, int(output[0, 0].item()), len(event.prefix_tokens))
+
     @torch.inference_mode()
     def sample(self, grammar_output):
         from vllm.logger import logger
@@ -369,6 +431,7 @@ class ViaSdRuntime:
                     qprime_computed_lengths=[len(prefixes[row]) + len(draft)],
                     target_catchup=self._catchup,
                     target_verify=self._verify_target,
+                    target_verify_batch=self._verify_target_batch,
                     qprime_sampler=lambda req, pos, values, params: self._sample(
                         values, batch, batch.req_ids.index(req), len(prefixes[batch.req_ids.index(req)]) + pos - 1
                     ),
@@ -445,10 +508,18 @@ class ViaSdRuntime:
                 [self.coordinator.states[rid].qprime_computed_len for rid in batch.req_ids],
                 self.stats,
             )
+            for plan in plans:
+                logger.info(
+                    "[VIA-SD] route request_ids=%s draft_tokens=%s scores=%s routes=%s",
+                    plan.request_ids,
+                    plan.draft_tokens,
+                    tuple(tuple(round(float(score), 5) for score in row) for row in plan.scores),
+                    plan.route_names,
+                )
         self.pending = None
         self.target_features.clear()
         if self._target_backend is not None:
-            model = getattr(self._target_backend, 'model', None)
+            model = getattr(self._target_backend, "model", None)
             if model is not None:
                 model.last_hidden_states = None
                 model.last_aux_hidden_states = None
