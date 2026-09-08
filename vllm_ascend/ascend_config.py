@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import json
+import math
 import os
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -175,16 +176,22 @@ class RejectionSamplerConfig:
 
 @config
 class ViaSdConfig:
-    """Configuration for the MRv2 VIA-SD q' observation pass.
+    """Configuration for the MRv2 VIA-SD q' verifier.
 
     ``layer_ids`` names the target decoder layers retained by q'.  q' is a
     structural view of the already loaded target model: its parameters are
-    aliases of target parameters and no second checkpoint is loaded.  The
-    feature is observation-only for now; target rejection sampling remains
-    the sole owner of the generated token.
+    aliases of target parameters and no second checkpoint is loaded.  ``mode``
+    selects the execution contract: ``disabled`` turns the feature off,
+    ``observe`` preserves the historical side-pass behavior, and
+    ``hierarchical`` lets q' route each draft position before target fallback.
     """
 
     enabled: bool = False
+    mode: str = "observe"
+    # Relative q'(draft)/max(q') gates.  These are intentionally direct
+    # configuration values rather than paper alpha/beta aliases.
+    accept_ratio: float = 0.7
+    escalate_ratio: float = 0.5
     # Leave empty to retain a deterministic, evenly spaced fraction of the
     # target layers.  Supplying IDs makes a layer-search result reproducible.
     layer_ids: list[int] = dataclasses.field(default_factory=list)
@@ -204,6 +211,23 @@ class ViaSdConfig:
 
     @model_validator(mode="after")
     def _validate(self):
+        if self.mode not in {"disabled", "observe", "hierarchical"}:
+            raise ValueError(
+                "via_sd_config.mode must be one of ['disabled', 'observe', 'hierarchical']"
+            )
+        for name, value in (
+            ("accept_ratio", self.accept_ratio),
+            ("escalate_ratio", self.escalate_ratio),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"via_sd_config.{name} must be numeric")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"via_sd_config.{name} must be finite")
+        if not 0 <= self.escalate_ratio < self.accept_ratio <= 1:
+            raise ValueError(
+                "via_sd_config thresholds must satisfy "
+                "0 <= escalate_ratio < accept_ratio <= 1"
+            )
         if any(layer_id < 0 for layer_id in self.layer_ids):
             raise ValueError("via_sd_config.layer_ids must contain non-negative layer IDs")
         if len(set(self.layer_ids)) != len(self.layer_ids):
@@ -1200,6 +1224,9 @@ def init_ascend_config(vllm_config):
     # the existing typed sub-config instead of maintaining two runtime paths.
     via_sd_aliases = {
         "enable_via_sd": "enabled",
+        "via_sd_mode": "mode",
+        "via_sd_accept_ratio": "accept_ratio",
+        "via_sd_escalate_ratio": "escalate_ratio",
         "via_sd_layer_ids": "layer_ids",
         "via_sd_layer_ratio": "layer_fraction",
         "via_sd_enable_kv_cache": "kv_cache_enabled",

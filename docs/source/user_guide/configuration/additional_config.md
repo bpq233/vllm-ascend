@@ -73,7 +73,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `enable_transpose_kv_cache_by_block`| bool | `True`  | Whether to enable transpose KV cache by block. Can also be configured via the `VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK` environment variable during the migration period. |
 | `enable_dsa_cp`                     | bool | `False` | Whether to enable dsa_cp for DeepSeek V3.2, DeepSeek V4, and other models with the same architecture. This feature requires sequence parallelism to be enabled.|
 | `rejection_sampler_config`          | dict | `{}`    | Configuration options for rejection sampler (block verify and entropy verify). |
-| `via_sd_config`                     | dict | `{}`    | MRv2 VIA-SD q' side-pass configuration. Disabled by default; q' logits never alter target verification. |
+| `via_sd_config`                     | dict | `{}`    | MRv2 VIA-SD q' configuration. Disabled by default; supports observation-only and hierarchical q'-first routing modes. |
 | `dynamic_spec_config`               | dict | `{}`    | Configuration options for Dynamic Speculative Decoding. See [Dynamic Speculative Decoding](../feature_guide/speculative_decoding.md#dynamic-speculative-decoding). |
 | `multistream_dsv4_dsa_overlap`      | bool | `True`  | Whether to enable dsa multi-stream overlap for DeepSeek V4.  |
 | `rl_config`                        | dict | `{}`    | One-click RL mode configuration. See <a href="#rl_config">rl_config</a> for all fields, the two deployment modes, usage examples, and the migration guide. |
@@ -189,13 +189,20 @@ settings; enabling both selects the combined DyntraLB recompute scheduler.
 
 The MRv2 VIA-SD pass runs after the proposer has produced a draft block. It
 executes a sparse q' view made from layers of the already loaded target model
-and returns per-position logits. It is observation-only in this release: q'
-never rewrites tokens, changes scheduler state, or supplies logits to the
-target rejection sampler.
+and returns per-position logits. `observe` mode keeps the original
+observation-only behavior. `hierarchical` mode uses the q' logits to route
+each draft position before target verification: high-confidence positions stay
+on q', medium-confidence positions are sampled and terminate the stale suffix,
+and low-confidence positions are compacted into a target fallback batch.
+Logical q' and target KV lengths are tracked independently, so accepting a
+draft token never implies that the target has computed that token.
 
 | Name | Type | Default | Description |
 | ---- | ---- | ------- | ----------- |
 | `enabled` | bool | `False` | Enable the MRv2 q' side pass. |
+| `mode` | str | `"observe"` | Execution contract: `"disabled"`, `"observe"`, or `"hierarchical"`. `observe` records q' logits without changing target sampling; `hierarchical` enables the three-way q' route coordinator. |
+| `accept_ratio` | float | `0.7` | HIGH boundary for `q'(draft) / max(q')`. A score greater than or equal to this value stays on the q' path. Must satisfy `0 <= escalate_ratio < accept_ratio <= 1`. |
+| `escalate_ratio` | float | `0.5` | MEDIUM lower boundary for `q'(draft) / max(q')`. Scores in `[escalate_ratio, accept_ratio)` are rewritten from q' and stop the suffix; lower scores are LOW and use target verification. |
 | `layer_ids` | list[int] | `[]` | Explicit sorted target decoder layers retained by q'. Empty selects an evenly spaced fraction. |
 | `layer_fraction` | float | `0.4` | Fraction used when `layer_ids` is empty. Must be in `(0, 1]`. |
 | `kv_cache_enabled` | bool | `True` | Allocate and manage separate q' KV pages. When false, run q' from scratch for every block. |
@@ -208,15 +215,26 @@ Otherwise, the requested fraction is selected at evenly spaced positions over
 the full target depth, not from the first N layers. The resolved layer set is
 fixed when q' is loaded; restart the engine to change it. Flat aliases
 `enable_via_sd`, `via_sd_layer_ids`, `via_sd_layer_ratio`,
-`via_sd_enable_kv_cache`, and `via_sd_log_validation_timing` are accepted at
-the top level of `additional_config`. `via_sd_log_enabled` (or
+`via_sd_enable_kv_cache`, `via_sd_log_validation_timing`,
+`via_sd_mode`, `via_sd_accept_ratio`, and `via_sd_escalate_ratio` are accepted
+at the top level of `additional_config`. `via_sd_log_enabled` (or
 `via_sd_enable_log`) controls VIA-SD log output independently of timing.
 Conflicting flat and nested values are rejected.
 
 The first adapter supports dense Qwen3 and Qwen2 decoder layers on a single
 pipeline-parallel rank. q' parameters alias the corresponding target
-parameters; no extra model checkpoint is loaded. The runner exposes only
-`get_via_sd_last_logits()` and keeps the target path unchanged.
+parameters; no extra model checkpoint is loaded. The runner exposes
+`get_via_sd_last_logits()` in both active modes and additionally exposes the
+current route plan and compact target rows through
+`get_via_sd_route_plan()` and `get_via_sd_target_fallback_rows()`.
+
+In `observe` mode the target path remains unchanged. In `hierarchical` mode,
+the route coordinator must consume the plan before target verification. A
+MEDIUM rewrite invalidates every later draft position; a LOW position first
+brings target KV up to the committed prefix using an actual target forward,
+then verifies only the compact LOW rows. Target results are scattered back to
+the original request rows, and stale physical pages may remain allocated but
+are never logically reused past the recorded stage lengths.
 
 **dynamic_spec_config**
 

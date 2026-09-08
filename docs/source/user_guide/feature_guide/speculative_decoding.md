@@ -63,15 +63,28 @@ vllm serve path/to/target/model \
 > [!NOTE]
 > On Ascend NPUs, the `npu_fused_infer_attention_score` operator supports a maximum of 16 tokens per decode round. Therefore, `(num_speculative_tokens + 1)` must be ≤ 16.
 
-## VIA-SD q' observation pass on MRv2
+## VIA-SD q' routing on MRv2
 
 MRv2 can run an optional q' side pass for the same draft block scheduled for
 target verification.
 The first implementation is a sparse view of the already loaded target model:
 it reuses target parameters, embedding, and output head, and does not load a
-second checkpoint. q' logits are observation-only. The existing target forward,
-rejection sampler, scheduler, and target KV cache continue to decide and commit
-tokens exactly as before.
+second checkpoint. The pass supports two execution modes:
+
+- `observe` (the default) records q' logits and timing only. The existing
+  target forward, rejection sampler, scheduler, and target KV cache remain the
+  source of truth.
+- `hierarchical` applies a per-position route before target verification. A
+  HIGH position (relative confidence `>= accept_ratio`) is accepted on q'. A
+  MEDIUM position (between `escalate_ratio` and `accept_ratio`) is sampled from
+  q', replaces the draft token, and terminates the remaining stale suffix. A
+  LOW position (`< escalate_ratio`) is sent to the target; only LOW positions
+  are included in the compact fallback batch.
+
+The default route boundaries are `accept_ratio = 0.7` and
+`escalate_ratio = 0.5`, where confidence is `q'(draft) / max(q')`. The
+boundaries are inclusive at HIGH and MEDIUM respectively and must satisfy
+`0 <= escalate_ratio < accept_ratio <= 1`.
 
 The default selection retains the nearest 40% of target decoder layers, spread
 evenly over the model. An explicit sorted `layer_ids` list can be supplied for
@@ -83,6 +96,9 @@ pipeline parallelism, quantization, LoRA, or KV transfer fail open by default.
 additional_config = {
     "via_sd_config": {
         "enabled": True,
+        "mode": "observe",       # or "hierarchical" for q'-first routing
+        "accept_ratio": 0.7,
+        "escalate_ratio": 0.5,
         # [] means an evenly spaced 40% selection. For Qwen3-8B this resolves
         # to 14 of its 36 decoder layers.
         "layer_ids": [],
@@ -103,10 +119,11 @@ recreate or restart the engine to use a new selection.
 
 The flat names from the VIA-SD feature specification are also accepted in
 `additional_config`: `enable_via_sd`, `via_sd_layer_ids`,
-`via_sd_layer_ratio`, `via_sd_enable_kv_cache`, and
-`via_sd_log_validation_timing`. `via_sd_log_enabled` (or
-`via_sd_enable_log`) controls VIA-SD log output independently. Do not provide
-a flat name and its nested equivalent with different values.
+`via_sd_layer_ratio`, `via_sd_enable_kv_cache`, `via_sd_log_validation_timing`,
+`via_sd_mode`, `via_sd_accept_ratio`, and `via_sd_escalate_ratio`.
+`via_sd_log_enabled` (or `via_sd_enable_log`) controls VIA-SD log output
+independently. Do not provide a flat name and its nested equivalent with
+different values.
 
 When `kv_cache_enabled` is true, q' attention receives separate physical KV
 pages through MRv2's normal allocator and maintains its own request-prefix
@@ -114,7 +131,11 @@ validity. When false, q' runs a complete no-cache forward for each draft block;
 no q' KV pages are allocated. The latest output is a tensor of shape
 `[batch, draft_steps, vocab]`, available from the MRv2 runner through
 `get_via_sd_last_logits()`. Invalid padded draft positions are filled with
-`-inf`. q' never returns a replacement token to target sampling in this stage.
+`-inf`. In `observe` mode q' never returns a replacement token to target
+sampling. In `hierarchical` mode use the route plan exposed by
+`get_via_sd_route_plan()` (and its `fallback_rows`) to drive the compact
+target adapter; `execute_via_sd_hierarchical()` provides the device-independent
+coordinator interface for integrations and tests.
 
 With VIA-SD enabled, every q' pass and every target forward that verifies a
 draft block emits a synchronized `elapsed_ms` log. The q' log also reports
@@ -131,7 +152,13 @@ so the two counters should advance together when both passes succeed. Set
 per-pass synchronization overhead.
 
 `kv_cache_enabled` changes only q' work. Target validation uses its original
-KV path in both cases, so similar target timings are expected.
+KV path in both cases, so similar target timings are expected. In hierarchical
+mode q' and target maintain separate logical lengths (`qprime_computed_len`
+and `target_computed_len`) in addition to the scheduler-visible
+`committed_len`; a q' acceptance does not advance target KV. Before a LOW
+fallback, target catches up to the committed prefix with a real forward. After
+a q' or target rewrite, the suffix is logically truncated even if its physical
+KV pages are retained.
 
 ## Speculating by matching n-grams in the prompt
 

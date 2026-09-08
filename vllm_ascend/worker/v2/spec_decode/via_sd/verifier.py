@@ -9,7 +9,8 @@ from typing import Any, Hashable
 import torch
 
 from .backend import ViaSdPagedBackend
-from .kv_cache import ViaSdKVCacheManager
+from .kv_cache import ViaSdKVCacheManager, ViaSdKVCacheState
+from .routing import ViaSdRoutePlan, build_route_plan
 
 
 def _as_token_list(tokens: Sequence[int] | torch.Tensor) -> list[int]:
@@ -66,10 +67,33 @@ class ViaSdVerifier:
         self.model = model
         self.config = config
         self.cache_enabled = bool(getattr(config, "kv_cache_enabled", True))
+        self.accept_ratio = float(getattr(config, "accept_ratio", 0.7))
+        self.escalate_ratio = float(getattr(config, "escalate_ratio", 0.5))
         self.max_num_tokens = int(runner.max_num_tokens)
         self.cache = ViaSdKVCacheManager(self.cache_enabled)
         self.backend = backend or ViaSdPagedBackend(runner, model, self.cache_enabled)
         self.last_stats = ViaSdValidationStats(cache_enabled=self.cache_enabled)
+
+    def build_route_plan(
+        self,
+        logits: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        *,
+        request_ids: Sequence[Hashable] | None = None,
+        valid_lengths: Sequence[int] | None = None,
+        batch_rows: Sequence[int] | None = None,
+    ) -> ViaSdRoutePlan:
+        """Classify q' rows using the configured direct thresholds."""
+
+        return build_route_plan(
+            logits,
+            draft_token_ids,
+            self.accept_ratio,
+            self.escalate_ratio,
+            request_ids=request_ids,
+            valid_lengths=valid_lengths,
+            batch_rows=batch_rows,
+        )
 
     @staticmethod
     def build_scoring_input(
@@ -313,6 +337,8 @@ class ViaSdVerifier:
         prefix_token_ids: Sequence[Sequence[int]],
         valid_lengths: Sequence[int] | None = None,
         table_indices: Sequence[int] | None = None,
+        committed_lengths: Sequence[int] | None = None,
+        target_computed_lengths: Sequence[int] | None = None,
     ) -> torch.Tensor:
         if draft_token_ids.ndim != 2:
             raise ValueError(f"q' draft tokens must be rank 2, got {draft_token_ids.shape}")
@@ -395,7 +421,66 @@ class ViaSdVerifier:
         for row, logits in enumerate(rows):
             if logits is not None:
                 output[row, : logits.shape[0]] = logits
+        if committed_lengths is not None and len(committed_lengths) != batch:
+            raise ValueError("q' committed-length metadata does not match the batch")
+        if target_computed_lengths is not None and len(target_computed_lengths) != batch:
+            raise ValueError("target computed-length metadata does not match the batch")
+        # The default observation path intentionally keeps the historical
+        # physical-token bookkeeping.  Hierarchical callers may provide the
+        # logical committed/target lengths explicitly after the real forward.
+        if committed_lengths is not None or target_computed_lengths is not None:
+            for row, request_id in enumerate(request_ids):
+                self.cache.update_lengths(
+                    request_id,
+                    committed_len=(None if committed_lengths is None else int(committed_lengths[row])),
+                    target_computed_len=(
+                        None
+                        if target_computed_lengths is None
+                        else int(target_computed_lengths[row])
+                    ),
+                )
         return output
+
+    @torch.inference_mode()
+    def verify_and_route(
+        self,
+        draft_token_ids: torch.Tensor,
+        request_ids: Sequence[Hashable],
+        request_indices: Sequence[int],
+        prefix_token_ids: Sequence[Sequence[int]],
+        valid_lengths: Sequence[int] | None = None,
+        table_indices: Sequence[int] | None = None,
+        *,
+        batch_rows: Sequence[int] | None = None,
+    ) -> tuple[torch.Tensor, ViaSdRoutePlan]:
+        """Run q' once and return logits together with its route plan."""
+
+        logits = self.verify(
+            draft_token_ids,
+            request_ids=request_ids,
+            request_indices=request_indices,
+            prefix_token_ids=prefix_token_ids,
+            valid_lengths=valid_lengths,
+            table_indices=table_indices,
+        )
+        plan = self.build_route_plan(
+            logits,
+            draft_token_ids,
+            request_ids=request_ids,
+            valid_lengths=valid_lengths,
+            batch_rows=batch_rows,
+        )
+        return logits, plan
+
+    def truncate(self, request_id: Hashable, valid_prefix_len: int) -> None:
+        """Invalidate a q' suffix after a rewrite without freeing pages."""
+
+        self.cache.truncate(request_id, valid_prefix_len)
+
+    def cache_state(self, request_id: Hashable) -> ViaSdKVCacheState | None:
+        return self.cache.state(request_id)
+
+    get_cache_state = cache_state
 
     def clear(self) -> None:
         self.cache.clear()
