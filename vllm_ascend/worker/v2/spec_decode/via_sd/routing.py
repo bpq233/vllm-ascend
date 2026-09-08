@@ -368,14 +368,15 @@ def build_route_plan(
                 raise ValueError("draft token is outside qprime vocabulary")
             tokens[i, :length] = torch.as_tensor(row, device=tokens.device)
             mask[i, :length] = True
-        maximum = logit_rows.amax(dim=-1)
-        selected = logit_rows.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+        probabilities = torch.softmax(logit_rows.float(), dim=-1)
+        maximum = probabilities.amax(dim=-1)
+        selected = probabilities.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
         invalid = (
             torch.isnan(logit_rows).any(dim=-1) | torch.isposinf(logit_rows).any(dim=-1) | torch.isneginf(maximum)
         ) & mask
         if invalid.any().item():
             raise ValueError("qprime logits contain NaN, positive infinity, or an all -inf row")
-        tensor_scores = (selected.float() - maximum.float()).exp().cpu().tolist()
+        tensor_scores = (selected / maximum.clamp_min(torch.finfo(probabilities.dtype).tiny)).cpu().tolist()
 
     all_scores: list[tuple[float, ...]] = []
     all_decisions: list[tuple[ViaSdDecision, ...]] = []

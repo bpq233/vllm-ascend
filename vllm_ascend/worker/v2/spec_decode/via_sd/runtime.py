@@ -20,7 +20,6 @@ class ViaSdRuntime:
         self.coordinator = ViaSdExecutionCoordinator(config.accept_ratio, config.escalate_ratio)
         runner._via_sd_coordinator = self.coordinator
         self.pending = None
-        self.target_logits = {}
         self.target_features = {}
         self._target_backend = None
         self.stats = {}
@@ -91,10 +90,9 @@ class ViaSdRuntime:
         self.target_features.clear()
         for req in scheduled.scheduled_new_reqs:
             self.coordinator.discard([req.req_id])
-            self.target_logits.pop(req.req_id, None)
             r.via_sd_verifier.discard([req.req_id])
         for rid in set(scheduled.finished_req_ids) | set(scheduled.preempted_req_ids or ()):
-            self.target_logits.pop(rid, None)
+            self.coordinator.discard([rid])
         r.update_pp_decode_requests()
         r.finish_requests(scheduled)
         r.free_states(scheduled)
@@ -117,7 +115,7 @@ class ViaSdRuntime:
         tables, slots = r.prepare_attn(batch)
         backend = r.via_sd_verifier.backend
         backend.set_request_block_tables(tables, batch.idx_mapping_np)
-        hidden_rows, aux_rows, prefixes, drafts = [], [], [], []
+        token_rows, begins, prefixes, drafts, request_rows = [], [], [], [], []
         for row, rid in enumerate(batch.req_ids):
             index = int(batch.idx_mapping_np[row])
             lo, hi = map(int, batch.query_start_loc_np[row : row + 2])
@@ -129,12 +127,19 @@ class ViaSdRuntime:
             prefix = tokens[:-count] if count else tokens
             state = self.coordinator.state_for(rid, prefix)
             begin = min(state.qprime_computed_len, start) if backend.cache_enabled else 0
-            hs, aux = self._features(tokens, begin, row)
-            hidden_rows.append(hs[start - begin :])
-            aux_rows.append([value[start - begin :] for value in aux] if aux else [])
-            state.record_qprime_forward(len(tokens))
+            token_rows.append(tokens)
+            begins.append(begin)
+            request_rows.append(row)
             drafts.append(query[-count:] if count else [])
             prefixes.append(prefix)
+        feature_rows = self._features_batch(token_rows, begins, request_rows)
+        hidden_rows, aux_rows = [], []
+        for row, (hs, aux), tokens, begin in zip(range(len(batch.req_ids)), feature_rows, token_rows, begins):
+            lo = int(batch.query_start_loc_np[row])
+            start = int(batch.positions[lo].item())
+            hidden_rows.append(hs[start - begin :])
+            aux_rows.append([value[start - begin :] for value in aux] if aux else [])
+            self.coordinator.states[batch.req_ids[row]].record_qprime_forward(len(tokens))
         hidden = torch.cat(hidden_rows)
         aux = [torch.cat([row[i] for row in aux_rows]) for i in range(len(aux_rows[0]))] or None
         metadata = r.model_state.prepare_attn(
@@ -151,6 +156,41 @@ class ViaSdRuntime:
             scheduled,
         )
         return None
+
+    def _features_batch(self, token_rows, begins, request_rows):
+        backend = self.runner.via_sd_verifier.backend
+        limit = self.runner.max_num_tokens if backend.cache_enabled else self.runner.max_model_len
+        hidden_rows = [[] for _ in token_rows]
+        aux_rows = [None for _ in token_rows]
+        offsets = list(begins)
+        while True:
+            active = [i for i, offset in enumerate(offsets) if offset < len(token_rows[i])]
+            if not active:
+                break
+            requests = [token_rows[i][offsets[i] : offsets[i] + limit] for i in active]
+            starts = [offsets[i] for i in active]
+            tables = [request_rows[i] for i in active]
+            started = self._clock()
+            packed_hidden, packed_aux = backend.forward_features(requests, starts, tables)
+            self._record('qprime', sum(len(request) for request in requests), started)
+            offset = 0
+            for i, request in zip(active, requests):
+                count = len(request)
+                hidden_rows[i].append(packed_hidden[offset : offset + count])
+                if packed_aux:
+                    if aux_rows[i] is None:
+                        aux_rows[i] = [[] for _ in packed_aux]
+                    for values, value in zip(aux_rows[i], packed_aux):
+                        values.append(value[offset : offset + count])
+                offsets[i] += count
+                offset += count
+        return [
+            (
+                torch.cat(hidden),
+                [torch.cat(values) for values in auxiliary] if auxiliary else None,
+            )
+            for hidden, auxiliary in zip(hidden_rows, aux_rows)
+        ]
 
     def _features(self, tokens, begin, row):
         backend = self.runner.via_sd_verifier.backend
@@ -196,9 +236,6 @@ class ViaSdRuntime:
         if not 0 <= relative < hi - lo:
             raise ValueError("Sampling position is outside the prepared request")
         result.input_ids = batch.input_ids[lo + relative : lo + relative + 1]
-        lo, hi = map(int, batch.query_start_loc_np[row : row + 2])
-        local_position = position - int(batch.positions[lo].item())
-        result.input_ids = batch.input_ids[lo + local_position : lo + local_position + 1]
         if result.input_ids.numel() != 1:
             raise RuntimeError("Sampler position is outside the scheduled request query")
         result.logits_indices = torch.zeros(1, dtype=torch.int64, device=device)
@@ -259,7 +296,6 @@ class ViaSdRuntime:
             logits = backend.forward(chunk, start, row)
             self._save_target_features(event.request_id, start, backend)
             self._record("target", len(chunk), started)
-            self.target_logits[event.request_id] = logits[-1].clone()
             self.coordinator.states[event.request_id].record_target_forward(start + len(chunk))
         return event.committed_len
 
@@ -382,9 +418,9 @@ class ViaSdRuntime:
         self._record("target", sum(len(row) for row in requests), started)
         decisions = {}
         packed_offset = 0
-        for row, (request_id, group, tokens, start) in zip(rows, metadata):
+        for row_index, (row, (request_id, group, tokens, start)) in enumerate(zip(rows, metadata)):
             self.coordinator.states[request_id].record_target_forward(len(tokens))
-            count = len(requests[metadata.index((request_id, group, tokens, start))])
+            count = len(requests[row_index])
             packed_hidden = getattr(backend, 'last_forward_hidden', None)
             packed_aux = getattr(backend, 'last_forward_aux', None)
             if packed_hidden is not None:
@@ -462,7 +498,6 @@ class ViaSdRuntime:
                     batch_rows=[row],
                     qprime_computed_lengths=[len(prefixes[row]) + len(draft)],
                     target_catchup=self._catchup,
-                    target_verify=self._verify_target,
                     target_verify_batch=self._verify_target_batch,
                     qprime_sampler=lambda req, pos, values, params: self._sample(
                         values, batch, batch.req_ids.index(req), len(prefixes[batch.req_ids.index(req)]) + pos - 1
