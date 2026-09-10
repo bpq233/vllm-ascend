@@ -243,6 +243,8 @@ class AscendConfig:
     enable_reduce_sample: bool = False
     enable_dsa_cp: bool = False
     draft_window_size: int | None = None
+    # Opt-in MRV2 multi-stage decoding; detailed validation lives with the pipeline.
+    multi_stage_spec_config: dict[str, Any] = dataclasses.field(default_factory=dict)
     mix_placement: bool = False
     pa_shape_list: list[Any] = dataclasses.field(default_factory=list)
     mega_moe_max_tokens: int = 131072
@@ -330,6 +332,10 @@ class AscendConfig:
     # multi-step downgrades are order-dependent (e.g. profiling_chunk reads
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
+        if self.multi_stage_spec_config:
+            from vllm_ascend.worker.v2.spec_decode.multi_stage.config import MultiStageConfig
+
+            MultiStageConfig.from_dict(self.multi_stage_spec_config).validate_runtime(vllm_config)
         vc = vllm_config
         self._check_mooncake_c8_kv_cache_quant(vc)
 

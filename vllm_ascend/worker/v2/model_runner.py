@@ -68,6 +68,7 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffe
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
+from vllm_ascend.worker.v2.spec_decode.multi_stage.config import MultiStageConfig
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
 
@@ -82,6 +83,8 @@ class NPUModelRunner(GPUModelRunner):
         return AscendPCPManager
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        multi_stage_config = MultiStageConfig.from_vllm_config(vllm_config)
+        multi_stage_config.validate_runtime(vllm_config)
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
         # FusedMoE can be constructed by the parent initializer and reads this
@@ -180,6 +183,27 @@ class NPUModelRunner(GPUModelRunner):
         set_mc2_mask(vllm_config, self.device)
         set_potential_max_tokens(vllm_config)
 
+        self.multi_stage_runtime = None
+        if multi_stage_config.enabled:
+            from vllm_ascend.worker.v2.spec_decode.multi_stage.runtime import (
+                MultiStageRuntime,
+                RaggedDraftTokensHandler,
+            )
+
+            self.multi_stage_runtime = MultiStageRuntime(self, multi_stage_config)
+            self.speculator.runtime = self.multi_stage_runtime
+            self.draft_tokens_handler = RaggedDraftTokensHandler(self.multi_stage_runtime)
+
+    def load_model(self, *args, **kwargs):
+        super().load_model(*args, **kwargs)
+        if self.multi_stage_runtime is not None:
+            self.multi_stage_runtime.install_sampler()
+
+    def shutdown(self):
+        if self.multi_stage_runtime is not None:
+            self.multi_stage_runtime.shutdown()
+        super().shutdown()
+
     def sample_tokens(self, grammar_output):
         output = super().sample_tokens(grammar_output)
 
@@ -209,6 +233,10 @@ class NPUModelRunner(GPUModelRunner):
         is_profile: bool = False,
         context_len: int = 0,
     ):
+        multi_stage_start = None
+        if self.multi_stage_runtime is not None and not dummy_run:
+            self.multi_stage_runtime.observe(scheduler_output)
+            multi_stage_start = self.multi_stage_runtime.before_forward()
         self._cpp_execution_time_ms = None
         profiling_config = self.ascend_config.scheduler_config.profiling_chunk_config
         execution_start_time = _start_profiling_chunk_timing(
@@ -238,6 +266,8 @@ class NPUModelRunner(GPUModelRunner):
             profiling_config,
             execution_start_time,
         )
+        if multi_stage_start is not None:
+            self.multi_stage_runtime.after_forward(multi_stage_start, scheduler_output.total_num_scheduled_tokens)
         return output
 
     @torch.inference_mode()

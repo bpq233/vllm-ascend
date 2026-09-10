@@ -16,12 +16,16 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+from typing import TYPE_CHECKING
+
 import torch
-from vllm.config import VllmConfig
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 def init_speculator(
-    vllm_config: VllmConfig,
+    vllm_config: "VllmConfig",
     device: torch.device,
 ):
     """Override GPU init_speculator for Ascend NPUs.
@@ -29,6 +33,13 @@ def init_speculator(
     """
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
+    from .multi_stage.config import MultiStageConfig
+
+    multi_stage = MultiStageConfig.from_vllm_config(vllm_config)
+    if multi_stage.enabled:
+        from .multi_stage.speculator import MultiStageDFlashSpeculator
+
+        return MultiStageDFlashSpeculator(vllm_config, device)
     if speculative_config.use_dspark():
         from vllm_ascend.worker.v2.spec_decode.dspark.speculator import (
             AscendDSparkSpeculator,
