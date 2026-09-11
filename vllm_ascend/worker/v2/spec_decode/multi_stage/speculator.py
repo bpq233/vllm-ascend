@@ -16,6 +16,7 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
 
     def __init__(self, vllm_config, device):
         self.multi_stage_config = MultiStageConfig.from_vllm_config(vllm_config)
+        self.multi_stage_config.configure_runtime(vllm_config)
         self.multi_stage_config.validate_runtime(vllm_config)
         self.output_width = vllm_config.speculative_config.num_speculative_tokens
         primary_config = copy.copy(vllm_config)
@@ -52,7 +53,7 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
         mm_inputs=None,
         is_profile=False,
     ):
-        measure = self.multi_stage_config.metrics_enabled and not dummy_run
+        measure = (self.multi_stage_config.metrics_enabled or self.multi_stage_config.summary_logging) and not dummy_run
         if measure:
             torch.npu.synchronize()
         start = perf_counter()
@@ -79,5 +80,7 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
         assert self.runtime is not None
         if measure:
             torch.npu.synchronize()
-            self.runtime.metrics.record("primary_drafter", primary.numel(), (perf_counter() - start) * 1000)
+            elapsed = (perf_counter() - start) * 1000
+            self.runtime.last_primary_ms = elapsed
+            self.runtime.metrics.record("primary_drafter", primary.numel(), elapsed)
         return self.runtime.expand(input_batch, primary, num_sampled)

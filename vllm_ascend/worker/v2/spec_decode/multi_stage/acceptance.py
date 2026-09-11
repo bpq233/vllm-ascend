@@ -54,22 +54,3 @@ def accepted_prefix_length(mask: Tensor) -> int:
     if mask.ndim != 1 or mask.dtype != torch.bool:
         raise ValueError("Acceptance policy must return a one-dimensional boolean mask")
     return int(mask.to(torch.int32).cumprod(dim=0).sum().item())
-
-
-def finalize_candidates(policy: AcceptancePolicy, logits: Tensor, draft: Tensor, sampled_target: Tensor) -> Tensor:
-    """Use the sample at first rejection, or at M for the all-accepted bonus.
-
-    The caller supplies samples from its normal target sampler, preserving its
-    temperature and other sampling settings. Logit row i predicts draft[i].
-    """
-    if logits.ndim != 2 or logits.shape[0] != draft.numel() + 1:
-        raise ValueError("Final logits must contain M+1 aligned rows")
-    if sampled_target.ndim != 1 or sampled_target.numel() != draft.numel() + 1:
-        raise ValueError("Target samples must contain M+1 tokens")
-    if sampled_target.device != draft.device or sampled_target.dtype != draft.dtype:
-        raise ValueError("Target samples must match draft device and dtype")
-    mask = policy.accept(logits[:-1], draft)
-    if mask.shape != draft.shape:
-        raise ValueError("Acceptance mask must match draft shape")
-    n = accepted_prefix_length(mask)
-    return torch.cat((draft[:n], sampled_target[n : n + 1]))

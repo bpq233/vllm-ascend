@@ -38,6 +38,7 @@ class IntermediateBackend:
         from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
         self.config = config
+        self.timing_enabled = config.metrics_enabled or config.summary_logging
         self.policy = policy
         self.device = device
         private = copy.copy(vllm_config)
@@ -74,6 +75,10 @@ class IntermediateBackend:
             method="dflash",
             revision=config.secondary_revision,
             num_speculative_tokens=config.secondary_num_speculative_tokens,
+            # All four models execute on the same existing TP group. Keeping
+            # the draft degree explicit prevents SpeculativeConfig defaults
+            # from silently selecting a rank-local secondary model.
+            draft_tensor_parallel_size=private.parallel_config.tensor_parallel_size,
             target_model_config=private.model_config,
             target_parallel_config=private.parallel_config,
         )
@@ -101,6 +106,8 @@ class IntermediateBackend:
                 for spec in specs.values()
             ):
                 raise ValueError("Intermediate multi-stage runner currently supports full attention KV only")
+            # get_kv_cache_spec reports this rank's KV-head shard, so the
+            # configured budget and resulting block pool are per TP rank.
             kv_config = get_kv_cache_configs(private, [specs], [config.kv_cache_memory_bytes])[0]
             self.runner.initialize_kv_cache(kv_config)
             self.runner._init_kv_zero_meta()
@@ -188,11 +195,11 @@ class IntermediateBackend:
             scheduled.num_scheduled_tokens = {request_id: end - start}
             scheduled.total_num_scheduled_tokens = end - start
             scheduled.num_common_prefix_blocks = [0] * len(cache.blocks)
-            if self.config.metrics_enabled:
+            if self.timing_enabled:
                 torch.npu.synchronize()
             forward_start = perf_counter()
             runner.execute_model(scheduled)
-            if self.config.metrics_enabled:
+            if self.timing_enabled:
                 torch.npu.synchronize()
                 self.verifier_calls += 1
                 self.verifier_tokens += end - start
@@ -266,7 +273,7 @@ class IntermediateBackend:
         runner.req_states.last_sampled_tokens[idx, 0] = anchor
         num_sampled = torch.ones(1, dtype=torch.int32, device=self.device)
         num_rejected = torch.tensor([rejected], dtype=torch.int32, device=self.device)
-        if self.config.metrics_enabled:
+        if self.timing_enabled:
             torch.npu.synchronize()
         start = perf_counter()
         proposed = runner.speculator.propose(
@@ -283,7 +290,7 @@ class IntermediateBackend:
             runner.sampler.sampling_states.seeds.gpu,
         )
         self.next_drafts[request_id] = proposed[0].cpu().tolist()
-        if self.config.metrics_enabled:
+        if self.timing_enabled:
             self.secondary_calls += 1
             self.secondary_tokens += proposed.shape[1]
             self.secondary_ms += (perf_counter() - start) * 1000

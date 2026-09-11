@@ -84,6 +84,7 @@ class NPUModelRunner(GPUModelRunner):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         multi_stage_config = MultiStageConfig.from_vllm_config(vllm_config)
+        multi_stage_config.configure_runtime(vllm_config)
         multi_stage_config.validate_runtime(vllm_config)
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -193,11 +194,6 @@ class NPUModelRunner(GPUModelRunner):
             self.multi_stage_runtime = MultiStageRuntime(self, multi_stage_config)
             self.speculator.runtime = self.multi_stage_runtime
             self.draft_tokens_handler = RaggedDraftTokensHandler(self.multi_stage_runtime)
-
-    def load_model(self, *args, **kwargs):
-        super().load_model(*args, **kwargs)
-        if self.multi_stage_runtime is not None:
-            self.multi_stage_runtime.install_sampler()
 
     def shutdown(self):
         if self.multi_stage_runtime is not None:

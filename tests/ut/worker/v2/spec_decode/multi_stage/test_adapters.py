@@ -7,32 +7,6 @@ import pytest
 import torch
 
 
-@pytest.mark.parametrize("method", ["all", "topk1", "topk5"])
-@pytest.mark.parametrize("seed", [3, 8, 17])
-def test_packed_final_sampling_matches_request_oracle(adapters, method, seed):
-    torch.manual_seed(seed)
-    lengths = [0, 1, 3, 5]
-    offsets = [0]
-    for length in lengths:
-        offsets.append(offsets[-1] + length + 1)
-    logits = torch.randn(offsets[-1], 12)
-    tokens = torch.randint(0, 12, (offsets[-1],))
-    target_samples = torch.randint(0, 12, (offsets[-1],))
-    policy = (
-        adapters.acceptance.AcceptAllPolicy() if method == "all" else adapters.acceptance.TopKPolicy(int(method[-1]))
-    )
-    output, counts = adapters.sampler.pack_accepted_prefixes(
-        policy, logits, tokens, target_samples, torch.tensor(offsets), 6
-    )
-    for row, (start, end) in enumerate(zip(offsets, offsets[1:])):
-        expected = adapters.acceptance.finalize_candidates(
-            policy, logits[start:end], tokens[start + 1 : end], target_samples[start:end]
-        )
-        assert output[row, : counts[row]].tolist() == expected.tolist()
-        assert (output[row, counts[row] :] == -1).all()
-        assert counts[row] <= lengths[row] + 1
-
-
 def make_runtime(adapters):
     runtime = adapters.runtime.MultiStageRuntime.__new__(adapters.runtime.MultiStageRuntime)
     runtime.runner = SimpleNamespace(req_states=SimpleNamespace(index_to_req_id={7: "a", 2: "b", 4: "c", 1: "d"}))
@@ -40,14 +14,6 @@ def make_runtime(adapters):
     runtime.context_lengths = {name: 3 for name in "abcd"}
     runtime.max_lengths = {"a": 15, "b": 5, "c": 15, "d": 3}
     return runtime
-
-
-def test_final_eos_bonus_and_max_tokens_before_worker_history(adapters):
-    runtime = make_runtime(adapters)
-    tokens = torch.tensor([[2, 9, 5, 6], [2, 3, 4, 5], [9, 3, 4, 5], [2, 3, 4, 5]])
-    result, counts = runtime.limit_final_output(tokens, torch.tensor([4, 4, 4, 4]), [7, 2, 4, 1])
-    assert counts.tolist() == [2, 2, 1, 0]
-    assert result.tolist() == [[2, 9, -1, -1], [2, 3, -1, -1], [9, -1, -1, -1], [-1] * 4]
 
 
 def test_ragged_handler_reports_real_lengths_and_takes_snapshot(adapters):
@@ -60,20 +26,54 @@ def test_ragged_handler_reports_real_lengths_and_takes_snapshot(adapters):
     assert output.draft_token_ids == [[2, 3, 4], [], [5], [6, 7]]
 
 
-def test_policy_sampler_reuses_target_samples_and_passes_acceptance_count(adapters):
-    sampler = adapters.sampler.PolicyRejectionSampler.__new__(adapters.sampler.PolicyRejectionSampler)
-    logits = torch.tensor([[0.0, 9.0, 1.0], [9.0, 1.0, 0.0], [0.0, 1.0, 9.0]])
-    sampler.sampler = SimpleNamespace(sample=lambda *args, **kwargs: (torch.tensor([2, 0, 2]), logits))
-    sampler.policy = adapters.acceptance.TopKPolicy(1)
-    sampler.num_speculative_steps = 2
-    sampler.config = SimpleNamespace(debug_logging=False, metrics_enabled=False)
-    sampler.runtime = SimpleNamespace(limit_final_output=lambda tokens, counts, _: (tokens, counts))
-    processed, sampled, count = sampler._verify(
-        logits, None, torch.tensor([0, 1, 2]), None, torch.tensor([0, 3]), None, [0], None, None
+def test_runtime_logs_ready_candidate_count_and_stage_times(adapters, caplog):
+    runtime = adapters.runtime.MultiStageRuntime.__new__(adapters.runtime.MultiStageRuntime)
+    runtime.config = SimpleNamespace(summary_logging=True)
+    runtime.runner = SimpleNamespace(
+        num_speculative_steps=16,
+        max_model_len=64,
+        device=torch.device("cpu"),
+        req_states=SimpleNamespace(
+            total_len=SimpleNamespace(gpu=torch.tensor([3, 2])),
+            all_token_ids=SimpleNamespace(gpu=torch.tensor([[1, 2, 3], [4, 5, 0]])),
+        ),
     )
-    assert processed is logits
-    assert sampled.tolist() == [[1, 0, -1]]
-    assert count.tolist() == [2]
+    runtime.stop_ids = {"a": frozenset(), "b": frozenset()}
+    runtime.context_lengths = {}
+    runtime.max_lengths = {"a": 64, "b": 64}
+    runtime.last_primary_ms = 1.25
+
+    class Pipeline:
+        last_run = {"intermediate_verifier_ms": 2.5, "secondary_drafter_ms": 0.75}
+
+        @staticmethod
+        def run(states, primary):
+            return {"a": [7, 8, 9], "b": [6]}
+
+    runtime.pipeline = Pipeline()
+    input_batch = SimpleNamespace(req_ids=["a", "b"], idx_mapping=torch.tensor([0, 1]), num_reqs=2)
+    with caplog.at_level("INFO"):
+        output = runtime.expand(input_batch, torch.tensor([[7, 8], [6, 0]]), torch.tensor([1, 1]))
+    assert output.shape == (2, 16)
+    assert "candidates_by_request={'a': 3, 'b': 1}" in caplog.text
+    assert "total_candidates=4" in caplog.text
+    assert "primary_model_ms=1.250" in caplog.text
+    assert "multi_stage_candidates_ready" in caplog.text
+
+
+def test_runtime_logs_exact_candidates_scheduled_to_target(adapters, monkeypatch, caplog):
+    runtime = adapters.runtime.MultiStageRuntime.__new__(adapters.runtime.MultiStageRuntime)
+    runtime.config = SimpleNamespace(summary_logging=True, metrics_enabled=False)
+    runtime.metrics = adapters.metrics.PipelineMetrics(True)
+    runtime.current_target_candidate_counts = {"a": 15, "b": 3}
+    monkeypatch.setattr(adapters.runtime.torch, "npu", SimpleNamespace(synchronize=lambda: None), raising=False)
+    with caplog.at_level("INFO"):
+        start = runtime.before_forward()
+        runtime.after_forward(start, 20)
+    assert "target_candidates_by_request={'a': 15, 'b': 3}" in caplog.text
+    assert "total_target_candidates=18" in caplog.text
+    assert "scheduled_tokens=20" in caplog.text
+    assert "target_model_forward_ms=" in caplog.text
 
 
 def test_finished_and_preempted_requests_release_private_cache(adapters):
@@ -114,7 +114,12 @@ class FakeRunner:
 
 def make_backend(adapters, chunk_size=100):
     backend = adapters.backend.IntermediateBackend.__new__(adapters.backend.IntermediateBackend)
-    backend.config = SimpleNamespace(secondary_num_speculative_tokens=2, metrics_enabled=False)
+    backend.config = SimpleNamespace(
+        secondary_num_speculative_tokens=2,
+        metrics_enabled=False,
+        summary_logging=False,
+    )
+    backend.timing_enabled = False
     backend.device = torch.device("cpu")
     backend.runner = FakeRunner(chunk_size)
     backend.block_sizes = [4, 4]
@@ -230,7 +235,7 @@ def test_backend_constructor_does_not_share_target_registry_or_quantization(adap
             dtype=torch.float32, max_model_len=64, trust_remote_code=False, tokenizer="target", tokenizer_revision=None
         ),
         compilation_config=SimpleNamespace(static_forward_context=target_registry, custom_ops=["all"]),
-        parallel_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
         scheduler_config=SimpleNamespace(async_scheduling=False),
         cache_config=SimpleNamespace(num_gpu_blocks_override=99, enable_prefix_caching=False),
         additional_config={"multi_stage_spec_config": {"enabled": True}},
@@ -284,6 +289,9 @@ def test_backend_constructor_does_not_share_target_registry_or_quantization(adap
     assert set(backend.vllm_config.compilation_config.static_forward_context) == {"private.layer"}
     assert backend.vllm_config.quant_config[0] == "intermediate"
     assert target.quant_config == "target_quant"
+    assert backend.vllm_config.parallel_config is not target.parallel_config
+    assert backend.vllm_config.parallel_config.tensor_parallel_size == 2
+    assert backend.vllm_config.speculative_config.draft_tensor_parallel_size == 2
     assert target.cache_config.num_gpu_blocks_override == 99
     assert backend.vllm_config.cache_config.num_gpu_blocks_override is None
     assert "multi_stage_spec_config" in target.additional_config

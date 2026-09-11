@@ -12,7 +12,6 @@ from .backend import IntermediateBackend
 from .config import make_policy
 from .metrics import PipelineMetrics
 from .pipeline import SpeculativePipeline
-from .sampler import PolicyRejectionSampler
 from .state import SpeculativeState
 
 logger = logging.getLogger(__name__)
@@ -41,7 +40,10 @@ class MultiStageRuntime:
         self.stop_ids = {}
         self.context_lengths = {}
         self.max_lengths = {}
-        self.metrics = PipelineMetrics(config.metrics_enabled)
+        self.metrics = PipelineMetrics(config.metrics_enabled or config.summary_logging)
+        self.last_primary_ms = 0.0
+        self.last_target_forward_ms = 0.0
+        self.current_target_candidate_counts = {}
 
     def load_backend(self):
         self.backend = IntermediateBackend(
@@ -56,18 +58,12 @@ class MultiStageRuntime:
             self.config.num_intermediate_rounds,
             self.config.debug_logging,
             self.config.metrics_enabled,
-        )
-
-    def install_sampler(self):
-        self.runner.rejection_sampler = PolicyRejectionSampler(
-            self.runner.sampler,
-            self.runner.speculative_config,
-            self.runner.device,
-            self.config,
-            self,
+            self.config.summary_logging,
         )
 
     def observe(self, scheduled):
+        target_drafts = getattr(scheduled, "scheduled_spec_decode_tokens", None) or {}
+        self.current_target_candidate_counts = {request_id: len(tokens) for request_id, tokens in target_drafts.items()}
         for request_id in scheduled.finished_req_ids | (scheduled.preempted_req_ids or set()):
             if self.backend is not None:
                 self.backend.release(request_id)
@@ -132,77 +128,42 @@ class MultiStageRuntime:
             tokens = self.drafts[req_id]
             if tokens:
                 output[row, : len(tokens)] = torch.tensor(tokens, dtype=torch.int64, device=runner.device)
-        if self.config.metrics_enabled:
+        if self.config.summary_logging:
+            candidate_counts = {request_id: len(tokens) for request_id, tokens in self.drafts.items()}
+            run = self.pipeline.last_run
             logger.info(
-                "multi_stage_metrics primary/final=%s pipeline_wall=%s intermediate=%s secondary=%s",
-                self.metrics.stages,
-                self.pipeline.metrics.stages,
-                {
-                    "calls": self.backend.verifier_calls,
-                    "tokens": self.backend.verifier_tokens,
-                    "ms": self.backend.verifier_ms,
-                },
-                {
-                    "calls": self.backend.secondary_calls,
-                    "tokens": self.backend.secondary_tokens,
-                    "ms": self.backend.secondary_ms,
-                },
+                "multi_stage_candidates_ready candidates_by_request=%s total_candidates=%s "
+                "primary_model_ms=%.3f intermediate_model_ms=%.3f "
+                "secondary_model_ms=%.3f",
+                candidate_counts,
+                sum(candidate_counts.values()),
+                self.last_primary_ms,
+                run["intermediate_verifier_ms"],
+                run["secondary_drafter_ms"],
             )
         return output
 
-    def limit_final_output(self, output, counts, indices):
-        positions = torch.arange(output.shape[1], device=output.device)
-        for row, index in enumerate(indices):
-            req_id = self.runner.req_states.index_to_req_id[int(index)]
-            remaining = self.max_lengths[req_id] - self.context_lengths[req_id]
-            counts[row] = counts[row].clamp(max=max(0, remaining))
-            stops = self.stop_ids[req_id]
-            if stops:
-                stop = torch.zeros_like(output[row], dtype=torch.bool)
-                for token in stops:
-                    stop |= output[row] == token
-                first = torch.where(stop, positions + 1, output.shape[1]).min()
-                counts[row] = torch.minimum(counts[row], first)
-        return output.masked_fill(positions[None, :] >= counts[:, None], -1), counts
-
-    def record_final(self, logits, draft, cu, output, counts, indices, accepted_lengths):
-        offsets = cu.cpu().tolist()
-        tokens = output.cpu().tolist()
-        count_list = counts.cpu().tolist()
-        accepted_list = accepted_lengths.cpu().tolist()
-        draft_list = draft.cpu().tolist()
-        topk = None
-        if self.config.debug_logging:
-            topk = (
-                logits.topk(min(self.config.final_verification.top_k, logits.shape[-1]), dim=-1).indices.cpu().tolist()
-            )
-        for row, index in enumerate(indices):
-            req_id = self.runner.req_states.index_to_req_id[int(index)]
-            start, end = offsets[row : row + 2]
-            committed = tokens[row][: count_list[row]]
-            candidate = draft_list[start + 1 : end]
-            accepted = min(accepted_list[row], len(committed))
-            if self.config.debug_logging:
-                logger.debug(
-                    "request_id=%s final_target_topk=%s final_accepted_tokens=%s "
-                    "final_accepted_length=%s committed_tokens=%s",
-                    req_id,
-                    topk[start:end],
-                    committed[:accepted],
-                    accepted,
-                    committed,
-                )
-            self.metrics.record("final_acceptance", len(candidate), 0.0, accepted)
-
     def before_forward(self):
-        if self.config.metrics_enabled:
+        if self.config.metrics_enabled or self.config.summary_logging:
             torch.npu.synchronize()
         return perf_counter()
 
     def after_forward(self, start, num_tokens):
-        if self.config.metrics_enabled:
+        if self.config.metrics_enabled or self.config.summary_logging:
             torch.npu.synchronize()
-            self.metrics.record("final_target", num_tokens, (perf_counter() - start) * 1000)
+            elapsed = (perf_counter() - start) * 1000
+            self.last_target_forward_ms = elapsed
+            self.metrics.record("target_forward", num_tokens, elapsed)
+            if self.config.summary_logging:
+                logger.info(
+                    "multi_stage_target target_candidates_by_request=%s "
+                    "total_target_candidates=%s scheduled_tokens=%s "
+                    "target_model_forward_ms=%.3f",
+                    self.current_target_candidate_counts,
+                    sum(self.current_target_candidate_counts.values()),
+                    num_tokens,
+                    elapsed,
+                )
 
     def shutdown(self):
         if self.backend is not None:

@@ -6,33 +6,6 @@ import pytest
 import torch
 
 
-@pytest.mark.parametrize("k", [1, 5])
-@pytest.mark.parametrize("reject_at", [0, 2, None])
-def test_final_prefix_and_bonus(core, k, reject_at):
-    draft = torch.tensor([2, 3, 4, 5])
-    logits = torch.full((5, 12), -20.0)
-    for i, token in enumerate(draft):
-        logits[i, token] = 10.0
-    if reject_at is not None:
-        logits[reject_at].zero_()
-        logits[reject_at, draft[reject_at]] = -10
-        logits[reject_at, 6:11] = 10
-    samples = torch.tensor([6, 7, 8, 9, 10])
-    result = core.acceptance.finalize_candidates(core.acceptance.TopKPolicy(k), logits, draft, samples)
-    accepted = 4 if reject_at is None else reject_at
-    assert result.tolist() == draft[:accepted].tolist() + [samples[accepted].item()]
-
-
-def test_all_accept_and_empty_draft(core):
-    result = core.acceptance.finalize_candidates(
-        core.acceptance.AcceptAllPolicy(), torch.zeros(3, 8), torch.tensor([1, 2]), torch.tensor([6, 6, 7])
-    )
-    assert result.tolist() == [1, 2, 7]
-    assert core.acceptance.finalize_candidates(
-        core.acceptance.TopKPolicy(1), torch.zeros(1, 8), torch.tensor([], dtype=torch.int64), torch.tensor([3])
-    ).tolist() == [3]
-
-
 @pytest.mark.parametrize("method", ["topk", "all"])
 def test_masked_and_invalid_tokens_never_accepted(core, method):
     policy = core.config.make_policy(core.config.VerificationConfig(method=method, top_k=100))
@@ -92,6 +65,18 @@ def test_batch_four_independent_stop_and_ragged(core):
     assert [entry[0] for entry in backend.verified[-1]] == ["full"]
 
 
+def test_candidate_limit_truncates_the_last_intermediate_round(core):
+    backend = Backend(core)
+    backend.propose = lambda states: {state.request_id: [6, 7, 8, 9] for state in states}
+    state = core.state.SpeculativeState("r", (1,), 15)
+    result = core.pipeline.SpeculativePipeline(backend, backend, 3, summary_logging=False).run(
+        [state], {"r": list(range(10, 18))}
+    )
+    assert len(result["r"]) == 15
+    assert len(backend.verified[-1][0][3]) == 3
+    assert state.stop_reason == "max_candidates"
+
+
 def test_finished_zero_budget_empty_proposal(core):
     backend = Backend(core)
     states = [
@@ -127,10 +112,13 @@ def test_logging_and_metrics_switches(core, caplog):
         "total_candidate_tokens",
     ):
         assert field in caplog.text
+    assert "multi_stage_intermediate" in caplog.text
+    assert "accepted_by_request={'r':" in caplog.text
+    assert "intermediate_model_ms=" in caplog.text
     assert pipeline.metrics.stages["intermediate_verifier"].calls == 3
     assert pipeline.metrics.stages["intermediate_verifier"].accepted_tokens == 5
     caplog.clear()
-    disabled = core.pipeline.SpeculativePipeline(backend, backend, 1)
+    disabled = core.pipeline.SpeculativePipeline(backend, backend, 1, summary_logging=False)
     with caplog.at_level("DEBUG"):
         disabled.run([core.state.SpeculativeState("r", (1,), 10)], {"r": [2]})
     assert not caplog.records
@@ -149,6 +137,7 @@ def test_logging_and_metrics_switches(core, caplog):
         {"final_verification": {"top_k": 0}},
         {"final_verification": {"method": "exact"}},
         {"metrics_enabled": "false"},
+        {"summary_logging": "false"},
     ],
 )
 def test_invalid_config(core, raw):
@@ -156,17 +145,81 @@ def test_invalid_config(core, raw):
         core.config.MultiStageConfig.from_dict(raw)
 
 
-@pytest.mark.parametrize("change", ["async", "graph", "tp", "width", "prefix_cache", "method"])
-def test_runtime_guards(core, change):
-    config = core.config.MultiStageConfig(enabled=True, intermediate_model="a", secondary_model="b")
-    runtime = SimpleNamespace(
+def make_runtime_config(change=None, tp_size=1, draft_tp_size=None):
+    if change == "reduce_sample":
+        tp_size = 2
+    parallel = {
+        "tensor_parallel_size": tp_size,
+        "pipeline_parallel_size": 2 if change == "pp" else 1,
+        "data_parallel_size": 2 if change == "dp" else 1,
+        "decode_context_parallel_size": 2 if change == "dcp" else 1,
+        "prefill_context_parallel_size": 2 if change == "pcp" else 1,
+    }
+    return SimpleNamespace(
         speculative_config=SimpleNamespace(
-            use_dflash=lambda: change != "method", num_speculative_tokens=4 if change == "width" else 16
+            use_dflash=lambda: change != "method",
+            num_speculative_tokens=4 if change == "width" else 16,
+            draft_tensor_parallel_size=draft_tp_size,
         ),
         scheduler_config=SimpleNamespace(async_scheduling=change == "async"),
         model_config=SimpleNamespace(enforce_eager=change != "graph"),
-        parallel_config=SimpleNamespace(tensor_parallel_size=2 if change == "tp" else 1),
+        parallel_config=SimpleNamespace(**parallel),
         cache_config=SimpleNamespace(enable_prefix_caching=change == "prefix_cache"),
+        additional_config={"enable_reduce_sample": change == "reduce_sample"},
     )
+
+
+@pytest.mark.parametrize(
+    "change", ["async", "graph", "pp", "dp", "dcp", "pcp", "width", "prefix_cache", "method", "reduce_sample"]
+)
+def test_runtime_guards(core, change):
+    config = core.config.MultiStageConfig(enabled=True, intermediate_model="a", secondary_model="b")
     with pytest.raises(ValueError):
-        config.validate_runtime(runtime)
+        config.validate_runtime(make_runtime_config(change))
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+def test_runtime_accepts_tensor_parallel(core, tp_size):
+    config = core.config.MultiStageConfig(enabled=True, intermediate_model="a", secondary_model="b")
+    config.validate_runtime(make_runtime_config(tp_size=tp_size, draft_tp_size=tp_size))
+
+
+def test_runtime_rejects_rank_local_primary_draft(core):
+    config = core.config.MultiStageConfig(enabled=True, intermediate_model="a", secondary_model="b")
+    with pytest.raises(ValueError, match="primary DFlash.*tensor_parallel_size"):
+        config.validate_runtime(make_runtime_config(tp_size=2, draft_tp_size=1))
+
+
+def test_runtime_expands_target_capacity_for_all_rounds(core, monkeypatch):
+    monkeypatch.setattr(core.config, "target_speculative_token_limit", lambda: 128)
+    runtime = make_runtime_config()
+    runtime.speculative_config.num_speculative_tokens = 15
+    config = core.config.MultiStageConfig(
+        enabled=True,
+        intermediate_model="a",
+        secondary_model="b",
+        primary_num_speculative_tokens=8,
+        secondary_num_speculative_tokens=4,
+        num_intermediate_rounds=3,
+    )
+    config.configure_runtime(runtime)
+    assert runtime.speculative_config.num_speculative_tokens == 16
+    config.validate_runtime(runtime)
+
+
+def test_runtime_caps_candidates_at_native_target_limit(core, monkeypatch, caplog):
+    monkeypatch.setattr(core.config, "target_speculative_token_limit", lambda: 15)
+    runtime = make_runtime_config()
+    runtime.speculative_config.num_speculative_tokens = 8
+    config = core.config.MultiStageConfig(
+        enabled=True,
+        intermediate_model="a",
+        secondary_model="b",
+        primary_num_speculative_tokens=8,
+        secondary_num_speculative_tokens=4,
+        num_intermediate_rounds=3,
+    )
+    with caplog.at_level("WARNING"):
+        config.configure_runtime(runtime)
+    assert runtime.speculative_config.num_speculative_tokens == 15
+    assert "later intermediate rounds will stop" in caplog.text

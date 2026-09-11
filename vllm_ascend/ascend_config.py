@@ -335,7 +335,9 @@ class AscendConfig:
         if self.multi_stage_spec_config:
             from vllm_ascend.worker.v2.spec_decode.multi_stage.config import MultiStageConfig
 
-            MultiStageConfig.from_dict(self.multi_stage_spec_config).validate_runtime(vllm_config)
+            multi_stage_config = MultiStageConfig.from_dict(self.multi_stage_spec_config)
+            multi_stage_config.configure_runtime(vllm_config)
+            multi_stage_config.validate_runtime(vllm_config)
         vc = vllm_config
         self._check_mooncake_c8_kv_cache_quant(vc)
 

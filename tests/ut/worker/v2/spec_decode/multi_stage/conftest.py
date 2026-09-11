@@ -78,7 +78,6 @@ def adapters(core, monkeypatch):
         "vllm.v1.core.sched",
         "vllm.v1.worker",
         "vllm.v1.worker.gpu",
-        "vllm.v1.worker.gpu.spec_decode",
     ):
         module(name)
     module("vllm.v1.outputs", DraftTokenIds=DraftTokenIds)
@@ -89,7 +88,6 @@ def adapters(core, monkeypatch):
         SchedulerOutput=SimpleNamespace(make_empty=lambda: SimpleNamespace()),
     )
     module("vllm.v1.kv_cache_interface", FullAttentionSpec=type("FullAttentionSpec", (), {}))
-    module("vllm.v1.worker.gpu.spec_decode.rejection_sampler", RejectionSampler=type("RejectionSampler", (), {}))
-    for part in ("sampler", "backend", "runtime"):
+    for part in ("backend", "runtime"):
         setattr(core, part, importlib.import_module(f"_multi_stage_cpu.{part}"))
     return core

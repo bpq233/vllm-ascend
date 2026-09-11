@@ -95,6 +95,12 @@ _LONG_PROMPTS = [os.path.join(_TEST_DIR, "prompts", "long_prompt.txt")]
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
+        "--multi-stage-models",
+        nargs=4,
+        default=None,
+        help="Four local model paths: target, primary DFlash, intermediate, secondary DFlash",
+    )
+    parser.addoption(
         "--msa-m3-sparse-backend",
         action="store",
         default=os.environ.get("MINIMAX_M3_SPARSE_BACKEND", "all"),
@@ -104,6 +110,14 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "test_minimax_m3_sparse_attn.py: all, triton reference, or msa_m3_npu (torch_npu)."
         ),
     )
+
+
+@pytest.fixture(scope="module")
+def multi_stage_models(request):
+    paths = request.config.getoption("--multi-stage-models")
+    if paths is None:
+        pytest.skip("Supply --multi-stage-models TARGET PRIMARY INTERMEDIATE SECONDARY on an NPU host")
+    return paths
 
 
 DISAGG_EPD_PROXY_SCRIPT = (

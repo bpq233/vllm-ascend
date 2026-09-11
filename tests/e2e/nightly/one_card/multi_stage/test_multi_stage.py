@@ -43,7 +43,6 @@ def test_four_model_generation(multi_stage_models, rounds, method, top_k, batch_
                 "secondary_num_speculative_tokens": 2,
                 "num_intermediate_rounds": rounds,
                 "intermediate_verification": {"method": method, "top_k": top_k},
-                "final_verification": {"method": method, "top_k": top_k},
                 "debug_logging": True,
                 "metrics_enabled": True,
             }

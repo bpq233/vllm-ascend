@@ -2,8 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Opt-in configuration, kept outside upstream SpeculativeConfig."""
 
+import logging
 from dataclasses import dataclass, fields
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+def target_speculative_token_limit() -> int:
+    """Return the native target sampler's compiled candidate limit."""
+    try:
+        from vllm.v1.sample.rejection_sampler import MAX_SPEC_LEN
+
+        return int(MAX_SPEC_LEN)
+    except (ImportError, AttributeError):
+        # The pinned upstream version uses 128. Keep config-only tooling usable
+        # when vLLM is not importable (for example documentation tests).
+        return 128
 
 
 @dataclass(frozen=True)
@@ -31,12 +46,15 @@ class MultiStageConfig:
     # Explicit private KV budget, deducted before target memory profiling.
     kv_cache_memory_bytes: int = 1 << 30
     intermediate_verification: VerificationConfig = VerificationConfig()
+    # Kept as a parsed no-op for compatibility with the first experimental
+    # configuration. Final verification always uses vLLM's native sampler.
     final_verification: VerificationConfig = VerificationConfig()
     debug_logging: bool = False
     metrics_enabled: bool = False
+    summary_logging: bool = True
 
     def __post_init__(self):
-        for name in ("enabled", "debug_logging", "metrics_enabled"):
+        for name in ("enabled", "debug_logging", "metrics_enabled", "summary_logging"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"multi_stage_spec_config.{name} must be a boolean")
         for name in (
@@ -87,13 +105,25 @@ class MultiStageConfig:
             raise ValueError("Multi-stage decoding requires speculative_config.method='dflash'")
         if spec.num_speculative_tokens < self.primary_num_speculative_tokens:
             raise ValueError("speculative_config.num_speculative_tokens must cover the primary draft width")
+        limit = target_speculative_token_limit()
+        if spec.num_speculative_tokens > limit:
+            raise ValueError(
+                f"speculative_config.num_speculative_tokens exceeds the native target sampler limit ({limit})"
+            )
         if vllm_config.scheduler_config.async_scheduling:
             raise ValueError("Multi-stage decoding currently requires async_scheduling=False")
         if not vllm_config.model_config.enforce_eager:
             raise ValueError("Multi-stage decoding currently requires enforce_eager=True")
         parallel = vllm_config.parallel_config
+        tp_size = getattr(parallel, "tensor_parallel_size", 1)
+        draft_tp_size = getattr(spec, "draft_tensor_parallel_size", None) or tp_size
+        if draft_tp_size != tp_size:
+            raise ValueError(
+                "Multi-stage decoding requires the primary DFlash model to use the target tensor_parallel_size"
+            )
+        if tp_size > 1 and (vllm_config.additional_config or {}).get("enable_reduce_sample", False):
+            raise ValueError("Multi-stage tensor parallelism currently requires enable_reduce_sample=False")
         for name in (
-            "tensor_parallel_size",
             "pipeline_parallel_size",
             "data_parallel_size",
             "decode_context_parallel_size",
@@ -112,6 +142,46 @@ class MultiStageConfig:
             raise ValueError("Multi-stage decoding does not support return_sampling_mask")
         if getattr(spec, "enable_adaptive_verification", False):
             raise ValueError("Multi-stage decoding does not support adaptive verification")
+
+    def configure_runtime(self, vllm_config: Any) -> None:
+        """Size native MRV2 buffers for all candidates multi-stage can produce.
+
+        This changes only the candidate width passed to the native target
+        verification path. If all configured rounds could exceed the native
+        sampler limit, the pipeline naturally stops at that limit.
+        """
+        if not self.enabled:
+            return
+        spec = vllm_config.speculative_config
+        if spec is None:
+            return
+        limit = target_speculative_token_limit()
+        configured = int(spec.num_speculative_tokens)
+        if configured > limit:
+            raise ValueError(
+                f"speculative_config.num_speculative_tokens exceeds the native target sampler limit ({limit})"
+            )
+        possible = self.primary_num_speculative_tokens + (
+            (self.num_intermediate_rounds - 1) * self.secondary_num_speculative_tokens
+        )
+        required = min(possible, limit)
+        if configured < required:
+            spec.num_speculative_tokens = required
+            logger.info(
+                "Expanded target speculative candidate capacity from %s to %s "
+                "for multi-stage decoding (native limit=%s)",
+                configured,
+                required,
+                limit,
+            )
+        if possible > limit:
+            logger.warning(
+                "Multi-stage decoding can produce up to %s candidates, but the "
+                "native target sampler limit is %s; later intermediate rounds "
+                "will stop when that limit is reached",
+                possible,
+                limit,
+            )
 
 
 def make_policy(config: VerificationConfig):
