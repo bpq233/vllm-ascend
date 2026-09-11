@@ -38,7 +38,7 @@ class IntermediateBackend:
         from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
         self.config = config
-        self.timing_enabled = config.metrics_enabled or config.summary_logging
+        self.timing_enabled = True
         self.policy = policy
         self.device = device
         private = copy.copy(vllm_config)

@@ -43,10 +43,10 @@ class TopKPolicy:
 class AcceptAllPolicy:
     def accept(self, logits: Tensor, draft_tokens: Tensor) -> Tensor:
         _validate(logits, draft_tokens)
-        # Full acceptance still respects hard masks and rejects invalid IDs.
-        in_range = (draft_tokens >= 0) & (draft_tokens < logits.shape[-1])
-        selected = logits.gather(1, draft_tokens.clamp(0, logits.shape[-1] - 1).long()[:, None]).squeeze(1)
-        return in_range & torch.isfinite(selected)
+        # This policy deliberately bypasses every target-side probability and
+        # logit mask check. Model-produced token IDs must still be valid so an
+        # invalid draft cannot index target state or vocabulary buffers.
+        return (draft_tokens >= 0) & (draft_tokens < logits.shape[-1])
 
 
 def accepted_prefix_length(mask: Tensor) -> int:

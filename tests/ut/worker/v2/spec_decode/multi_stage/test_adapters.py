@@ -41,31 +41,69 @@ def make_runtime(adapters):
     return runtime
 
 
-def test_target_eos_and_max_tokens_are_clamped_before_history_update(adapters):
-    runtime = make_runtime(adapters)
-    tokens = torch.tensor([[2, 9, 5, 6], [2, 3, 4, 5], [9, 3, 4, 5], [2, 3, 4, 5]])
-    result, counts = runtime.limit_final_output(tokens, torch.tensor([4, 4, 4, 4]), [7, 2, 4, 1])
-    assert counts.tolist() == [2, 2, 1, 0]
-    assert result.tolist() == [[2, 9, -1, -1], [2, 3, -1, -1], [9, -1, -1, -1], [-1] * 4]
+def test_runtime_logs_enabled_configuration_at_startup(adapters, caplog):
+    config = SimpleNamespace(
+        metrics_enabled=False,
+        summary_logging=False,
+        primary_num_speculative_tokens=8,
+        secondary_num_speculative_tokens=4,
+        num_intermediate_rounds=3,
+        intermediate_verification=SimpleNamespace(method="topk"),
+        final_verification=SimpleNamespace(method="all"),
+    )
+    runner = SimpleNamespace(num_speculative_steps=15)
+    with caplog.at_level("INFO"):
+        adapters.runtime.MultiStageRuntime(runner, config)
+    assert "multi_stage_enabled primary_tokens=8 secondary_tokens=4" in caplog.text
+    assert "intermediate_rounds=3" in caplog.text
+    assert "intermediate_verification=topk" in caplog.text
+    assert "final_verification=all" in caplog.text
+    assert "target_capacity=15" in caplog.text
 
 
-def test_target_policy_sampler_reuses_normal_target_samples(adapters):
+def test_target_policy_sampler_reuses_normal_target_samples(adapters, monkeypatch):
     sampler = adapters.sampler.PolicyRejectionSampler.__new__(adapters.sampler.PolicyRejectionSampler)
     logits = torch.tensor([[0.0, 9.0, 1.0], [9.0, 1.0, 0.0], [0.0, 1.0, 9.0]])
     sampler.sampler = SimpleNamespace(sample=lambda *args, **kwargs: (torch.tensor([2, 0, 2]), logits))
     sampler.policy = adapters.acceptance.TopKPolicy(1)
     sampler.num_speculative_steps = 2
     sampler.config = SimpleNamespace(debug_logging=False, summary_logging=False, metrics_enabled=False)
-    sampler.runtime = SimpleNamespace(
-        limit_final_output=lambda tokens, counts, _: (tokens, counts),
-        record_final=lambda *args: None,
-    )
+    sampler.runtime = SimpleNamespace(record_final=lambda *args: None)
+    monkeypatch.setattr(adapters.sampler.torch, "npu", SimpleNamespace(synchronize=lambda: None), raising=False)
     processed, sampled, count = sampler._verify(
         logits, None, torch.tensor([0, 1, 2]), None, torch.tensor([0, 3]), None, [0], None, None
     )
     assert processed is logits
     assert sampled.tolist() == [[1, 0, -1]]
     assert count.tolist() == [2]
+
+
+def test_accept_all_keeps_masked_candidates_and_target_bonus(adapters, monkeypatch):
+    sampler = adapters.sampler.PolicyRejectionSampler.__new__(adapters.sampler.PolicyRejectionSampler)
+    processed = torch.tensor([[0.0, 0.0, 0.0], [0.0, -torch.inf, 0.0], [0.0, 0.0, -torch.inf]])
+    sampler.sampler = SimpleNamespace(sample=lambda *args, **kwargs: (torch.tensor([0, 0, 2]), processed))
+    sampler.policy = adapters.acceptance.AcceptAllPolicy()
+    sampler.num_speculative_steps = 2
+    sampler.config = SimpleNamespace(debug_logging=False, summary_logging=False, metrics_enabled=False)
+    recorded = []
+    sampler.runtime = SimpleNamespace(record_final=lambda *args: recorded.append(args))
+    monkeypatch.setattr(adapters.sampler.torch, "npu", SimpleNamespace(synchronize=lambda: None), raising=False)
+
+    _, sampled, count = sampler._verify(
+        processed,
+        None,
+        torch.tensor([0, 1, 2]),
+        None,
+        torch.tensor([0, 3]),
+        None,
+        [0],
+        None,
+        None,
+    )
+
+    assert sampled.tolist() == [[1, 2, 2]]
+    assert count.tolist() == [3]
+    assert len(recorded) == 1
 
 
 def test_target_verification_summary_reports_policy_and_acceptance(adapters, caplog):
@@ -90,7 +128,31 @@ def test_target_verification_summary_reports_policy_and_acceptance(adapters, cap
     assert "multi_stage_target_verification method=topk top_k=5" in caplog.text
     assert "candidates_by_request={'a': 2}" in caplog.text
     assert "accepted_by_request={'a': 1}" in caplog.text
+    assert "acceptance_rate=50.0%" in caplog.text
     assert "verification_ms=1.250" in caplog.text
+
+
+def test_target_accept_all_summary_reports_one_hundred_percent(adapters, caplog):
+    runtime = make_runtime(adapters)
+    runtime.config = SimpleNamespace(
+        debug_logging=False,
+        summary_logging=False,
+        final_verification=adapters.config.VerificationConfig(method="all"),
+    )
+    runtime.metrics = adapters.metrics.PipelineMetrics(False)
+    with caplog.at_level("INFO"):
+        runtime.record_final(
+            torch.full((3, 8), -torch.inf),
+            torch.tensor([1, 2, 3]),
+            torch.tensor([0, 3]),
+            torch.tensor([[2, 3, 7]]),
+            torch.tensor([3]),
+            [7],
+            torch.tensor([2]),
+            1.25,
+        )
+    assert "method=all top_k=None" in caplog.text
+    assert "total_candidates=2 total_accepted=2 acceptance_rate=100.0%" in caplog.text
 
 
 def test_ragged_handler_reports_real_lengths_and_takes_snapshot(adapters):
@@ -140,7 +202,7 @@ def test_runtime_logs_ready_candidate_count_and_stage_times(adapters, caplog):
 
 def test_runtime_logs_exact_candidates_scheduled_to_target(adapters, monkeypatch, caplog):
     runtime = adapters.runtime.MultiStageRuntime.__new__(adapters.runtime.MultiStageRuntime)
-    runtime.config = SimpleNamespace(summary_logging=True, metrics_enabled=False)
+    runtime.config = SimpleNamespace(summary_logging=False, metrics_enabled=False)
     runtime.metrics = adapters.metrics.PipelineMetrics(True)
     runtime.current_target_candidate_counts = {"a": 15, "b": 3}
     monkeypatch.setattr(adapters.runtime.torch, "npu", SimpleNamespace(synchronize=lambda: None), raising=False)

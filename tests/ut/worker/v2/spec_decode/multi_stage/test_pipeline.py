@@ -6,13 +6,20 @@ import pytest
 import torch
 
 
-@pytest.mark.parametrize("method", ["topk", "all"])
-def test_masked_and_invalid_tokens_never_accepted(core, method):
-    policy = core.config.make_policy(core.config.VerificationConfig(method=method, top_k=100))
+def test_topk_rejects_masked_and_invalid_tokens(core):
+    policy = core.config.make_policy(core.config.VerificationConfig(method="topk", top_k=100))
     logits = torch.zeros(4, 4)
     logits[0, 1] = -torch.inf
     logits[1, 2] = torch.nan
     assert not policy.accept(logits, torch.tensor([1, 2, -1, 4])).any()
+
+
+def test_accept_all_bypasses_target_masks_but_rejects_invalid_ids(core):
+    policy = core.config.make_policy(core.config.VerificationConfig(method="all"))
+    logits = torch.zeros(4, 4)
+    logits[0, 1] = -torch.inf
+    logits[1, 2] = torch.nan
+    assert policy.accept(logits, torch.tensor([1, 2, -1, 4])).tolist() == [True, True, False, False]
 
 
 class Backend:
@@ -121,8 +128,14 @@ def test_logging_and_metrics_switches(core, caplog):
     disabled = core.pipeline.SpeculativePipeline(backend, backend, 1, summary_logging=False)
     with caplog.at_level("DEBUG"):
         disabled.run([core.state.SpeculativeState("r", (1,), 10)], {"r": [2]})
-    assert not caplog.records
+    assert len(caplog.records) == 1
+    assert "multi_stage_intermediate" in caplog.text
     assert disabled.metrics.stages == {}
+
+
+def test_logging_uses_vllm_configured_logger(core):
+    assert core.config.logger.name == "vllm"
+    assert core.pipeline.logger is core.config.logger
 
 
 @pytest.mark.parametrize(

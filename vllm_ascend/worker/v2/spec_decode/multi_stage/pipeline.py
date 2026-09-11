@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bounded speculative expansion with independent per-request stopping."""
 
-import logging
 import sys
 from time import perf_counter
+
+from vllm.logger import logger
 
 from .interfaces import Drafter, Verifier
 from .metrics import PipelineMetrics
 from .state import SpeculativeState
-
-logger = logging.getLogger(__name__)
 
 
 class SpeculativePipeline:
@@ -29,7 +28,7 @@ class SpeculativePipeline:
         self.num_rounds = num_rounds
         self.debug_logging = debug_logging
         self.summary_logging = summary_logging
-        self.metrics = PipelineMetrics(metrics_enabled or summary_logging)
+        self.metrics = PipelineMetrics(metrics_enabled)
         self.last_run = {
             "intermediate_verifier_ms": 0.0,
             "secondary_drafter_ms": 0.0,
@@ -122,18 +121,17 @@ class SpeculativePipeline:
                     "secondary_model_ms": cached_secondary_ms,
                 }
                 self.last_run["rounds"].append(round_stats)
-                if self.summary_logging:
-                    logger.info(
-                        "multi_stage_intermediate round=%s proposed=%s accepted=%s "
-                        "accepted_by_request=%s intermediate_model_ms=%.3f "
-                        "secondary_model_ms=%.3f",
-                        round_id + 1,
-                        input_count,
-                        accepted_count,
-                        accepted_by_request,
-                        verifier_ms,
-                        cached_secondary_ms,
-                    )
+                logger.info(
+                    "multi_stage_intermediate round=%s proposed=%s accepted=%s "
+                    "accepted_by_request=%s intermediate_model_ms=%.3f "
+                    "secondary_model_ms=%.3f",
+                    round_id + 1,
+                    input_count,
+                    accepted_count,
+                    accepted_by_request,
+                    verifier_ms,
+                    cached_secondary_ms,
+                )
                 if round_id + 1 == self.num_rounds:
                     break
                 continuing = [s for s in active if s.should_continue()]

@@ -47,9 +47,7 @@ class PolicyRejectionSampler(RejectionSampler):
         expanded_local_pos,
     ):
         del draft_logits
-        measure = self.config.summary_logging or self.config.metrics_enabled
-        if measure:
-            torch.npu.synchronize()
+        torch.npu.synchronize()
         start = perf_counter()
         # Reuse the target sampler so penalties, temperature, top-k/top-p,
         # seeds, replacement tokens, and all-accepted bonus tokens retain the
@@ -72,22 +70,19 @@ class PolicyRejectionSampler(RejectionSampler):
             cu_num_logits,
             self.num_speculative_steps + 1,
         )
-        # Clamp an accepted EOS and per-request max_tokens before MRV2 writes
-        # the sampled row into request history.
-        output, counts = self.runtime.limit_final_output(output, counts, idx_mapping_np)
-        elapsed = 0.0
-        if measure:
-            torch.npu.synchronize()
-            elapsed = (perf_counter() - start) * 1000
-        if self.config.debug_logging or self.config.summary_logging or self.config.metrics_enabled:
-            self.runtime.record_final(
-                processed,
-                draft_sampled,
-                cu_num_logits,
-                output,
-                counts,
-                idx_mapping_np,
-                accepted_lengths,
-                elapsed,
-            )
+        # Return the complete candidate prefix and target bonus token. Native
+        # MRV2 owns EOS/max-token/history handling and its metrics assume every
+        # sampler row includes that bonus token.
+        torch.npu.synchronize()
+        elapsed = (perf_counter() - start) * 1000
+        self.runtime.record_final(
+            processed,
+            draft_sampled,
+            cu_num_logits,
+            output,
+            counts,
+            idx_mapping_np,
+            accepted_lengths,
+            elapsed,
+        )
         return processed, output, counts

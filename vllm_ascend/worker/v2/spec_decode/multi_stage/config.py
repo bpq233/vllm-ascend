@@ -2,11 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Opt-in configuration, kept outside upstream SpeculativeConfig."""
 
-import logging
 from dataclasses import dataclass, fields
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from vllm.logger import logger
 
 ASCEND_FIA_MAX_DECODE_QUERY_LEN = 16
 ASCEND_MAX_SPECULATIVE_TOKENS = ASCEND_FIA_MAX_DECODE_QUERY_LEN - 1

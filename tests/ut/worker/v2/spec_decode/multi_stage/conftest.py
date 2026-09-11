@@ -8,6 +8,7 @@ Run with --confcutdir pointing to this directory on hosts without vLLM/NPU.
 
 import importlib
 import importlib.util
+import logging
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -24,6 +25,12 @@ def core(monkeypatch):
     for key in list(sys.modules):
         if key == name or key.startswith(name + "."):
             monkeypatch.delitem(sys.modules, key)
+    vllm = ModuleType("vllm")
+    vllm.__path__ = []
+    vllm_logger = ModuleType("vllm.logger")
+    vllm_logger.logger = logging.getLogger("vllm")
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.logger", vllm_logger)
     spec = importlib.util.spec_from_file_location(name, path / "__init__.py", submodule_search_locations=[str(path)])
     package = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, package)

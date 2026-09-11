@@ -126,7 +126,6 @@ llm = LLM(
             "final_verification": {"method": "topk", "top_k": 5},
             "debug_logging": False,
             "metrics_enabled": False,
-            "summary_logging": True,
         }
     },
 )
@@ -134,22 +133,35 @@ outputs = llm.generate(["Hello"], SamplingParams(temperature=0, max_tokens=64))
 ```
 
 Select MRV2 using the existing upstream `VLLM_USE_V2_MODEL_RUNNER=1` setting.
-At INFO level, `summary_logging=true` reports each intermediate round's proposed
-and accepted counts, candidate counts ready for scheduling, the exact candidate
-counts scheduled into each target forward, and primary/intermediate/secondary/
-target-forward/target-verification time. Accurate NPU timing adds device synchronizations; set
-`summary_logging=false` when measuring end-to-end throughput externally. Set
+At the default INFO level, enabling multi-stage decoding always emits summary
+logs through vLLM's worker logger. It first reports `multi_stage_enabled` and
+`multi_stage_target_sampler_installed`, then reports each intermediate round's
+proposed and accepted counts, candidate counts ready for scheduling, the exact
+candidate counts scheduled into each target forward, the final target acceptance
+rate, and primary/intermediate/secondary/target-forward/target-verification time.
+Accurate NPU timing adds device synchronizations. The legacy `summary_logging`
+option remains accepted for configuration compatibility but no longer suppresses
+these logs. Set
 `VLLM_LOGGING_LEVEL=DEBUG` and `debug_logging=true`
 to see token traces; these traces include prompt content. `metrics_enabled=true`
 keeps cumulative in-process counters independently of summary logs.
 For both `intermediate_verification` and `final_verification`, `method="topk"`
 accepts the contiguous candidate prefix whose tokens belong to the corresponding
-model's top k, while `method="all"` accepts every valid candidate except tokens
-removed by hard masks. `top_k` must remain a positive integer and is ignored by
-`all`. Final top-k is evaluated after the target's normal logits processing.
+model's top k, while `method="all"` accepts every candidate with a valid token ID,
+including candidates removed by target-side probability or grammar masks. `top_k`
+must remain a positive integer and is ignored by `all`. Final top-k is evaluated
+after the target's normal logits processing.
 These configurable final policies are approximate and do not preserve the
 target distribution in the same way as standard rejection sampling. Secondary
 DFlash drafts greedily.
+
+The upstream `Per-position acceptance rate` uses the total number of speculative
+iterations as every position's denominator. With ragged multi-stage drafts it is
+therefore a reach/survival rate: later values fall when fewer requests propose
+that many candidates, even if every proposed candidate is accepted. Upstream
+`Avg Draft acceptance rate` and the multi-stage `acceptance_rate` instead divide
+total accepted candidates by total proposed candidates. With final `method="all"`,
+the latter rates should be 100%.
 
 Omit `multi_stage_spec_config` or set `enabled=false` to retain ordinary MRV2
 decoding and the original DFlash implementation.
