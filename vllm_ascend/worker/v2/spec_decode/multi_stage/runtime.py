@@ -12,6 +12,7 @@ from .backend import IntermediateBackend
 from .config import make_policy
 from .metrics import PipelineMetrics
 from .pipeline import SpeculativePipeline
+from .sampler import PolicyRejectionSampler
 from .state import SpeculativeState
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,15 @@ class MultiStageRuntime:
             self.config.debug_logging,
             self.config.metrics_enabled,
             self.config.summary_logging,
+        )
+
+    def install_sampler(self):
+        self.runner.rejection_sampler = PolicyRejectionSampler(
+            self.runner.sampler,
+            self.runner.speculative_config,
+            self.runner.device,
+            self.config,
+            self,
         )
 
     def observe(self, scheduled):
@@ -142,6 +152,68 @@ class MultiStageRuntime:
                 run["secondary_drafter_ms"],
             )
         return output
+
+    def limit_final_output(self, output, counts, indices):
+        positions = torch.arange(output.shape[1], device=output.device)
+        for row, index in enumerate(indices):
+            req_id = self.runner.req_states.index_to_req_id[int(index)]
+            remaining = self.max_lengths[req_id] - self.context_lengths[req_id]
+            counts[row] = counts[row].clamp(max=max(0, remaining))
+            stops = self.stop_ids[req_id]
+            if stops:
+                stop = torch.zeros_like(output[row], dtype=torch.bool)
+                for token in stops:
+                    stop |= output[row] == token
+                first = torch.where(stop, positions + 1, output.shape[1]).min()
+                counts[row] = torch.minimum(counts[row], first)
+        return output.masked_fill(positions[None, :] >= counts[:, None], -1), counts
+
+    def record_final(self, logits, draft, cu, output, counts, indices, accepted_lengths, elapsed_ms):
+        offsets = cu.cpu().tolist()
+        tokens = output.cpu().tolist()
+        count_list = counts.cpu().tolist()
+        accepted_list = accepted_lengths.cpu().tolist()
+        draft_list = draft.cpu().tolist()
+        topk = None
+        if self.config.debug_logging:
+            k = min(self.config.final_verification.top_k, logits.shape[-1])
+            topk = logits.topk(k, dim=-1).indices.cpu().tolist()
+        accepted_by_request = {}
+        candidate_by_request = {}
+        for row, index in enumerate(indices):
+            req_id = self.runner.req_states.index_to_req_id[int(index)]
+            start, end = offsets[row : row + 2]
+            committed = tokens[row][: count_list[row]]
+            candidate = draft_list[start + 1 : end]
+            accepted = min(accepted_list[row], count_list[row], len(candidate))
+            accepted_by_request[req_id] = accepted
+            candidate_by_request[req_id] = len(candidate)
+            if self.config.debug_logging:
+                logger.debug(
+                    "request_id=%s final_target_topk=%s final_accepted_tokens=%s "
+                    "final_accepted_length=%s committed_tokens=%s",
+                    req_id,
+                    topk[start:end],
+                    committed[:accepted],
+                    accepted,
+                    committed,
+                )
+        total_candidates = sum(candidate_by_request.values())
+        total_accepted = sum(accepted_by_request.values())
+        self.metrics.record("target_verification", total_candidates, elapsed_ms, total_accepted)
+        if self.config.summary_logging:
+            logger.info(
+                "multi_stage_target_verification method=%s top_k=%s "
+                "candidates_by_request=%s accepted_by_request=%s "
+                "total_candidates=%s total_accepted=%s verification_ms=%.3f",
+                self.config.final_verification.method,
+                self.config.final_verification.top_k if self.config.final_verification.method == "topk" else None,
+                candidate_by_request,
+                accepted_by_request,
+                total_candidates,
+                total_accepted,
+                elapsed_ms,
+            )
 
     def before_forward(self):
         if self.config.metrics_enabled or self.config.summary_logging:

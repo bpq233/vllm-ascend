@@ -48,11 +48,12 @@ only the affected request. On exit, private speculative tails are logically
 truncated; on the next outer iteration the private runner synchronizes with the
 actual committed prefix, computing only the missing suffix.
 
-The final target uses the unchanged upstream MRV2 rejection sampler, including
-its normal sampling parameters, replacement-token behavior, EOS handling, and
-request-history updates. Multi-stage code only changes the candidate token list
-handed to that sampler. Approximate top-k/full acceptance applies only between
-the primary/secondary drafts and the intermediate model.
+The final target subclasses the upstream MRV2 rejection sampler and changes only
+its candidate-acceptance rule. Parent MRV2 chunking, logprobs, sampled/rejected
+counts, replacement and bonus sampling, EOS clamping, and request-history updates
+remain in place. Final acceptance can use approximate top-k membership or accept
+all valid, unmasked candidates. Replacement and bonus tokens still come from the
+target's normal sampler with its request sampling parameters.
 
 ## Files
 
@@ -63,6 +64,7 @@ the primary/secondary drafts and the intermediate model.
 | `multi_stage/acceptance.py`, `pipeline.py` | New | Acceptance policies and bounded per-request loop |
 | `multi_stage/backend.py` | New | Intermediate MRV2 runner, secondary DFlash and private KV |
 | `multi_stage/speculator.py`, `runtime.py` | New | Primary reuse, ragged draft handoff and lifecycle |
+| `multi_stage/sampler.py` | New | Configurable target top-k/full acceptance |
 | `multi_stage/metrics.py` | New | Stage timing and token counters |
 | `worker/v2/spec_decode/__init__.py` | Modify | Select the opt-in speculator |
 | `worker/v2/model_runner.py` | Modify | Attach runtime, load hooks and request lifecycle |
@@ -83,10 +85,16 @@ the scheduler, buffers and target KV lookahead. The additional configuration
 separately sets the primary and secondary draft widths. For 8 primary tokens and
 three intermediate verification rounds with 4 secondary tokens per round, the
 largest candidate is `8 + (3 - 1) * 4 = 16` tokens. Multi-stage initialization
-automatically raises a smaller configured capacity to 16 before the scheduler
-and runner allocate their buffers. The pinned native target sampler supports at
-most 128 candidates. If the configured rounds could produce more, expansion
-stops at 128 and the remaining intermediate rounds are skipped for that request.
+raises a smaller configured capacity only up to the effective platform limit
+before the scheduler and runner allocate their buffers. Although
+the pinned native sampler supports 128 candidates, Ascend FIA's TND decode path
+supports at most 16 query tokens, including the target bonus position. Therefore
+the effective candidate limit is 15. If the configured rounds could produce
+more, expansion stops as soon as that request has accepted 15 candidates and
+the remaining intermediate rounds are skipped. An explicitly larger upstream
+capacity is reduced to 15 during configuration, before attention builders run.
+Each individual primary or secondary draft width must also be no greater than
+15; the accumulated candidate list is truncated independently at the same limit.
 
 ```python
 from vllm import LLM, SamplingParams
@@ -115,6 +123,7 @@ llm = LLM(
             "num_intermediate_rounds": 3,
             "kv_cache_memory_bytes": 1073741824,
             "intermediate_verification": {"method": "topk", "top_k": 5},
+            "final_verification": {"method": "topk", "top_k": 5},
             "debug_logging": False,
             "metrics_enabled": False,
             "summary_logging": True,
@@ -128,15 +137,19 @@ Select MRV2 using the existing upstream `VLLM_USE_V2_MODEL_RUNNER=1` setting.
 At INFO level, `summary_logging=true` reports each intermediate round's proposed
 and accepted counts, candidate counts ready for scheduling, the exact candidate
 counts scheduled into each target forward, and primary/intermediate/secondary/
-target-forward time. Accurate NPU timing adds device synchronizations; set
+target-forward/target-verification time. Accurate NPU timing adds device synchronizations; set
 `summary_logging=false` when measuring end-to-end throughput externally. Set
 `VLLM_LOGGING_LEVEL=DEBUG` and `debug_logging=true`
 to see token traces; these traces include prompt content. `metrics_enabled=true`
 keeps cumulative in-process counters independently of summary logs.
-`method="all"` accepts all valid intermediate candidates except hard-masked
-tokens. Secondary DFlash drafts greedily. `final_verification` remains accepted
-for old configurations but is ignored; final verification is always the native
-target path.
+For both `intermediate_verification` and `final_verification`, `method="topk"`
+accepts the contiguous candidate prefix whose tokens belong to the corresponding
+model's top k, while `method="all"` accepts every valid candidate except tokens
+removed by hard masks. `top_k` must remain a positive integer and is ignored by
+`all`. Final top-k is evaluated after the target's normal logits processing.
+These configurable final policies are approximate and do not preserve the
+target distribution in the same way as standard rejection sampling. Secondary
+DFlash drafts greedily.
 
 Omit `multi_stage_spec_config` or set `enabled=false` to retain ordinary MRV2
 decoding and the original DFlash implementation.
@@ -195,9 +208,9 @@ python -m pytest -sv \
                        /models/intermediate /models/secondary-dflash
 ```
 
-The NPU tests compare intermediate top-k=1 greedy output to ordinary target
-decoding, and exercise intermediate top-k=5/full acceptance with batch 1/4 and
-rounds 1/3. They are supplied
+The NPU tests compare intermediate/final top-k=1 greedy output to ordinary target
+decoding, and exercise intermediate/final top-k=5/full acceptance with batch 1/4
+and rounds 1/3. They are supplied
 but have not been executed in the Windows development environment. The CPU
 tests use real Torch policies and cache/lifecycle code with explicitly simulated
 device forwards; they cannot validate NPU attention, weight loading or latency.

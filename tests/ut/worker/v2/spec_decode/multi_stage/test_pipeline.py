@@ -145,6 +145,17 @@ def test_invalid_config(core, raw):
         core.config.MultiStageConfig.from_dict(raw)
 
 
+def test_intermediate_and_target_verification_are_independently_configurable(core):
+    config = core.config.MultiStageConfig.from_dict(
+        {
+            "intermediate_verification": {"method": "topk", "top_k": 3},
+            "final_verification": {"method": "all", "top_k": 1},
+        }
+    )
+    assert config.intermediate_verification == core.config.VerificationConfig(method="topk", top_k=3)
+    assert config.final_verification == core.config.VerificationConfig(method="all", top_k=1)
+
+
 def make_runtime_config(change=None, tp_size=1, draft_tp_size=None):
     if change == "reduce_sample":
         tp_size = 2
@@ -158,7 +169,7 @@ def make_runtime_config(change=None, tp_size=1, draft_tp_size=None):
     return SimpleNamespace(
         speculative_config=SimpleNamespace(
             use_dflash=lambda: change != "method",
-            num_speculative_tokens=4 if change == "width" else 16,
+            num_speculative_tokens=4 if change == "width" else 15,
             draft_tensor_parallel_size=draft_tp_size,
         ),
         scheduler_config=SimpleNamespace(async_scheduling=change == "async"),
@@ -190,6 +201,14 @@ def test_runtime_rejects_rank_local_primary_draft(core):
         config.validate_runtime(make_runtime_config(tp_size=2, draft_tp_size=1))
 
 
+@pytest.mark.parametrize("field", ["primary_num_speculative_tokens", "secondary_num_speculative_tokens"])
+def test_runtime_rejects_per_forward_width_above_ascend_limit(core, field):
+    values = {field: 16}
+    config = core.config.MultiStageConfig(enabled=True, intermediate_model="a", secondary_model="b", **values)
+    with pytest.raises(ValueError, match="Ascend per-forward limit"):
+        config.validate_runtime(make_runtime_config())
+
+
 def test_runtime_expands_target_capacity_for_all_rounds(core, monkeypatch):
     monkeypatch.setattr(core.config, "target_speculative_token_limit", lambda: 128)
     runtime = make_runtime_config()
@@ -204,6 +223,28 @@ def test_runtime_expands_target_capacity_for_all_rounds(core, monkeypatch):
     )
     config.configure_runtime(runtime)
     assert runtime.speculative_config.num_speculative_tokens == 16
+    config.validate_runtime(runtime)
+
+
+def test_ascend_attention_caps_native_sampler_capacity_at_fifteen(core):
+    assert core.config.target_speculative_token_limit() == 15
+
+
+def test_runtime_reduces_explicit_capacity_before_attention_init(core, caplog):
+    runtime = make_runtime_config()
+    runtime.speculative_config.num_speculative_tokens = 43
+    config = core.config.MultiStageConfig(
+        enabled=True,
+        intermediate_model="a",
+        secondary_model="b",
+        primary_num_speculative_tokens=8,
+        secondary_num_speculative_tokens=4,
+        num_intermediate_rounds=10,
+    )
+    with caplog.at_level("WARNING"):
+        config.configure_runtime(runtime)
+    assert runtime.speculative_config.num_speculative_tokens == 15
+    assert "including the bonus token" in caplog.text
     config.validate_runtime(runtime)
 
 

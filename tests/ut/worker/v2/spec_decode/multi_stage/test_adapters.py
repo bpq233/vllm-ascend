@@ -7,6 +7,31 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize("method,top_k", [("all", 5), ("topk", 1), ("topk", 5)])
+@pytest.mark.parametrize("seed", [3, 8, 17])
+def test_packed_target_policy_matches_request_oracle(adapters, method, top_k, seed):
+    torch.manual_seed(seed)
+    lengths = [0, 1, 3, 5]
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length + 1)
+    logits = torch.randn(offsets[-1], 12)
+    tokens = torch.randint(0, 12, (offsets[-1],))
+    target_samples = torch.randint(0, 12, (offsets[-1],))
+    policy = adapters.config.make_policy(adapters.config.VerificationConfig(method=method, top_k=top_k))
+    output, counts, accepted = adapters.sampler.pack_accepted_prefixes(
+        policy, logits, tokens, target_samples, torch.tensor(offsets), 6
+    )
+    for row, (start, end) in enumerate(zip(offsets, offsets[1:])):
+        draft = tokens[start + 1 : end]
+        mask = policy.accept(logits[start : end - 1], draft)
+        expected_accepted = adapters.acceptance.accepted_prefix_length(mask)
+        expected = torch.cat((draft[:expected_accepted], target_samples[start + expected_accepted :][:1]))
+        assert accepted[row] == expected_accepted
+        assert output[row, : counts[row]].tolist() == expected.tolist()
+        assert (output[row, counts[row] :] == -1).all()
+
+
 def make_runtime(adapters):
     runtime = adapters.runtime.MultiStageRuntime.__new__(adapters.runtime.MultiStageRuntime)
     runtime.runner = SimpleNamespace(req_states=SimpleNamespace(index_to_req_id={7: "a", 2: "b", 4: "c", 1: "d"}))
@@ -14,6 +39,58 @@ def make_runtime(adapters):
     runtime.context_lengths = {name: 3 for name in "abcd"}
     runtime.max_lengths = {"a": 15, "b": 5, "c": 15, "d": 3}
     return runtime
+
+
+def test_target_eos_and_max_tokens_are_clamped_before_history_update(adapters):
+    runtime = make_runtime(adapters)
+    tokens = torch.tensor([[2, 9, 5, 6], [2, 3, 4, 5], [9, 3, 4, 5], [2, 3, 4, 5]])
+    result, counts = runtime.limit_final_output(tokens, torch.tensor([4, 4, 4, 4]), [7, 2, 4, 1])
+    assert counts.tolist() == [2, 2, 1, 0]
+    assert result.tolist() == [[2, 9, -1, -1], [2, 3, -1, -1], [9, -1, -1, -1], [-1] * 4]
+
+
+def test_target_policy_sampler_reuses_normal_target_samples(adapters):
+    sampler = adapters.sampler.PolicyRejectionSampler.__new__(adapters.sampler.PolicyRejectionSampler)
+    logits = torch.tensor([[0.0, 9.0, 1.0], [9.0, 1.0, 0.0], [0.0, 1.0, 9.0]])
+    sampler.sampler = SimpleNamespace(sample=lambda *args, **kwargs: (torch.tensor([2, 0, 2]), logits))
+    sampler.policy = adapters.acceptance.TopKPolicy(1)
+    sampler.num_speculative_steps = 2
+    sampler.config = SimpleNamespace(debug_logging=False, summary_logging=False, metrics_enabled=False)
+    sampler.runtime = SimpleNamespace(
+        limit_final_output=lambda tokens, counts, _: (tokens, counts),
+        record_final=lambda *args: None,
+    )
+    processed, sampled, count = sampler._verify(
+        logits, None, torch.tensor([0, 1, 2]), None, torch.tensor([0, 3]), None, [0], None, None
+    )
+    assert processed is logits
+    assert sampled.tolist() == [[1, 0, -1]]
+    assert count.tolist() == [2]
+
+
+def test_target_verification_summary_reports_policy_and_acceptance(adapters, caplog):
+    runtime = make_runtime(adapters)
+    runtime.config = SimpleNamespace(
+        debug_logging=False,
+        summary_logging=True,
+        final_verification=adapters.config.VerificationConfig(method="topk", top_k=5),
+    )
+    runtime.metrics = adapters.metrics.PipelineMetrics(True)
+    with caplog.at_level("INFO"):
+        runtime.record_final(
+            torch.zeros(3, 8),
+            torch.tensor([1, 2, 3]),
+            torch.tensor([0, 3]),
+            torch.tensor([[2, 7, -1]]),
+            torch.tensor([2]),
+            [7],
+            torch.tensor([1]),
+            1.25,
+        )
+    assert "multi_stage_target_verification method=topk top_k=5" in caplog.text
+    assert "candidates_by_request={'a': 2}" in caplog.text
+    assert "accepted_by_request={'a': 1}" in caplog.text
+    assert "verification_ms=1.250" in caplog.text
 
 
 def test_ragged_handler_reports_real_lengths_and_takes_snapshot(adapters):

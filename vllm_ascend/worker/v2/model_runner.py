@@ -195,6 +195,11 @@ class NPUModelRunner(GPUModelRunner):
             self.speculator.runtime = self.multi_stage_runtime
             self.draft_tokens_handler = RaggedDraftTokensHandler(self.multi_stage_runtime)
 
+    def load_model(self, *args, **kwargs):
+        super().load_model(*args, **kwargs)
+        if self.multi_stage_runtime is not None:
+            self.multi_stage_runtime.install_sampler()
+
     def shutdown(self):
         if self.multi_stage_runtime is not None:
             self.multi_stage_runtime.shutdown()

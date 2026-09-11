@@ -46,6 +46,7 @@ def test_four_model_tensor_parallel_generation(multi_stage_models):
                 "num_intermediate_rounds": 3,
                 "kv_cache_memory_bytes": 268435456,
                 "intermediate_verification": {"method": "topk", "top_k": 1},
+                "final_verification": {"method": "topk", "top_k": 1},
             }
         },
     ) as runner:

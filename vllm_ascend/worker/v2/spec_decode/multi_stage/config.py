@@ -8,17 +8,20 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+ASCEND_FIA_MAX_DECODE_QUERY_LEN = 16
+ASCEND_MAX_SPECULATIVE_TOKENS = ASCEND_FIA_MAX_DECODE_QUERY_LEN - 1
+
 
 def target_speculative_token_limit() -> int:
-    """Return the native target sampler's compiled candidate limit."""
+    """Return the effective target limit across sampler and Ascend attention."""
     try:
         from vllm.v1.sample.rejection_sampler import MAX_SPEC_LEN
 
-        return int(MAX_SPEC_LEN)
+        native_limit = int(MAX_SPEC_LEN)
     except (ImportError, AttributeError):
-        # The pinned upstream version uses 128. Keep config-only tooling usable
-        # when vLLM is not importable (for example documentation tests).
-        return 128
+        # Keep config-only tooling usable when vLLM is not importable.
+        native_limit = 128
+    return min(native_limit, ASCEND_MAX_SPECULATIVE_TOKENS)
 
 
 @dataclass(frozen=True)
@@ -46,8 +49,7 @@ class MultiStageConfig:
     # Explicit private KV budget, deducted before target memory profiling.
     kv_cache_memory_bytes: int = 1 << 30
     intermediate_verification: VerificationConfig = VerificationConfig()
-    # Kept as a parsed no-op for compatibility with the first experimental
-    # configuration. Final verification always uses vLLM's native sampler.
+    # Applied at the target's native MRV2 verification boundary.
     final_verification: VerificationConfig = VerificationConfig()
     debug_logging: bool = False
     metrics_enabled: bool = False
@@ -103,12 +105,18 @@ class MultiStageConfig:
         spec = vllm_config.speculative_config
         if spec is None or not spec.use_dflash():
             raise ValueError("Multi-stage decoding requires speculative_config.method='dflash'")
+        for name in ("primary_num_speculative_tokens", "secondary_num_speculative_tokens"):
+            if getattr(self, name) > ASCEND_MAX_SPECULATIVE_TOKENS:
+                raise ValueError(
+                    f"multi_stage_spec_config.{name} exceeds the Ascend per-forward limit "
+                    f"({ASCEND_MAX_SPECULATIVE_TOKENS})"
+                )
         if spec.num_speculative_tokens < self.primary_num_speculative_tokens:
             raise ValueError("speculative_config.num_speculative_tokens must cover the primary draft width")
         limit = target_speculative_token_limit()
         if spec.num_speculative_tokens > limit:
             raise ValueError(
-                f"speculative_config.num_speculative_tokens exceeds the native target sampler limit ({limit})"
+                f"speculative_config.num_speculative_tokens exceeds the Ascend target verification limit ({limit})"
             )
         if vllm_config.scheduler_config.async_scheduling:
             raise ValueError("Multi-stage decoding currently requires async_scheduling=False")
@@ -158,9 +166,15 @@ class MultiStageConfig:
         limit = target_speculative_token_limit()
         configured = int(spec.num_speculative_tokens)
         if configured > limit:
-            raise ValueError(
-                f"speculative_config.num_speculative_tokens exceeds the native target sampler limit ({limit})"
+            spec.num_speculative_tokens = limit
+            logger.warning(
+                "Reduced target speculative candidate capacity from %s to %s: "
+                "Ascend FIA supports at most %s query tokens including the bonus token",
+                configured,
+                limit,
+                ASCEND_FIA_MAX_DECODE_QUERY_LEN,
             )
+            configured = limit
         possible = self.primary_num_speculative_tokens + (
             (self.num_intermediate_rounds - 1) * self.secondary_num_speculative_tokens
         )
@@ -169,7 +183,7 @@ class MultiStageConfig:
             spec.num_speculative_tokens = required
             logger.info(
                 "Expanded target speculative candidate capacity from %s to %s "
-                "for multi-stage decoding (native limit=%s)",
+                "for multi-stage decoding (Ascend target limit=%s)",
                 configured,
                 required,
                 limit,
@@ -177,7 +191,7 @@ class MultiStageConfig:
         if possible > limit:
             logger.warning(
                 "Multi-stage decoding can produce up to %s candidates, but the "
-                "native target sampler limit is %s; later intermediate rounds "
+                "Ascend target verification limit is %s; later intermediate rounds "
                 "will stop when that limit is reached",
                 possible,
                 limit,
