@@ -29,6 +29,15 @@ class PrivateCache:
     blocks: list[list[int]] = field(default_factory=list)
 
 
+@dataclass
+class ForwardInput:
+    request_id: str
+    tokens: tuple[int, ...]
+    context_len: int
+    start: int
+    cache: PrivateCache
+
+
 class IntermediateBackend:
     def __init__(self, vllm_config, device, config, policy):
         # These imports are deliberately lazy: constructing a nested runner from
@@ -38,7 +47,7 @@ class IntermediateBackend:
         from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
         self.config = config
-        self.timing_enabled = True
+        self.timing_enabled = config.metrics_enabled or config.summary_logging
         self.policy = policy
         self.device = device
         private = copy.copy(vllm_config)
@@ -143,32 +152,48 @@ class IntermediateBackend:
             self.runner.kv_block_zeroer.zero_block_ids(allocated)
         return cache
 
-    def _store_draft_context(self, execution, cache):
+    def _store_draft_contexts(self, execution, caches):
         draft = self.runner.speculator
         hidden = execution.hidden_states
         if execution.aux_hidden_states:
             hidden = draft.model.combine_hidden_states(torch.cat(execution.aux_hidden_states, dim=-1))
         batch = execution.input_batch
         positions = batch.positions[: batch.num_tokens]
+        offsets = batch.query_start_loc_np
         group_slots = []
         for gid in draft.draft_kv_cache_group_ids:
-            blocks = torch.tensor(cache.blocks[gid], dtype=torch.int64, device=self.device)
             size = self.block_sizes[gid]
-            group_slots.append((blocks[positions.long() // size] * size + positions % size).to(torch.int32))
+            parts = []
+            for row, request_id in enumerate(batch.req_ids):
+                start, end = int(offsets[row]), int(offsets[row + 1])
+                request_positions = positions[start:end]
+                blocks = torch.tensor(caches[request_id].blocks[gid], dtype=torch.int64, device=self.device)
+                parts.append(
+                    (blocks[request_positions.long() // size] * size + request_positions % size).to(torch.int32)
+                )
+            group_slots.append(torch.cat(parts))
         slots = (
             [group_slots[i] for i in draft._layer_group_idx] if draft._layer_group_idx is not None else group_slots[0]
         )
         draft.model.precompute_and_store_context_kv(hidden[: batch.num_tokens], positions, slots)
 
+    def _store_draft_context(self, execution, cache):
+        self._store_draft_contexts(execution, {execution.input_batch.req_ids[0]: cache})
+
+    @staticmethod
+    def _common_prefix_length(cached, tokens):
+        common = 0
+        for cached_token, token in zip(cached, tokens):
+            if cached_token != token:
+                break
+            common += 1
+        return common
+
     def _forward(self, request_id, tokens, context_len):
         """Incrementally forward a prefix, overlapping its last token for logits."""
         capacity = min(self.runner.max_model_len, len(tokens) + self.config.secondary_num_speculative_tokens)
         cache = self._reserve(request_id, capacity)
-        common = 0
-        for a, b in zip(cache.tokens, tokens):
-            if a != b:
-                break
-            common += 1
+        common = self._common_prefix_length(cache.tokens, tokens)
         # The last context token must yield the logits predicting draft[0].
         start = min(common, context_len - 1)
         if start < 0:
@@ -219,10 +244,96 @@ class IntermediateBackend:
         assert execution is not None
         return execution, torch.cat(logits_parts), cache
 
+    def _can_forward_batch(self, states):
+        total_tokens = 0
+        for state in states:
+            tokens = state.context + tuple(state.current_draft)
+            cached = self.caches.get(state.request_id)
+            common = self._common_prefix_length(cached.tokens if cached is not None else (), tokens)
+            start = min(common, len(state.context) - 1)
+            if start < 0:
+                return False
+            total_tokens += len(tokens) - start
+        return total_tokens <= self.runner.max_num_tokens
+
+    def _forward_batch(self, states):
+        """Run all request-local incremental spans in one packed MRV2 forward."""
+        work = []
+        for state in states:
+            context = state.context
+            tokens = context + tuple(state.current_draft)
+            capacity = min(self.runner.max_model_len, len(tokens) + self.config.secondary_num_speculative_tokens)
+            cache = self._reserve(state.request_id, capacity)
+            common = self._common_prefix_length(cache.tokens, tokens)
+            start = min(common, len(context) - 1)
+            if start < 0:
+                raise ValueError("Intermediate verification requires a nonempty context")
+            work.append(ForwardInput(state.request_id, tokens, len(context), start, cache))
+
+        scheduled = SchedulerOutput.make_empty()
+        scheduled.scheduled_new_reqs = [
+            NewRequestData(
+                req_id=item.request_id,
+                prompt_token_ids=list(item.tokens),
+                mm_features=[],
+                sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
+                pooling_params=None,
+                block_ids=tuple(item.cache.blocks),
+                num_computed_tokens=item.start,
+                lora_request=None,
+                prefill_token_ids=list(item.tokens),
+            )
+            for item in work
+        ]
+        scheduled.num_scheduled_tokens = {item.request_id: len(item.tokens) - item.start for item in work}
+        scheduled.total_num_scheduled_tokens = sum(scheduled.num_scheduled_tokens.values())
+        scheduled.num_common_prefix_blocks = [0] * len(work[0].cache.blocks)
+        if self.timing_enabled:
+            torch.npu.synchronize()
+        forward_start = perf_counter()
+        self.runner.execute_model(scheduled)
+        if self.timing_enabled:
+            torch.npu.synchronize()
+            self.verifier_calls += 1
+            self.verifier_tokens += scheduled.total_num_scheduled_tokens
+            self.verifier_ms += (perf_counter() - forward_start) * 1000
+        execution = self.runner.execute_model_state
+        if execution is None:
+            raise RuntimeError("Intermediate MRV2 forward returned no execution state")
+        work_by_id = {item.request_id: item for item in work}
+        self._store_draft_contexts(execution, {item.request_id: item.cache for item in work})
+
+        batch = execution.input_batch
+        offsets = batch.query_start_loc_np
+        hidden_parts = []
+        candidate_counts = []
+        for row, request_id in enumerate(batch.req_ids):
+            item = work_by_id[request_id]
+            batch_start = int(offsets[row])
+            lo = max(item.context_len - 1, item.start)
+            hi = len(item.tokens) - 1
+            count = max(0, hi - lo)
+            candidate_counts.append(count)
+            hidden_parts.append(
+                execution.hidden_states[
+                    batch_start + lo - item.start : batch_start + hi - item.start
+                ]
+            )
+            item.cache.tokens = item.tokens
+        packed_logits = self.runner.model.compute_logits(torch.cat(hidden_parts))
+        logits_by_id = {}
+        offset = 0
+        for request_id, count in zip(batch.req_ids, candidate_counts):
+            logits_by_id[request_id] = packed_logits[offset : offset + count]
+            offset += count
+        return execution, work_by_id, logits_by_id
+
     @torch.inference_mode()
     def verify(self, states):
-        results = {}
         with set_current_vllm_config(self.vllm_config):
+            if len(states) > 1 and self._can_forward_batch(states):
+                return self._verify_batch(states)
+            results = {}
             for state in states:
                 self.next_drafts.pop(state.request_id, None)
                 context = state.context
@@ -255,6 +366,44 @@ class IntermediateBackend:
                     self._draft(state.request_id, execution, accepted_end, accepted_tokens[-1])
                 cache.tokens = tuple(tokens[:accepted_end])
                 self.runner.execute_model_state = None
+        return results
+
+    def _verify_batch(self, states):
+        for state in states:
+            self.next_drafts.pop(state.request_id, None)
+        execution, work_by_id, logits_by_id = self._forward_batch(states)
+        results = {}
+        draft_inputs = {}
+        for state in states:
+            context = state.context
+            logits = logits_by_id[state.request_id]
+            drafts = torch.tensor(state.current_draft, dtype=torch.int64, device=self.device)
+            accepted = accepted_prefix_length(self.policy.accept(logits, drafts))
+            accepted_tokens = state.current_draft[:accepted]
+            for i, token in enumerate(accepted_tokens):
+                if token in state.eos_token_ids:
+                    accepted_tokens = accepted_tokens[: i + 1]
+                    break
+            accepted_end = len(context) + len(accepted_tokens)
+            topk = None
+            if self.config.debug_logging:
+                k = min(self.config.intermediate_verification.top_k, logits.shape[-1])
+                topk = logits.topk(k, dim=-1).indices.cpu().tolist()
+            results[state.request_id] = VerificationResult(accepted_tokens, accepted == 0, topk)
+            can_draft = (
+                accepted_tokens
+                and state.round_id + 1 < self.config.num_intermediate_rounds
+                and len(accepted_tokens) < state.remaining
+                and accepted_tokens[-1] not in state.eos_token_ids
+                and accepted_end + self.config.secondary_num_speculative_tokens <= self.runner.max_model_len
+            )
+            if can_draft:
+                draft_inputs[state.request_id] = (accepted_end, accepted_tokens[-1])
+            work = work_by_id[state.request_id]
+            work.cache.tokens = work.tokens[:accepted_end]
+        if draft_inputs:
+            self._draft_batch(execution, work_by_id, draft_inputs)
+        self.runner.execute_model_state = None
         return results
 
     def _draft(self, request_id, execution, accepted_end, anchor):
@@ -293,6 +442,54 @@ class IntermediateBackend:
         if self.timing_enabled:
             self.secondary_calls += 1
             self.secondary_tokens += proposed.shape[1]
+            self.secondary_ms += (perf_counter() - start) * 1000
+
+    def _draft_batch(self, execution, work_by_id, draft_inputs):
+        """Generate secondary drafts for a packed verifier batch in one call."""
+        runner = self.runner
+        batch = execution.input_batch
+        state_indices = []
+        anchors = []
+        rejected_counts = []
+        for request_id in batch.req_ids:
+            work = work_by_id[request_id]
+            accepted_end, anchor = draft_inputs.get(
+                request_id,
+                (work.context_len, work.tokens[work.context_len - 1]),
+            )
+            rejected = len(work.tokens) + 1 - accepted_end
+            state_indices.append(runner.req_states.req_id_to_index[request_id])
+            anchors.append(anchor)
+            rejected_counts.append(rejected)
+        state_indices_tensor = torch.tensor(state_indices, dtype=torch.long, device=self.device)
+        runner.req_states.last_sampled_tokens[state_indices_tensor, 0] = torch.tensor(
+            anchors, dtype=runner.req_states.last_sampled_tokens.dtype, device=self.device
+        )
+        num_sampled = torch.ones(len(batch.req_ids), dtype=torch.int32, device=self.device)
+        num_rejected = torch.tensor(rejected_counts, dtype=torch.int32, device=self.device)
+        if self.timing_enabled:
+            torch.npu.synchronize()
+        start = perf_counter()
+        proposed = runner.speculator.propose(
+            batch,
+            execution.attn_metadata,
+            execution.slot_mappings_by_layer,
+            execution.hidden_states,
+            execution.aux_hidden_states,
+            num_sampled,
+            num_rejected,
+            runner.req_states.last_sampled_tokens,
+            runner.req_states.next_prefill_tokens,
+            runner.sampler.sampling_states.temperature.gpu,
+            runner.sampler.sampling_states.seeds.gpu,
+        )
+        proposed_list = proposed.cpu().tolist()
+        for row, request_id in enumerate(batch.req_ids):
+            if request_id in draft_inputs:
+                self.next_drafts[request_id] = proposed_list[row]
+        if self.timing_enabled:
+            self.secondary_calls += 1
+            self.secondary_tokens += len(draft_inputs) * proposed.shape[1]
             self.secondary_ms += (perf_counter() - start) * 1000
 
     def propose(self, states):

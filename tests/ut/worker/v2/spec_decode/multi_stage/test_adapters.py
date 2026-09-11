@@ -44,7 +44,7 @@ def make_runtime(adapters):
 def test_runtime_logs_enabled_configuration_at_startup(adapters, caplog):
     config = SimpleNamespace(
         metrics_enabled=False,
-        summary_logging=False,
+        summary_logging=True,
         primary_num_speculative_tokens=8,
         secondary_num_speculative_tokens=4,
         num_intermediate_rounds=3,
@@ -59,6 +59,21 @@ def test_runtime_logs_enabled_configuration_at_startup(adapters, caplog):
     assert "intermediate_verification=topk" in caplog.text
     assert "final_verification=all" in caplog.text
     assert "target_capacity=15" in caplog.text
+
+
+def test_runtime_summary_logging_false_suppresses_startup_log(adapters, caplog):
+    config = SimpleNamespace(
+        metrics_enabled=False,
+        summary_logging=False,
+        primary_num_speculative_tokens=8,
+        secondary_num_speculative_tokens=4,
+        num_intermediate_rounds=3,
+        intermediate_verification=SimpleNamespace(method="topk"),
+        final_verification=SimpleNamespace(method="all"),
+    )
+    with caplog.at_level("INFO"):
+        adapters.runtime.MultiStageRuntime(SimpleNamespace(num_speculative_steps=15), config)
+    assert not caplog.records
 
 
 def test_target_policy_sampler_reuses_normal_target_samples(adapters, monkeypatch):
@@ -103,7 +118,7 @@ def test_accept_all_keeps_masked_candidates_and_target_bonus(adapters, monkeypat
 
     assert sampled.tolist() == [[1, 2, 2]]
     assert count.tolist() == [3]
-    assert len(recorded) == 1
+    assert not recorded
 
 
 def test_target_verification_summary_reports_policy_and_acceptance(adapters, caplog):
@@ -136,7 +151,7 @@ def test_target_accept_all_summary_reports_one_hundred_percent(adapters, caplog)
     runtime = make_runtime(adapters)
     runtime.config = SimpleNamespace(
         debug_logging=False,
-        summary_logging=False,
+        summary_logging=True,
         final_verification=adapters.config.VerificationConfig(method="all"),
     )
     runtime.metrics = adapters.metrics.PipelineMetrics(False)
@@ -202,7 +217,7 @@ def test_runtime_logs_ready_candidate_count_and_stage_times(adapters, caplog):
 
 def test_runtime_logs_exact_candidates_scheduled_to_target(adapters, monkeypatch, caplog):
     runtime = adapters.runtime.MultiStageRuntime.__new__(adapters.runtime.MultiStageRuntime)
-    runtime.config = SimpleNamespace(summary_logging=False, metrics_enabled=False)
+    runtime.config = SimpleNamespace(summary_logging=True, metrics_enabled=False)
     runtime.metrics = adapters.metrics.PipelineMetrics(True)
     runtime.current_target_candidate_counts = {"a": 15, "b": 3}
     monkeypatch.setattr(adapters.runtime.torch, "npu", SimpleNamespace(synchronize=lambda: None), raising=False)
@@ -233,21 +248,34 @@ class FakeRunner:
     def __init__(self, chunk_size=100):
         self.max_model_len = 100
         self.max_num_tokens = chunk_size
+        self.execute_calls = 0
         self.spans = []
         self.zeroed_blocks = []
         self.kv_block_zeroer = SimpleNamespace(zero_block_ids=self.zeroed_blocks.extend)
         self.model = SimpleNamespace(compute_logits=lambda hidden: hidden.repeat(1, 12))
 
     def execute_model(self, scheduled):
-        req = scheduled.scheduled_new_reqs[0]
-        start = req.num_computed_tokens
-        end = start + scheduled.total_num_scheduled_tokens
-        self.spans.append((start, end))
-        positions = torch.arange(start, end)
+        self.execute_calls += 1
+        positions = []
+        offsets = [0]
+        req_ids = []
+        for req in scheduled.scheduled_new_reqs:
+            start = req.num_computed_tokens
+            end = start + scheduled.num_scheduled_tokens[req.req_id]
+            self.spans.append((start, end))
+            positions.append(torch.arange(start, end))
+            offsets.append(offsets[-1] + end - start)
+            req_ids.append(req.req_id)
+        packed_positions = torch.cat(positions)
         self.execute_model_state = SimpleNamespace(
-            hidden_states=positions.float()[:, None],
+            hidden_states=packed_positions.float()[:, None],
             aux_hidden_states=None,
-            input_batch=SimpleNamespace(positions=positions, num_tokens=end - start),
+            input_batch=SimpleNamespace(
+                req_ids=req_ids,
+                positions=packed_positions,
+                query_start_loc_np=offsets,
+                num_tokens=len(packed_positions),
+            ),
         )
 
 
@@ -255,6 +283,9 @@ def make_backend(adapters, chunk_size=100):
     backend = adapters.backend.IntermediateBackend.__new__(adapters.backend.IntermediateBackend)
     backend.config = SimpleNamespace(
         secondary_num_speculative_tokens=2,
+        num_intermediate_rounds=1,
+        debug_logging=False,
+        intermediate_verification=SimpleNamespace(top_k=5),
         metrics_enabled=False,
         summary_logging=False,
     )
@@ -265,7 +296,10 @@ def make_backend(adapters, chunk_size=100):
     backend.free_blocks = list(range(1, 100))
     backend.caches = {}
     backend.next_drafts = {}
+    backend.vllm_config = SimpleNamespace()
+    backend.policy = adapters.acceptance.AcceptAllPolicy()
     backend._store_draft_context = lambda execution, cache: None
+    backend._store_draft_contexts = lambda execution, caches: None
     return backend
 
 
@@ -290,6 +324,23 @@ def test_chunked_private_prefill_keeps_all_verification_logits(adapters):
     _, logits, _ = backend._forward("r", tuple(range(8)), 5)
     assert backend.runner.spans == [(0, 2), (2, 4), (4, 6), (6, 8)]
     assert logits[:, 0].tolist() == [4, 5, 6]
+
+
+def test_intermediate_verification_packs_active_requests_into_one_forward(adapters):
+    backend = make_backend(adapters)
+    states = [
+        adapters.state.SpeculativeState("a", (1, 2), 8),
+        adapters.state.SpeculativeState("b", (5, 6), 8),
+    ]
+    states[0].current_draft = [3, 4]
+    states[1].current_draft = [7, 8]
+
+    results = backend.verify(states)
+
+    assert backend.runner.execute_calls == 1
+    assert backend.runner.spans == [(0, 4), (0, 4)]
+    assert results["a"].accepted_tokens == [3, 4]
+    assert results["b"].accepted_tokens == [7, 8]
 
 
 def test_private_block_groups_and_requests_never_alias(adapters):
@@ -351,11 +402,18 @@ def test_secondary_context_slots_use_private_group_and_position(adapters):
     execution = SimpleNamespace(
         hidden_states=torch.zeros(4, 2),
         aux_hidden_states=[torch.ones(4, 1), torch.full((4, 1), 2.0)],
-        input_batch=SimpleNamespace(positions=torch.tensor([0, 3, 4, 5]), num_tokens=4),
+        input_batch=SimpleNamespace(
+            req_ids=["r"],
+            positions=torch.tensor([0, 3, 4, 5]),
+            query_start_loc_np=[0, 4],
+            num_tokens=4,
+        ),
     )
     # Restore the real method (the generic fake-runner helper stubs this boundary).
-    adapters.backend.IntermediateBackend._store_draft_context(
-        backend, execution, adapters.backend.PrivateCache(blocks=[[10, 11], [20, 21]])
+    adapters.backend.IntermediateBackend._store_draft_contexts(
+        backend,
+        execution,
+        {"r": adapters.backend.PrivateCache(blocks=[[10, 11], [20, 21]])},
     )
     assert captured["slots"][0].tolist() == [80, 83, 84, 85]
     assert captured["slots"][1].tolist() == [40, 43, 44, 45]

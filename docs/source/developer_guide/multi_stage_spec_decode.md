@@ -126,6 +126,7 @@ llm = LLM(
             "final_verification": {"method": "topk", "top_k": 5},
             "debug_logging": False,
             "metrics_enabled": False,
+            "summary_logging": True,
         }
     },
 )
@@ -133,15 +134,15 @@ outputs = llm.generate(["Hello"], SamplingParams(temperature=0, max_tokens=64))
 ```
 
 Select MRV2 using the existing upstream `VLLM_USE_V2_MODEL_RUNNER=1` setting.
-At the default INFO level, enabling multi-stage decoding always emits summary
-logs through vLLM's worker logger. It first reports `multi_stage_enabled` and
+At the default INFO level, `summary_logging=true` emits summary logs through
+vLLM's worker logger. It first reports `multi_stage_enabled` and
 `multi_stage_target_sampler_installed`, then reports each intermediate round's
 proposed and accepted counts, candidate counts ready for scheduling, the exact
 candidate counts scheduled into each target forward, the final target acceptance
 rate, and primary/intermediate/secondary/target-forward/target-verification time.
-Accurate NPU timing adds device synchronizations. The legacy `summary_logging`
-option remains accepted for configuration compatibility but no longer suppresses
-these logs. Set
+Accurate NPU timing adds device synchronizations. Set `summary_logging=false` to
+suppress these multi-stage INFO logs and their timing synchronizations; this does
+not disable vLLM's original periodic engine and speculative-decoding statistics. Set
 `VLLM_LOGGING_LEVEL=DEBUG` and `debug_logging=true`
 to see token traces; these traces include prompt content. `metrics_enabled=true`
 keeps cumulative in-process counters independently of summary logs.

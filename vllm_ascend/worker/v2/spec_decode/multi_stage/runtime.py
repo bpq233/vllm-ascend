@@ -43,17 +43,18 @@ class MultiStageRuntime:
         self.last_primary_ms = 0.0
         self.last_target_forward_ms = 0.0
         self.current_target_candidate_counts = {}
-        logger.info(
-            "multi_stage_enabled primary_tokens=%d secondary_tokens=%d "
-            "intermediate_rounds=%d intermediate_verification=%s "
-            "final_verification=%s target_capacity=%d",
-            self.config.primary_num_speculative_tokens,
-            self.config.secondary_num_speculative_tokens,
-            self.config.num_intermediate_rounds,
-            self.config.intermediate_verification.method,
-            self.config.final_verification.method,
-            self.runner.num_speculative_steps,
-        )
+        if self.config.summary_logging:
+            logger.info(
+                "multi_stage_enabled primary_tokens=%d secondary_tokens=%d "
+                "intermediate_rounds=%d intermediate_verification=%s "
+                "final_verification=%s target_capacity=%d",
+                self.config.primary_num_speculative_tokens,
+                self.config.secondary_num_speculative_tokens,
+                self.config.num_intermediate_rounds,
+                self.config.intermediate_verification.method,
+                self.config.final_verification.method,
+                self.runner.num_speculative_steps,
+            )
 
     def load_backend(self):
         self.backend = IntermediateBackend(
@@ -79,11 +80,12 @@ class MultiStageRuntime:
             self.config,
             self,
         )
-        logger.info(
-            "multi_stage_target_sampler_installed verification=%s top_k=%d",
-            self.config.final_verification.method,
-            self.config.final_verification.top_k,
-        )
+        if self.config.summary_logging:
+            logger.info(
+                "multi_stage_target_sampler_installed verification=%s top_k=%d",
+                self.config.final_verification.method,
+                self.config.final_verification.top_k,
+            )
 
     def observe(self, scheduled):
         target_drafts = getattr(scheduled, "scheduled_spec_decode_tokens", None) or {}
@@ -152,18 +154,19 @@ class MultiStageRuntime:
             tokens = self.drafts[req_id]
             if tokens:
                 output[row, : len(tokens)] = torch.tensor(tokens, dtype=torch.int64, device=runner.device)
-        candidate_counts = {request_id: len(tokens) for request_id, tokens in self.drafts.items()}
-        run = self.pipeline.last_run
-        logger.info(
-            "multi_stage_candidates_ready candidates_by_request=%s total_candidates=%s "
-            "primary_model_ms=%.3f intermediate_model_ms=%.3f "
-            "secondary_model_ms=%.3f",
-            candidate_counts,
-            sum(candidate_counts.values()),
-            self.last_primary_ms,
-            run["intermediate_verifier_ms"],
-            run["secondary_drafter_ms"],
-        )
+        if self.config.summary_logging:
+            candidate_counts = {request_id: len(tokens) for request_id, tokens in self.drafts.items()}
+            run = self.pipeline.last_run
+            logger.info(
+                "multi_stage_candidates_ready candidates_by_request=%s total_candidates=%s "
+                "primary_model_ms=%.3f intermediate_model_ms=%.3f "
+                "secondary_model_ms=%.3f",
+                candidate_counts,
+                sum(candidate_counts.values()),
+                self.last_primary_ms,
+                run["intermediate_verifier_ms"],
+                run["secondary_drafter_ms"],
+            )
         return output
 
     def record_final(self, logits, draft, cu, output, counts, indices, accepted_lengths, elapsed_ms):
@@ -200,39 +203,45 @@ class MultiStageRuntime:
         total_accepted = sum(accepted_by_request.values())
         self.metrics.record("target_verification", total_candidates, elapsed_ms, total_accepted)
         acceptance_rate = 100.0 * total_accepted / total_candidates if total_candidates else 100.0
-        logger.info(
-            "multi_stage_target_verification method=%s top_k=%s "
-            "candidates_by_request=%s accepted_by_request=%s "
-            "total_candidates=%s total_accepted=%s acceptance_rate=%.1f%% "
-            "verification_ms=%.3f",
-            self.config.final_verification.method,
-            self.config.final_verification.top_k if self.config.final_verification.method == "topk" else None,
-            candidate_by_request,
-            accepted_by_request,
-            total_candidates,
-            total_accepted,
-            acceptance_rate,
-            elapsed_ms,
-        )
+        if self.config.summary_logging:
+            logger.info(
+                "multi_stage_target_verification method=%s top_k=%s "
+                "candidates_by_request=%s accepted_by_request=%s "
+                "total_candidates=%s total_accepted=%s acceptance_rate=%.1f%% "
+                "verification_ms=%.3f",
+                self.config.final_verification.method,
+                self.config.final_verification.top_k if self.config.final_verification.method == "topk" else None,
+                candidate_by_request,
+                accepted_by_request,
+                total_candidates,
+                total_accepted,
+                acceptance_rate,
+                elapsed_ms,
+            )
 
     def before_forward(self):
+        if not (self.config.summary_logging or self.config.metrics_enabled):
+            return None
         torch.npu.synchronize()
         return perf_counter()
 
     def after_forward(self, start, num_tokens):
+        if start is None:
+            return
         torch.npu.synchronize()
         elapsed = (perf_counter() - start) * 1000
         self.last_target_forward_ms = elapsed
         self.metrics.record("target_forward", num_tokens, elapsed)
-        logger.info(
-            "multi_stage_target target_candidates_by_request=%s "
-            "total_target_candidates=%s scheduled_tokens=%s "
-            "target_model_forward_ms=%.3f",
-            self.current_target_candidate_counts,
-            sum(self.current_target_candidate_counts.values()),
-            num_tokens,
-            elapsed,
-        )
+        if self.config.summary_logging:
+            logger.info(
+                "multi_stage_target target_candidates_by_request=%s "
+                "total_target_candidates=%s scheduled_tokens=%s "
+                "target_model_forward_ms=%.3f",
+                self.current_target_candidate_counts,
+                sum(self.current_target_candidate_counts.values()),
+                num_tokens,
+                elapsed,
+            )
 
     def shutdown(self):
         if self.backend is not None:

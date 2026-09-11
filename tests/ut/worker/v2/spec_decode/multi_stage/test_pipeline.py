@@ -128,8 +128,7 @@ def test_logging_and_metrics_switches(core, caplog):
     disabled = core.pipeline.SpeculativePipeline(backend, backend, 1, summary_logging=False)
     with caplog.at_level("DEBUG"):
         disabled.run([core.state.SpeculativeState("r", (1,), 10)], {"r": [2]})
-    assert len(caplog.records) == 1
-    assert "multi_stage_intermediate" in caplog.text
+    assert not caplog.records
     assert disabled.metrics.stages == {}
 
 

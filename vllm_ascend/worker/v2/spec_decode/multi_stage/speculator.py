@@ -53,7 +53,9 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
         mm_inputs=None,
         is_profile=False,
     ):
-        measure = not dummy_run
+        measure = (
+            self.multi_stage_config.summary_logging or self.multi_stage_config.metrics_enabled
+        ) and not dummy_run
         if measure:
             torch.npu.synchronize()
         start = perf_counter()

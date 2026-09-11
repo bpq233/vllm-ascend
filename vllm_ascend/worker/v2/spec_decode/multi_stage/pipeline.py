@@ -121,17 +121,18 @@ class SpeculativePipeline:
                     "secondary_model_ms": cached_secondary_ms,
                 }
                 self.last_run["rounds"].append(round_stats)
-                logger.info(
-                    "multi_stage_intermediate round=%s proposed=%s accepted=%s "
-                    "accepted_by_request=%s intermediate_model_ms=%.3f "
-                    "secondary_model_ms=%.3f",
-                    round_id + 1,
-                    input_count,
-                    accepted_count,
-                    accepted_by_request,
-                    verifier_ms,
-                    cached_secondary_ms,
-                )
+                if self.summary_logging:
+                    logger.info(
+                        "multi_stage_intermediate round=%s proposed=%s accepted=%s "
+                        "accepted_by_request=%s intermediate_model_ms=%.3f "
+                        "secondary_model_ms=%.3f",
+                        round_id + 1,
+                        input_count,
+                        accepted_count,
+                        accepted_by_request,
+                        verifier_ms,
+                        cached_secondary_ms,
+                    )
                 if round_id + 1 == self.num_rounds:
                     break
                 continuing = [s for s in active if s.should_continue()]
