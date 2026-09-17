@@ -243,6 +243,8 @@ class AscendConfig:
     enable_reduce_sample: bool = False
     enable_dsa_cp: bool = False
     draft_window_size: int | None = None
+    # MRV2 intermediate models and optional final acceptance policy.
+    multi_stage_speculative: dict[str, Any] = dataclasses.field(default_factory=dict)
     mix_placement: bool = False
     pa_shape_list: list[Any] = dataclasses.field(default_factory=list)
     mega_moe_max_tokens: int = 131072
@@ -1237,6 +1239,10 @@ def init_ascend_config(vllm_config):
     # the single legitimate entry point — bypassing the factory leaves derived
     # fields at their sentinel defaults.
     new_config.derive_and_validate(vllm_config)
+    if new_config.multi_stage_speculative:
+        from vllm_ascend.worker.v2.spec_decode.multi_stage_config import validate_multi_stage
+
+        validate_multi_stage(vllm_config, new_config.multi_stage_speculative)
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)
     new_config.xlite_graph_config._validate_preconditions(vllm_config)

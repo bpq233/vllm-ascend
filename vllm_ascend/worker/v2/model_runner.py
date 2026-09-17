@@ -189,6 +189,31 @@ class NPUModelRunner(GPUModelRunner):
             self.pp_handler.broadcast_draft_tokens()
         return output
 
+    def load_model(self, *args, **kwargs):
+        super().load_model(*args, **kwargs)
+        options = self.ascend_config.multi_stage_speculative
+        if not options:
+            return
+        if "final_verification" in options and self.is_last_pp_rank:
+            from vllm_ascend.worker.v2.spec_decode.acceptance import AcceptancePolicy
+            from vllm_ascend.worker.v2.spec_decode.final_verification import FinalVerificationSampler
+
+            self.rejection_sampler = FinalVerificationSampler(
+                self.sampler, self.speculative_config, self.device, AcceptancePolicy(**options["final_verification"])
+            )
+        if hasattr(self.speculator, "initialize_intermediate"):
+            from vllm.utils.mem_utils import DeviceMemoryProfiler
+
+            with DeviceMemoryProfiler() as memory:
+                self.speculator.initialize_intermediate(self)
+            self.model_memory_usage += memory.consumed_memory
+            self.draft_tokens_handler = self.speculator
+
+    def shutdown(self):
+        if hasattr(self.speculator, "initialize_intermediate"):
+            self.draft_tokens_handler = None
+        super().shutdown()
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
             super().initialize_kv_cache(kv_cache_config)
