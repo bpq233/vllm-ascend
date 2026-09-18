@@ -38,11 +38,12 @@ class Backend:
         self.proposals = iter(proposals)
         self.calls = []
 
-    def verify(self, contexts, drafts):
+    def verify_batches(self, contexts, drafts, req_ids=None):
         self.calls.append(("verify", contexts, drafts))
-        return [scores(row) for row in next(self.verification)]
+        rows = next(self.verification)
+        yield torch.cat([scores(row) for row in rows]), [len(row) for row in rows]
 
-    def propose(self, contexts):
+    def propose(self, contexts, req_ids=None):
         self.calls.append(("propose", contexts))
         return next(self.proposals)
 
@@ -159,3 +160,27 @@ def test_unsupported_runner_modes(modules, attribute, value):
     setattr(cfg, attribute, value)
     with pytest.raises(ValueError):
         config.validate_multi_stage(cfg, settings())
+
+
+def test_long_budget_validation(modules):
+    config, _ = modules
+    cfg = vllm_config()
+    cfg.speculative_config.num_speculative_tokens = 32
+    cfg.scheduler_config.max_num_batched_tokens = 64
+    cfg.cache_config = NS(cache_dtype="auto")
+    options = {**settings(), "primary_num_speculative_tokens": 4}
+    config.validate_multi_stage(cfg, options)
+    for changes in ({"primary_num_speculative_tokens": 16}, {"intermediate": settings(num_rounds=0)["intermediate"]}):
+        with pytest.raises(ValueError):
+            config.validate_multi_stage(cfg, {**options, **changes})
+    cfg.scheduler_config.max_num_batched_tokens = 32
+    with pytest.raises(ValueError, match="max_num_batched_tokens"):
+        config.validate_multi_stage(cfg, options)
+
+
+def test_packed_decisions_match_individual_requests(modules):
+    config, Pipeline = modules
+    pipeline = Pipeline(None, config.IntermediateConfig("v", "d", verification={"method": "topk", "top_k": 1}), 32)
+    drafts = [[1, 2, 3], [], [5, 6]]
+    packed = torch.cat([scores([1, 9, 3, 4]), scores([7]), scores([5, 6, 8])])
+    assert pipeline._decide(packed, drafts, [4, 1, 3]) == [[1, 9], [0, 7], [2, 8]]

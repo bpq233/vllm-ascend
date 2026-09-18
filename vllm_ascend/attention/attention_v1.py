@@ -41,6 +41,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
+from vllm_ascend.attention.spec_decode import MAX_DECODE_QUERY_LEN, speculative_decode_threshold
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     PagedAttentionGraphParam,
@@ -253,11 +254,9 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         )
 
         self.speculative_config = vllm_config.speculative_config
-        self.decode_threshold = 1
+        self.decode_threshold = speculative_decode_threshold(vllm_config)
         if self.speculative_config:
-            spec_token_num = self.speculative_config.num_speculative_tokens
-            self.decode_threshold += spec_token_num
-            assert self.decode_threshold <= 16, (
+            assert self.decode_threshold <= MAX_DECODE_QUERY_LEN, (
                 f"decode_threshold exceeded \
                 npu_fused_infer_attention_score TND layout's limit of 16, \
                 got {self.decode_threshold}"

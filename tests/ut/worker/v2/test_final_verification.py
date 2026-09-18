@@ -74,6 +74,31 @@ class TestAcceptancePolicy(unittest.TestCase):
                     expected.append(target[start + len(expected)].item())
                     self.assertEqual(sampled[req, : counts[req]].tolist(), expected)
 
+    def test_long_ragged_batch_rejection_boundary_and_bonus(self):
+        widths = [0, 15, 16, 32]
+        boundaries = torch.tensor([0, *np.cumsum([w + 1 for w in widths])])
+        size = int(boundaries[-1])
+        drafts = torch.arange(size) % 47
+        logits = torch.full((size, 49), -10.0)
+        next_tokens = drafts.roll(-1)
+        logits[torch.arange(size), next_tokens] = 10.0
+        target = torch.full((size,), 48)  # Distinct supplied target samples.
+        for fail in (0, 15, 16, 31, 32):
+            scores = logits.clone()
+            start = int(boundaries[-2])
+            if fail < 32:
+                scores[start + fail, :] = -10.0
+                scores[start + fail, 47] = 10.0
+            sampled, counts = assemble(scores, drafts, target, boundaries, 32, AcceptancePolicy(top_k=1))
+            self.assertEqual(counts.tolist(), [1, 16, 17, fail + 1])
+            for i, width in enumerate([0, 15, 16, fail]):
+                begin = int(boundaries[i])
+                self.assertEqual(sampled[i, :width].tolist(), drafts[begin + 1 : begin + width + 1].tolist())
+                self.assertEqual(sampled[i, width], 48)
+                self.assertTrue((sampled[i, width + 1 :] == -1).all())
+            _, all_counts = assemble(scores, drafts, target, boundaries, 32, AcceptancePolicy("all"))
+            self.assertEqual(all_counts.tolist(), [1, 16, 17, 33])
+
 
 class TestFinalVerificationSampler(unittest.TestCase):
     def test_sampling_metadata_forwarded_and_draft_probabilities_ignored(self):

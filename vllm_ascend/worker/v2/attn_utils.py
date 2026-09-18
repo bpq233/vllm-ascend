@@ -45,6 +45,7 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
+from vllm_ascend.attention.spec_decode import MAX_DECODE_QUERY_LEN, uses_long_speculative_queries
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     get_sfa_qsfa_packed_head_dim,
@@ -312,6 +313,10 @@ def build_attn_state(
             # In Prefilling Decoding Disaggregation scenario, SpecDecoding
             # need to supports seq_len=1
             attn_state = AscendAttentionState.SpecDecoding
+    elif uses_long_speculative_queries(vllm_config) and np.any(num_scheduled_tokens > MAX_DECODE_QUERY_LEN):
+        # Cached causal extend: retain paged prefix KV and all query logits.
+        # A mixed batch keeps short rows first for the backend's phase split.
+        attn_state = AscendAttentionState.ChunkedPrefill
     # Speculative decoding.
     elif np.all(num_valid_tokens == 1):
         if vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp":

@@ -51,6 +51,7 @@ from vllm_ascend.ascend_forward_context import (
     set_mc2_mask,
     set_mc2_tokens_capacity,
 )
+from vllm_ascend.attention.spec_decode import MAX_DECODE_QUERY_LEN, uses_long_speculative_queries
 from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
     _start_profiling_chunk_timing,
@@ -240,6 +241,9 @@ class NPUModelRunner(GPUModelRunner):
             profiling_config,
             scheduler_output,
         )
+        trace_verification = hasattr(self.rejection_sampler, "begin_forward")
+        if trace_verification:
+            self.rejection_sampler.begin_forward(scheduler_output, dummy_run)
 
         if vllm_version_is("0.27.1"):
             output = super().execute_model(
@@ -259,6 +263,8 @@ class NPUModelRunner(GPUModelRunner):
                 context_len=context_len,
             )
 
+        if trace_verification:
+            self.rejection_sampler.end_forward()
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
             profiling_config,
             execution_start_time,
@@ -301,6 +307,8 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs = len(num_tokens_per_req)
 
             req_ids = sort_batch_req_ids(num_tokens_per_req, self.decode_query_len)
+            if uses_long_speculative_queries(self.vllm_config):
+                req_ids.sort(key=lambda req: num_tokens_per_req[req] > MAX_DECODE_QUERY_LEN)
 
             self._update_seq_lens_cpu(scheduler_output, req_ids)
 
@@ -518,6 +526,8 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_output.scheduled_spec_decode_tokens,
                 self.decode_query_len,
             )
+            if uses_long_speculative_queries(self.vllm_config):
+                req_ids.sort(key=lambda req: num_tokens_per_req[req] > MAX_DECODE_QUERY_LEN)
 
             self._update_seq_lens_cpu(scheduler_output, req_ids)
 
