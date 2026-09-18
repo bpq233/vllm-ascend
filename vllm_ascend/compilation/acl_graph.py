@@ -29,6 +29,9 @@ _STREAM_RESOURCE_ERROR_CODE = "207008"
 _STREAM_RESOURCE_ERROR_MARKERS = (
     "insufficient_stream_resources",
     "stream resources are insufficient",
+    "alloc stream resource failed",
+    "too many streams are created",
+    "too many streams are captured",
 )
 _OLD_HDK_CAPTURE_ERROR_MARKERS = ("alloc sq cq fail",)
 

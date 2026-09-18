@@ -170,6 +170,15 @@ def test_long_budget_validation(modules):
     cfg.cache_config = NS(cache_dtype="auto")
     options = {**settings(), "primary_num_speculative_tokens": 4}
     config.validate_multi_stage(cfg, options)
+    # Omitting primary width must not inherit the long final budget.
+    config.validate_multi_stage(cfg, settings())
+    assert config.primary_draft_width(settings(), 32) == 4
+    assert config.primary_draft_width(settings(), 8) == 8
+    assert config.primary_draft_width(options, 32) == 4
+    with pytest.raises(ValueError, match="primary_num_speculative_tokens=32"):
+        config.validate_multi_stage(cfg, {**settings(), "primary_num_speculative_tokens": 32})
+    with pytest.raises(ValueError, match="intermediate.num_speculative_tokens=32"):
+        config.validate_multi_stage(cfg, settings(num_speculative_tokens=32))
     for changes in ({"primary_num_speculative_tokens": 16}, {"intermediate": settings(num_rounds=0)["intermediate"]}):
         with pytest.raises(ValueError):
             config.validate_multi_stage(cfg, {**options, **changes})
@@ -184,3 +193,24 @@ def test_packed_decisions_match_individual_requests(modules):
     drafts = [[1, 2, 3], [], [5, 6]]
     packed = torch.cat([scores([1, 9, 3, 4]), scores([7]), scores([5, 6, 8])])
     assert pipeline._decide(packed, drafts, [4, 1, 3]) == [[1, 9], [0, 7], [2, 8]]
+
+
+def test_sparse_capture_sizes_cover_verifier_and_secondary(modules):
+    config, _ = modules
+    sizes = config.intermediate_capture_sizes(4096, 4, 15)
+    assert sizes == [1, 16, 64, 256, 1024, 4096]
+    # Reported NPU failure used max_model_len=40960 and 44 legacy gears.
+    assert config.intermediate_capture_sizes(40960, 4, 15) == [1, 16, 64, 256, 1024, 4096, 16384, 40960]
+    assert config.intermediate_capture_sizes(40960, 4, 15, [64, 256]) == [64, 256, 40960]
+    assert config.intermediate_capture_sizes(4096, 4, 15, [256, 64, 256]) == [64, 256, 4096]
+    for requests in range(1, 5):
+        assert any(requests * 16 <= size <= 4 * 16 and size % 16 == 0 for size in sizes)
+    with pytest.raises(ValueError, match="token buffer"):
+        config.intermediate_capture_sizes(4096, 4, 15, [8192])
+
+
+@pytest.mark.parametrize("sizes", [[], [0], [-1], [True], [2.5], "64"])
+def test_invalid_intermediate_capture_sizes(modules, sizes):
+    config, _ = modules
+    with pytest.raises(ValueError, match="cudagraph_capture_sizes"):
+        config.IntermediateConfig.from_dict(settings(cudagraph_capture_sizes=sizes)["intermediate"])

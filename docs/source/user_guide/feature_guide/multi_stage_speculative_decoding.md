@@ -30,7 +30,7 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /models/Qwen-8B \
 
 将示例路径替换为兼容的实际模型。中间 verifier 与 Target 必须具有相同词表和 token ID，中间 DFlash 必须与中间 verifier 匹配。
 
-- `primary_num_speculative_tokens`：原 DFlash 的生成长度。保留原配置的长度即可；省略时等于最终候选容量。
+- `primary_num_speculative_tokens`：原 DFlash 的单轮生成长度。省略时，最终容量 ≤15 则沿用最终容量，最终容量 >15 则默认 4。显式设置超过 15 不会被自动截断，会提示具体字段和值。
 - 原 `speculative_config.num_speculative_tokens`：最终候选容量，供原 scheduler、Target KV 和缓冲区预分配使用。中间候选最多占用这一容量，实际长度单独返回 scheduler。
 - `intermediate.num_rounds`：中间校验次数。3 表示“校验原 draft → 中间 draft → 校验 → 中间 draft → 校验”，不会把最后一批未经中间校验的 draft 追加进候选。
 - `intermediate.num_speculative_tokens`：每次中间 DFlash 的生成长度。
@@ -71,6 +71,10 @@ logits 仍通过原 `combine_sampled_and_draft_tokens` / `logits_indices` 选取
 支持文本、full-attention、未量化的中间 verifier，复用 TP；不支持中间流水线的 PP/DP/CP、LoRA、异步调度或 adaptive verification。启用图时，Target 和中间 verifier 使用分段图，Primary/Secondary DFlash 使用独立完整 query 图。中间 verifier 在模型加载后预捕获小 token 桶和覆盖完整 context 的几何桶；稳定输入缓冲区填入实际 query，padding 槽置为 -1，实际 KV 长度保持不变。中间图参数、更新流及 RoPE 与主模型隔离；缺少匹配图会报错，不静默回退 eager。显式 enforce_eager/NONE 用于关闭图作对照。图捕获与中间 KV 在加载期计入内存预算，中间激活也参与 profile。按缓存容量分组完成多轮，避免轮间反复淘汰；microbatch token 预算按实际新增 query 计算。尚未提供真机吞吐收益数据。
 
 这里的四模型图执行不代表整个 Python 调度循环是单张完整图：两个 verifier 的动态 attention 仍在分段图边界外执行，候选列表、接受决策回传和调度控制也在图外。中间图首次捕获会增加加载时间和常驻内存。
+
+遇到 `EE1023 / Alloc Stream resource failed / Too many streams are created` 时，需要降低总捕获桶数量，而不是增加候选 token 限额。中间层默认采用稀疏桶（例如 token buffer 为 4096、4 请求、DFlash 宽度 15 时为 `[1,16,64,256,1024,4096]`），不再捕获完整的 `1..32` 小桶。可在 `intermediate` 中设置 `"cudagraph_capture_sizes": [64,256]`；实现会补齐最大中间 token buffer 和 Secondary 最大批次桶，确保全部输入长度仍有图覆盖。更少桶会增加 padding 计算量，需要真机测量权衡。主模型的 `compilation_config.cudagraph_capture_sizes` 单独控制 Target/Primary，不能替代此中间层选项。捕获资源耗尽后应退出并重新启动该任务，不能在已报异步错误的进程内继续捕获。不要同时开启 `ASCEND_LAUNCH_BLOCKING=1` 与 ACL 图。
+
+资源诊断依据：KG `runtime_docs_zh_faq_ee1023资源不足问题_too_many_streams_are_captured_to_the_acl_graph`，`source_file=cann-runtime/runtime/docs/zh/FAQ/EE1023资源不足问题.md`，score `0.943825`。该文档要求检查 stream 创建/销毁、设备上其他进程和共享资源占用；减少捕获桶是针对本实现的修正，不保证覆盖所有 EE1023 原因。
 
 数据传输：正式历史在 CPU 按请求 ID 缓存，稳定 decode 每轮只将长度、Primary 草稿及最多 final_capacity+1 个尾部 token 合并为一次 D2H；首次请求、长度缩短或大步 prefill 才读取完整历史。中间输入 IDs、位置、页槽、长度和 query 边界合并为一次 pinned H2D，设备上生成派生 metadata；最终候选也使用 pinned H2D。接受决策保持每个 microbatch 一次小结果 D2H，仍需同步以驱动 CPU 迭代控制，尚不是全设备端流水线。
 

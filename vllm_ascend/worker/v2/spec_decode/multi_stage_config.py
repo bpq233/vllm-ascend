@@ -5,6 +5,31 @@ from dataclasses import dataclass, field
 MAX_DFLASH_DRAFT_TOKENS = 15
 
 
+def intermediate_capture_sizes(max_tokens, max_reqs, draft_width, requested=None):
+    """Sparse gears: four resident models share the device's stream budget."""
+    if requested is not None:
+        if any(size > max_tokens for size in requested):
+            raise ValueError("intermediate.cudagraph_capture_sizes must fit the intermediate token buffer.")
+        sizes = set(requested)
+    else:
+        sizes = {1}
+        size = 16
+        while size < max_tokens:
+            sizes.add(size)
+            size *= 4
+    # Cover the largest secondary batch even if the verifier gears are sparse.
+    # Smaller DFlash batches pad to a captured request count.
+    sizes.update((max_reqs * (draft_width + 1), max_tokens))
+    return sorted(sizes)
+
+
+def primary_draft_width(options, final_capacity):
+    # A long final budget accumulates multiple short drafts. Do not silently
+    # turn that budget into an unsupported single DFlash query.
+    default = 4 if final_capacity > MAX_DFLASH_DRAFT_TOKENS else final_capacity
+    return options.get("primary_num_speculative_tokens", default)
+
+
 def configure_long_target_graphs(vllm_config):
     """Enable attention splitting before compilation and graph sizing.
 
@@ -45,6 +70,7 @@ class IntermediateConfig:
     num_speculative_tokens: int = 4
     max_num_seqs: int = 4
     max_model_len: int | None = None
+    cudagraph_capture_sizes: list[int] | None = None
     verification: dict = field(default_factory=lambda: {"method": "topk", "top_k": 5})
 
     @classmethod
@@ -55,6 +81,11 @@ class IntermediateConfig:
         result = cls(verifier_model=verifier["model"], drafter_model=drafter["model"], **values)
         if not result.verifier_model or not result.drafter_model:
             raise ValueError("Both intermediate model paths are required.")
+        sizes = result.cudagraph_capture_sizes
+        if sizes is not None and (
+            not isinstance(sizes, list) or not sizes or any(type(size) is not int or size <= 0 for size in sizes)
+        ):
+            raise ValueError("intermediate.cudagraph_capture_sizes must be a nonempty list of positive integers.")
         for name in ("num_rounds", "num_speculative_tokens", "max_num_seqs", "max_model_len"):
             value = getattr(result, name)
             minimum = 0 if name == "num_rounds" else 1
@@ -89,12 +120,17 @@ def validate_multi_stage(vllm_config, config):
         return
     intermediate = IntermediateConfig.from_dict(config["intermediate"])
     AcceptancePolicy(**intermediate.verification)
-    width = config.get("primary_num_speculative_tokens", spec.num_speculative_tokens)
+    width = primary_draft_width(config, spec.num_speculative_tokens)
     if type(width) is not int or not 0 < width <= spec.num_speculative_tokens:
         raise ValueError("primary_num_speculative_tokens must be within the final speculative budget.")
     if long_candidates:
         if width > MAX_DFLASH_DRAFT_TOKENS or intermediate.num_speculative_tokens > MAX_DFLASH_DRAFT_TOKENS:
-            raise ValueError("Keep primary and secondary DFlash widths <= 15; only the final budget may be larger.")
+            raise ValueError(
+                f"DFlash per-round widths must be <= 15: primary_num_speculative_tokens={width}, "
+                f"intermediate.num_speculative_tokens={intermediate.num_speculative_tokens}; "
+                f"final speculative_config.num_speculative_tokens={spec.num_speculative_tokens} is allowed. "
+                "Set both draft widths to 4 and increase intermediate.num_rounds to accumulate long candidates."
+            )
         if getattr(vllm_config.model_config, "use_mla", False) or getattr(vllm_config.model_config, "is_hybrid", False):
             raise ValueError("Long candidate verification currently requires a full-attention target.")
         if vllm_config.cache_config.cache_dtype not in ("auto", "float16", "bfloat16"):

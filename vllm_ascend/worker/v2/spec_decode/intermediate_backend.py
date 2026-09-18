@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 """Worker-local verifier and DFlash with independent, persistent paged KV."""
 
+import logging
 from contextlib import contextmanager
 from copy import copy, deepcopy
 from math import ceil
@@ -32,6 +33,9 @@ from vllm_ascend.worker.v2.spec_decode.intermediate_graph import (
     capture_secondary_graphs,
     init_secondary_graphs,
 )
+from vllm_ascend.worker.v2.spec_decode.multi_stage_config import intermediate_capture_sizes, primary_draft_width
+
+logger = logging.getLogger(__name__)
 
 
 class IntermediateBackend:
@@ -141,17 +145,15 @@ class IntermediateBackend:
         if self.graph_enabled:
             from vllm_ascend.platform import _setup_compile_backend
 
-            # Warm every token bucket through the maximum intermediate input,
-            # including first-use context, without inheriting target sizes or
-            # compiled layer state. Geometric large buckets bound graph count.
-            sizes = list(range(1, min(32, self.max_num_tokens) + 1))
-            sizes.extend(n * (self.config.num_speculative_tokens + 1) for n in range(1, self.max_num_reqs + 1))
-            size = 64
-            while size < self.max_num_tokens:
-                sizes.append(size)
-                size *= 2
-            sizes.append(self.max_num_tokens)
-            cfg.compilation_config.cudagraph_capture_sizes = sorted(set(sizes))
+            # Every bucket captures pieces in every verifier layer and holds
+            # runtime/TP stream resources. Dense 1..32 gears are too costly
+            # with four resident models; use sparse padding-compatible gears.
+            cfg.compilation_config.cudagraph_capture_sizes = intermediate_capture_sizes(
+                self.max_num_tokens,
+                self.max_num_reqs,
+                self.config.num_speculative_tokens,
+                self.config.cudagraph_capture_sizes,
+            )
             cfg.compilation_config.max_cudagraph_capture_size = self.max_num_tokens
             _setup_compile_backend(cfg, self.parent_config.compilation_config.oot_compiler)
         with self._context():
@@ -174,6 +176,21 @@ class IntermediateBackend:
             CUDAGraphMode.PIECEWISE,
             1,
             self,
+        )
+        logger.info(
+            "multi_stage_graph_plan verifier=%s verifier_mode=PIECEWISE verifier_sizes=%s "
+            "secondary_mode=FULL_DECODE_ONLY secondary_sizes=%s max_model_len=%d max_num_tokens=%d",
+            self.config.verifier_model,
+            self.cudagraph_manager.capture_sizes,
+            sorted(
+                {
+                    desc.num_tokens
+                    for descs in self.drafter.query_cudagraph_manager._capture_descs.values()
+                    for desc in descs
+                }
+            ),
+            self.max_model_len,
+            self.max_num_tokens,
         )
         self.cudagraph_manager.capture(
             self.model,
@@ -497,8 +514,9 @@ class IntermediateBackend:
         self.propose(rows)
         width = max(
             self.config.num_speculative_tokens,
-            self.parent_config.additional_config["multi_stage_speculative"].get(
-                "primary_num_speculative_tokens", self.parent_config.speculative_config.num_speculative_tokens
+            primary_draft_width(
+                self.parent_config.additional_config["multi_stage_speculative"],
+                self.parent_config.speculative_config.num_speculative_tokens,
             ),
         )
         width = min(width, self.max_model_len - 1)

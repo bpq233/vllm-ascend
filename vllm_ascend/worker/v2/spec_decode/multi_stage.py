@@ -9,7 +9,7 @@ from vllm.v1.outputs import DraftTokenIds
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import AscendDFlashSpeculator
 from vllm_ascend.worker.v2.spec_decode.intermediate import IntermediatePipeline
 from vllm_ascend.worker.v2.spec_decode.intermediate_backend import IntermediateBackend
-from vllm_ascend.worker.v2.spec_decode.multi_stage_config import IntermediateConfig
+from vllm_ascend.worker.v2.spec_decode.multi_stage_config import IntermediateConfig, primary_draft_width
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +22,7 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
         self.final_capacity = vllm_config.speculative_config.num_speculative_tokens
         primary_config = copy(vllm_config)
         primary_config.speculative_config = copy(vllm_config.speculative_config)
-        primary_config.speculative_config.num_speculative_tokens = options.get(
-            "primary_num_speculative_tokens", self.final_capacity
-        )
+        primary_config.speculative_config.num_speculative_tokens = primary_draft_width(options, self.final_capacity)
         super().__init__(primary_config, device)
         self.intermediate_config = IntermediateConfig.from_dict(options["intermediate"])
         self.candidates = []
