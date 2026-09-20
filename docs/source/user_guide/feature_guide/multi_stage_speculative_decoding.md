@@ -2,6 +2,8 @@
 
 原 DFlash 先生成 token，中间 verifier 校验这些 token，再由中间 DFlash 继续生成；最终候选通过原 MRV2 draft 缓冲区交给 Target。原 DFlash 实现和 Target 的提交、拒绝回退流程保持不变。
 
+实现统一放在 `vllm_ascend/worker/v2/spec_decode/multi_stage/`：`adapter.py` 接入原 DFlash，`config.py` 管理配置，`pipeline.py` 控制迭代，`backend.py` 包含中间模型、KV/hidden 缓存及图状态，`acceptance.py` 与 `final_verification.py` 管理接受策略和最终验证。包入口保持轻量，配置校验时不会提前加载模型模块。原来的独立 cache/graph 辅助文件已合并，不保留重复实现；部署更新需要同步新目录和引用路径修改。
+
 ## 配置
 
 启用 MRV2（`VLLM_USE_V2_MODEL_RUNNER=1`），使用同步调度（`--no-async-scheduling`）。例如：
@@ -77,6 +79,12 @@ logits 仍通过原 `combine_sampled_and_draft_tokens` / `logits_indices` 选取
 资源诊断依据：KG `runtime_docs_zh_faq_ee1023资源不足问题_too_many_streams_are_captured_to_the_acl_graph`，`source_file=cann-runtime/runtime/docs/zh/FAQ/EE1023资源不足问题.md`，score `0.943825`。该文档要求检查 stream 创建/销毁、设备上其他进程和共享资源占用；减少捕获桶是针对本实现的修正，不保证覆盖所有 EE1023 原因。
 
 数据传输：正式历史在 CPU 按请求 ID 缓存，稳定 decode 每轮只将长度、Primary 草稿及最多 final_capacity+1 个尾部 token 合并为一次 D2H；首次请求、长度缩短或大步 prefill 才读取完整历史。中间输入 IDs、位置、页槽、长度和 query 边界合并为一次 pinned H2D，设备上生成派生 metadata；最终候选也使用 pinned H2D。接受决策保持每个 microbatch 一次小结果 D2H，仍需同步以驱动 CPU 迭代控制，尚不是全设备端流水线。
+
+稳态热路径优化：CPU 正式历史和 KV token 记录只追加新增 token；KV 前缀按 1024-token 块比较，仅在分歧块逐 token 定位。中间验证全部 hidden 行都用于预测时直接计算 logits，省去索引 H2D 和 hidden gather；Secondary 使用常驻 anchor、计数、温度和 seed 缓冲区。中间接受判断缓存最多 16 种小形状 metadata，直接利用 top-k 返回值检查有效性，避免再次 gather 词表 logits；最终全接受路径跳过接受 mask 和首拒绝位置归约。先执行仍驻留缓存的请求，再将结果还原为原批次顺序，降低跨 Target 步的缓存淘汰。
+
+稀疏图桶存在性能代价：只有 `[64,256,40960]` 时，4-token query 会补到 64，257-token query 原本会补到 40960。现在当 padding 超过实际 query 的 8 倍、且存在待计算的冷前缀和较小图桶时，先用已有小图分块补齐前缀，再批量验证预测行，不增加捕获桶。该保护以更多小图调用换取更少 padding，并非所有场景的实测最优值。debug 日志的 `executed_tokens`（包含 padding）与 `padding_tokens` 可与 `forward_tokens` 对比。
+
+Verifier 仅保存预测短后缀的、已投影的 context hidden，复制到独立存储以防下一次图重放覆盖；不保存整段 prompt 激活。Secondary 所需的末尾行仍在缓存、且对应 KV 前缀完全一致时，直接复用该行，跳过额外 Verifier forward 和重复辅助层投影；缓存缺失、前缀变化或槽位回收时沿用正常模型计算。后端的 `reused_hidden_tokens` 记录跳过的 predictor 行数，NPU 集成测试检查其增长。以上优化保持现有接受策略；真实 NPU 精度、吞吐和图资源占用仍须验证。
 
 每个中间小批次保持 packed logits，只进行一次 Top-k 和一次决策 D2H；slot mapping 按整个小批次向量化。模型依赖链上的 verifier → drafter 必须顺序执行，各阶段内部按 batch 计算。首版不跨轮复用中间 KV，因此实际收益需要结合上下文长度和接受率测量。
 

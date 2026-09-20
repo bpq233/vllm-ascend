@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import torch
 
-SOURCE = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode"
+SOURCE = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode/multi_stage"
 
 
 def load_module(name, filename):
@@ -52,6 +52,30 @@ class TestAcceptancePolicy(unittest.TestCase):
         self.assertEqual(sampled.tolist(), [[1, 4, -1, -1], [2, 3, 1, -1], [4, -1, -1, -1]])
         self.assertEqual(lengths.tolist(), [2, 3, 1])
         self.assertEqual(lengths.dtype, torch.int32)
+
+    def test_all_skips_acceptance_with_nonfinite_logits_and_ragged_bonus(self):
+        # Empty, two-token and one-token drafts share the same padded output.
+        # All-policy must ignore even nonfinite logits and retain the supplied
+        # sampled bonus rather than accidentally reading the next request.
+        logits = torch.tensor([[float("nan"), -torch.inf, torch.inf]]).expand(6, -1)
+        drafts = torch.tensor([0, 0, 1, 2, 0, 2], dtype=torch.int32)
+        targets = torch.tensor([2, 1, 0, 1, 0, 1], dtype=torch.int32)
+        with patch.object(AcceptancePolicy, "accept", side_effect=AssertionError("unnecessary acceptance")):
+            sampled, counts = assemble(
+                logits, drafts, targets, torch.tensor([0, 1, 4, 6]), 3, AcceptancePolicy("all")
+            )
+        self.assertEqual(sampled.tolist(), [[2, -1, -1, -1], [1, 2, 1, -1], [2, 1, -1, -1]])
+        self.assertEqual(counts.tolist(), [1, 3, 2])
+        self.assertEqual(sampled.dtype, torch.int64)
+        self.assertEqual(counts.dtype, torch.int32)
+
+    def test_all_zero_capacity_returns_each_target_bonus(self):
+        sampled, counts = assemble(
+            torch.zeros(2, 4), torch.tensor([1, 3]), torch.tensor([2, 0]),
+            torch.tensor([0, 1, 2]), 0, AcceptancePolicy("all")
+        )
+        self.assertEqual(sampled.tolist(), [[2], [0]])
+        self.assertEqual(counts.tolist(), [1, 1])
 
     def test_batched_prefix_matches_sequential_reference(self):
         rng = torch.Generator().manual_seed(71)
@@ -117,7 +141,7 @@ class TestFinalVerificationSampler(unittest.TestCase):
             {
                 parent.__name__: parent,
                 utils.__name__: utils,
-                "vllm_ascend.worker.v2.spec_decode.acceptance": acceptance,
+                "vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance": acceptance,
             },
         ):
             module = load_module("_test_final_verification", "final_verification.py")

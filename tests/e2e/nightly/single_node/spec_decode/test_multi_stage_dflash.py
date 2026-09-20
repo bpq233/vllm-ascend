@@ -47,6 +47,7 @@ def _target_graph_probe(worker, install=False):
         "calls": worker._long_target_pw_calls,
         "forward_tokens": backend.forward_tokens,
         "reused_tokens": backend.reused_tokens,
+        "reused_hidden_tokens": backend.reused_hidden_tokens,
         "intermediate_calls": backend.graph_replays,
         "intermediate_sizes": [
             desc.num_tokens for desc in backend.cudagraph_manager._capture_descs.get(CUDAGraphMode.PIECEWISE, [])
@@ -162,5 +163,6 @@ def test_multi_stage_dflash(method, long_candidates, graph, monkeypatch):
             assert all(row["primary_calls"] > 0 and row["secondary_calls"] > 0 for row in after)
             assert all(end["intermediate_calls"] > begin["intermediate_calls"] for begin, end in zip(before, after))
             assert all(end["reused_tokens"] > begin["reused_tokens"] for begin, end in zip(before, after))
+            assert all(end["reused_hidden_tokens"] > begin["reused_hidden_tokens"] for begin, end in zip(before, after))
             # Changed request shapes and slot reuse replay warmed graphs.
             assert [row["captures"] for row in before] == [row["captures"] for row in after]

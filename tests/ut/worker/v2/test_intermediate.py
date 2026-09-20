@@ -11,7 +11,7 @@ import torch
 
 @pytest.fixture
 def modules(monkeypatch):
-    root = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode"
+    root = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode/multi_stage"
 
     def load(name, filename):
         spec = importlib.util.spec_from_file_location(name, root / filename)
@@ -20,9 +20,9 @@ def modules(monkeypatch):
         spec.loader.exec_module(module)
         return module
 
-    load("vllm_ascend.worker.v2.spec_decode.acceptance", "acceptance.py")
-    config = load("_intermediate_test_config", "multi_stage_config.py")
-    pipeline = load("_intermediate_test_pipeline", "intermediate.py")
+    load("vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance", "acceptance.py")
+    config = load("_intermediate_test_config", "config.py")
+    pipeline = load("_intermediate_test_pipeline", "pipeline.py")
     return config, pipeline.IntermediatePipeline
 
 
@@ -89,6 +89,21 @@ def test_empty_active_batch_does_not_run_backend(modules):
     backend = Backend([])
     assert Pipeline(backend, config.IntermediateConfig("v", "d"), 4).refine([[1]], [[2]], [0]) == [[]]
     assert backend.calls == []
+
+
+def test_resident_requests_run_first_and_results_restore_original_order(modules):
+    config, Pipeline = modules
+    backend = NS(max_num_reqs=1, cache=NS(slots={"b": 0}))
+    pipe = Pipeline(backend, config.IntermediateConfig("v", "d"), 4)
+    calls = []
+
+    def refine(prefixes, drafts, limits, req_ids):
+        calls.extend(req_ids)
+        return drafts
+
+    pipe._refine = refine
+    assert pipe.refine([[1], [2], [3]], [[4], [5], [6]], [4, 4, 4], ["a", "b", "c"]) == [[4], [5], [6]]
+    assert calls == ["b", "a", "c"]
 
 
 def vllm_config():
@@ -214,3 +229,50 @@ def test_invalid_intermediate_capture_sizes(modules, sizes):
     config, _ = modules
     with pytest.raises(ValueError, match="cudagraph_capture_sizes"):
         config.IntermediateConfig.from_dict(settings(cudagraph_capture_sizes=sizes)["intermediate"])
+
+
+@pytest.mark.parametrize("top_k", [1, 2, 7, 40])
+def test_decisions_preserve_ties_and_nonfinite_policy(modules, top_k):
+    config, Pipeline = modules
+    pipe = Pipeline(None, config.IntermediateConfig("v", "d", verification={"top_k": top_k}), 32)
+    drafts = [[1, 2, 3], [], [0, 6]]
+    lengths = [4, 1, 3]
+    for seed in range(8):
+        generator = torch.Generator().manual_seed(seed)
+        logits = torch.randint(-2, 3, (8, 8), generator=generator).float()
+        logits[0, 1] = float("inf")
+        logits[2, 3] = float("-inf")
+        logits[5, 0] = float("nan")
+        expected = []
+        offset = 0
+        for draft, size in zip(drafts, lengths):
+            flags = pipe.policy.accept(logits[offset : offset + size], torch.tensor([*draft, 0]))
+            stop = next((i for i in range(len(draft)) if not flags[i]), len(draft))
+            expected.append([stop, logits[offset + stop].argmax().item()])
+            offset += size
+        assert pipe._decide(logits, drafts, lengths) == expected
+
+
+def test_shape_metadata_reused_and_bounded(modules):
+    config, Pipeline = modules
+    pipe = Pipeline(None, config.IntermediateConfig("v", "d"), 32)
+    logits = scores([1, 2, 3])
+    first = pipe._decision_shape(logits, [3])
+    second = pipe._decision_shape(logits, [3])
+    assert all(a is b for a, b in zip(first, second))
+    for length in range(1, 24):
+        pipe._decision_shape(torch.zeros(length, 32), [length])
+    assert len(pipe._decision_shapes) == 16
+
+
+def test_proposal_context_is_reused_without_mutating_retained_history(modules):
+    _, Pipeline = modules
+    backend = Backend([[[1, 7, 8]], [[3, 4, 5]], [[9, 10]]], proposals=[[[3, 4]], [[9]]])
+    pipe = Pipeline(backend, NS(num_rounds=3, verification={"method": "topk", "top_k": 1}), 8)
+    prefixes = [[20] * 8192]
+    original = prefixes[0].copy()
+    assert pipe.refine(prefixes, [[1, 2]], [8]) == [[1, 7, 3, 4, 5, 9, 10]]
+    assert prefixes == [original]
+    assert backend.calls[1][1][0] is backend.calls[2][1][0]
+    assert backend.calls[3][1][0] is backend.calls[4][1][0]
+    assert backend.calls[1][1][0] == original + [1, 7]

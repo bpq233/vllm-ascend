@@ -170,7 +170,7 @@ def test_both_graph_manager_versions_capture_long_target_piecewise():
 @pytest.mark.parametrize("width,eager", [(32, False), (32, True), (4, False)])
 @pytest.mark.parametrize("splits", [None, [], ["custom::op"]])
 def test_graph_config_prepares_compilation_and_keeps_draft_full_mode(mode, width, eager, splits):
-    tree = ast.parse((ROOT / "worker/v2/spec_decode/multi_stage_config.py").read_text(encoding="utf-8"))
+    tree = ast.parse((ROOT / "worker/v2/spec_decode/multi_stage/config.py").read_text(encoding="utf-8"))
     fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "configure_long_target_graphs")
     fn.body = [n for n in fn.body if not isinstance(n, ast.ImportFrom)]
     ns = dict(CUDAGraphMode=GraphMode, CompilationMode=NS(VLLM_COMPILE="compile"), **vars(routing))

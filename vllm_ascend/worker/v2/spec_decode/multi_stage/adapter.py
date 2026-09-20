@@ -7,9 +7,9 @@ import torch
 from vllm.v1.outputs import DraftTokenIds
 
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import AscendDFlashSpeculator
-from vllm_ascend.worker.v2.spec_decode.intermediate import IntermediatePipeline
-from vllm_ascend.worker.v2.spec_decode.intermediate_backend import IntermediateBackend
-from vllm_ascend.worker.v2.spec_decode.multi_stage_config import IntermediateConfig, primary_draft_width
+from vllm_ascend.worker.v2.spec_decode.multi_stage.backend import IntermediateBackend
+from vllm_ascend.worker.v2.spec_decode.multi_stage.config import IntermediateConfig, primary_draft_width
+from vllm_ascend.worker.v2.spec_decode.multi_stage.pipeline import IntermediatePipeline
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,12 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
             if previous is None or delta < 0 or delta > width:
                 prefix = source[int(index), :length].cpu().tolist()
             else:
-                prefix = previous + (row[-delta:] if delta else [])
+                # The synchronous pipeline never mutates committed prefixes.
+                # Append the delta instead of copying the entire host history
+                # again on every decode step (especially costly at 40K+).
+                if delta:
+                    previous.extend(row[-delta:])
+                prefix = previous
             histories[req_id] = prefix
             lengths.append(length)
             prefixes.append(prefix)

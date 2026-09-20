@@ -102,7 +102,7 @@ def validate_multi_stage(vllm_config, config):
         return
     if set(config) - {"primary_num_speculative_tokens", "intermediate", "final_verification"}:
         raise ValueError("Unknown multi_stage_speculative option.")
-    from vllm_ascend.worker.v2.spec_decode.acceptance import AcceptancePolicy
+    from vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance import AcceptancePolicy
 
     if "final_verification" in config:
         AcceptancePolicy(**config["final_verification"])

@@ -8,7 +8,7 @@ import torch
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
 from vllm_ascend.utils import vllm_version_is
-from vllm_ascend.worker.v2.spec_decode.acceptance import AcceptancePolicy, assemble_verified_tokens
+from vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance import AcceptancePolicy, assemble_verified_tokens
 
 logger = logging.getLogger(__name__)
 

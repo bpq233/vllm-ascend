@@ -13,9 +13,14 @@ import pytest
 
 @pytest.fixture
 def graph_helpers():
-    path = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode/intermediate_graph.py"
+    path = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode/multi_stage/backend.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    tree.body = [n for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))]
+    tree.body = [
+        n
+        for n in tree.body
+        if isinstance(n, (ast.ClassDef, ast.FunctionDef))
+        and n.name in ("IntermediateGraphState", "init_secondary_graphs", "capture_secondary_graphs")
+    ]
     params = NS(_graph_params=object(), _draft_graph_params=object(), _draft_graph_prefill_params=object())
     stream = Mock(return_value=object())
     namespace = dict(

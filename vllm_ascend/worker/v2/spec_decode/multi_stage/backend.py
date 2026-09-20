@@ -3,6 +3,7 @@
 """Worker-local verifier and DFlash with independent, persistent paged KV."""
 
 import logging
+from collections import OrderedDict
 from contextlib import contextmanager
 from copy import copy, deepcopy
 from math import ceil
@@ -20,6 +21,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import set_eagle3_aux_hidden_state_layers
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.compilation import acl_graph
 from vllm_ascend.ops import rotary_embedding as rope
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
@@ -27,15 +29,140 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_metadata, get_kv_cache_s
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_states import init_asecnd_model_state
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import AscendDFlashSpeculator
-from vllm_ascend.worker.v2.spec_decode.intermediate_cache import IntermediateKVCache
-from vllm_ascend.worker.v2.spec_decode.intermediate_graph import (
-    IntermediateGraphState,
-    capture_secondary_graphs,
-    init_secondary_graphs,
-)
-from vllm_ascend.worker.v2.spec_decode.multi_stage_config import intermediate_capture_sizes, primary_draft_width
+from vllm_ascend.worker.v2.spec_decode.multi_stage.config import intermediate_capture_sizes, primary_draft_width
 
 logger = logging.getLogger(__name__)
+
+
+class IntermediateKVCache:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.slots = OrderedDict()
+        self.tokens = [[] for _ in range(capacity)]
+
+    def retain(self, live_request_ids):
+        live = set(live_request_ids)
+        for req_id in list(self.slots):
+            if req_id not in live:
+                self.tokens[self.slots.pop(req_id)] = []
+
+    def query_start(self, req_id, sequence, required):
+        if req_id not in self.slots:
+            return 0
+        cached = self.tokens[self.slots[req_id]]
+        common = min(len(cached), required)
+        # Most of a long prefix is unchanged. Compare bounded slices in C
+        # rather than dispatching a Python iteration for every cached token.
+        # Only the first divergent block needs a token-level scan.
+        for start in range(0, common, 1024):
+            end = min(start + 1024, common)
+            if cached[start:end] != sequence[start:end]:
+                for i in range(start, end):
+                    if cached[i] != sequence[i]:
+                        return i
+        return common
+
+    def plan(self, req_ids, sequences, required_starts):
+        """Reserve disjoint slots and invalidate a divergent/unneeded tail.
+
+        required_starts retains the predictor row needed for logits or the
+        drafter's anchor. No caller may read a cached hidden state: that row
+        is recomputed, while all preceding KV is reused.
+        """
+        if (
+            len(set(req_ids)) != len(req_ids)
+            or len(req_ids) > self.capacity
+            or len(sequences) != len(req_ids)
+            or len(required_starts) != len(req_ids)
+        ):
+            raise ValueError("Intermediate cache needs distinct request IDs within its capacity.")
+        protected = set(req_ids)
+        slots, starts = [], []
+        for req_id, sequence, required in zip(req_ids, sequences, required_starts):
+            if not sequence or not 0 <= required < len(sequence):
+                raise ValueError("A nonempty query and a valid predictor position are required.")
+            if req_id not in self.slots:
+                free = set(range(self.capacity)) - set(self.slots.values())
+                if free:
+                    slot = min(free)
+                else:
+                    victim = next(key for key in self.slots if key not in protected)
+                    slot = self.slots.pop(victim)
+                self.tokens[slot] = []
+                self.slots[req_id] = slot
+            slot = self.slots[req_id]
+            self.slots.move_to_end(req_id)
+            cached = self.tokens[slot]
+            common = self.query_start(req_id, sequence, required)
+            # Token equality also handles final-target rejection, preemption,
+            # and request-ID reuse without trusting speculative lengths.
+            del cached[common:]
+            slots.append(slot)
+            starts.append(common)
+        return slots, starts
+
+    def commit(self, slots, sequences):
+        # Called only after BOTH verifier KV and DFlash context KV are written.
+        for slot, sequence in zip(slots, sequences):
+            # plan() already retained exactly the equal, valid prefix. Only
+            # append newly computed IDs instead of copying a long prefix again.
+            cached = self.tokens[slot]
+            cached.extend(sequence[len(cached) :])
+
+
+class IntermediateGraphState:
+    """Own graph parameter buckets without replacing the main runner's buckets.
+
+    ACL attention stores capture handles in module globals. The intermediate
+    verifier and secondary draft have independent weights and KV, so sharing
+    those handles with the target/primary draft would update the wrong graphs.
+    Like the worker's forward context, this scope is used on its execution
+    thread. Reentrant entry must retain any buckets initialized by the caller.
+    """
+
+    _names = ("_graph_params", "_draft_graph_params", "_draft_graph_prefill_params")
+
+    def __init__(self):
+        self._params = dict.fromkeys(self._names)
+        self._depth = 0
+
+    @contextmanager
+    def context(self):
+        if self._depth:
+            self._depth += 1
+            try:
+                yield
+            finally:
+                self._depth -= 1
+            return
+        saved = {name: getattr(acl_graph, name) for name in self._names}
+        for name, value in self._params.items():
+            setattr(acl_graph, name, value)
+        self._depth = 1
+        try:
+            yield
+        finally:
+            self._params = {name: getattr(acl_graph, name) for name in self._names}
+            for name, value in saved.items():
+                setattr(acl_graph, name, value)
+            self._depth = 0
+
+
+def init_secondary_graphs(drafter, mode, device):
+    """Initialize after set_attn, inside the intermediate graph-state scope."""
+    enabled = mode != CUDAGraphMode.NONE
+    drafter.update_stream = torch.npu.Stream(device=device) if enabled else None
+    # DFlash's parallel query is uniform, including when verifier queries are
+    # ragged. Request its full decode graph separately from verifier piecewise.
+    drafter.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY if enabled else CUDAGraphMode.NONE)
+    if enabled and not drafter.query_cudagraph_manager.needs_capture():
+        raise ValueError("Secondary DFlash requires full graph attention support and nonempty capture sizes.")
+
+
+def capture_secondary_graphs(drafter):
+    """Capture only after both models' KV tensors have been initialized."""
+    if drafter.query_cudagraph_manager.needs_capture():
+        drafter.capture()
 
 
 class IntermediateBackend:
@@ -53,7 +180,10 @@ class IntermediateBackend:
         self.max_num_reqs = config.max_num_seqs
         self.cache = IntermediateKVCache(self.max_num_reqs)
         self.forward_tokens = 0
+        self.executed_tokens = 0
         self.reused_tokens = 0
+        self.reused_hidden_tokens = 0
+        self._context_rows = [None] * self.max_num_reqs
         self.max_model_len = config.max_model_len or parent_config.model_config.max_model_len
         # Full prefixes may exceed the main runner's chunked-prefill budget.
         self.max_num_tokens = min(
@@ -264,6 +394,16 @@ class IntermediateBackend:
             kernel_sizes,
             cfg,
         )
+        self._init_proposal_scratch()
+
+    def _init_proposal_scratch(self):
+        # Stable device addresses also avoid tiny allocations/kernels on every
+        # intermediate round. Only anchors vary; the other inputs are constants.
+        self._proposal_anchors = torch.zeros(self.max_num_reqs, device=self.device, dtype=torch.int64)
+        self._proposal_ones = torch.ones(self.max_num_reqs, device=self.device, dtype=torch.int32)
+        self._proposal_zeros = torch.zeros(self.max_num_reqs, device=self.device, dtype=torch.int32)
+        self._proposal_temperature = torch.zeros(self.max_num_reqs, device=self.device)
+        self._proposal_seeds = torch.zeros(self.max_num_reqs, device=self.device, dtype=torch.int64)
 
     def _batches(self, sequences, req_ids=None, required_starts=None):
         start, num_tokens = 0, 0
@@ -281,12 +421,28 @@ class IntermediateBackend:
         if start < len(sequences):
             yield start, sequences[start:]
 
-    def _forward(self, sequences, req_ids=None, required_starts=None):
+    def _cached_context_rows(self, sequences, req_ids):
+        """Use owned hidden rows only while the corresponding prefix KV is valid."""
+        rows = []
+        for req_id, sequence in zip(req_ids, sequences):
+            slot = self.cache.slots.get(req_id)
+            if slot is None or self.cache.query_start(req_id, sequence, len(sequence)) != len(sequence):
+                return None
+            saved = self._context_rows[slot]
+            position = len(sequence) - 1
+            if saved is None or saved[0] != req_id or not saved[1] <= position < saved[2]:
+                return None
+            offset = position - saved[1]
+            rows.append(saved[3][offset : offset + 1])
+        return torch.cat(rows, dim=0) if rows else None
+
+    def _forward(self, sequences, req_ids=None, required_starts=None, reuse_context=False):
         n = len(sequences)
         if req_ids is None:
             req_ids = [str(i) for i in range(n)]
         if required_starts is None:
             required_starts = [len(s) - 1 for s in sequences]
+        cached_context = self._cached_context_rows(sequences, req_ids) if reuse_context else None
         cache_slots, computed = self.cache.plan(req_ids, sequences, required_starts)
         lengths = np.array([len(s) for s in sequences], dtype=np.int32)
         computed = np.asarray(computed, dtype=np.int32)
@@ -295,7 +451,7 @@ class IntermediateBackend:
         total = int(starts[-1])
         if total > self.max_num_tokens:
             raise ValueError("Intermediate incremental query exceeds the token buffer.")
-        manager = self.cudagraph_manager
+        manager = self.cudagraph_manager if cached_context is None else None
         desc = manager.dispatch(n, total, None, 0) if manager is not None else None
         if desc is not None and desc.cg_mode != CUDAGraphMode.PIECEWISE:
             raise RuntimeError("Intermediate query has no captured piecewise graph; refusing silent eager fallback.")
@@ -400,6 +556,14 @@ class IntermediateBackend:
             num_input_tokens=padded_total,
         )
         slots = build_slot_mappings_by_layer(self.block_tables.slot_mappings[:, :padded_total], self.kv_cache_config)
+        if cached_context is not None:
+            # KV and projected auxiliary rows already exist from verification.
+            # DFlash accepts this combined context directly with aux=None.
+            # Avoid a verifier forward AND a second auxiliary projection here.
+            self.cache.commit(cache_slots, sequences)
+            self.reused_hidden_tokens += total
+            self.reused_tokens += sum(lengths)
+            return batch, metadata, slots, cached_context, None
         model_positions = self.input_buffers.positions[:padded_total]
         padding = self.input_buffers.is_padding[:padded_total]
         padding[:total].fill_(False)
@@ -436,7 +600,14 @@ class IntermediateBackend:
         )
         self.drafter.model.precompute_and_store_context_kv(context_hidden, positions, context_slots)
         self.cache.commit(cache_slots, sequences)
+        for row, (req_id, slot, sequence, required) in enumerate(zip(req_ids, cache_slots, sequences, required_starts)):
+            # Only retain prediction rows, never the full prompt activations.
+            # clone owns storage: future graph replay overwrites model outputs.
+            begin = int(starts[row]) + required - int(computed[row])
+            end = int(starts[row + 1])
+            self._context_rows[slot] = (req_id, required, len(sequence), context_hidden[begin:end].clone())
         self.forward_tokens += total
+        self.executed_tokens += padded_total
         self.reused_tokens += int(computed.sum())
         return batch, metadata, slots, hidden, aux
 
@@ -444,6 +615,24 @@ class IntermediateBackend:
     def verify(self, prefixes, drafts, req_ids=None):
         for logits, lengths in self.verify_batches(prefixes, drafts, req_ids=req_ids):
             yield from logits.split(lengths)
+
+    def _warm_prefixes(self, sequences, req_ids, required):
+        """Avoid pathological padding across a large gap in sparse graph gears."""
+        sizes = getattr(self.cudagraph_manager, "capture_sizes", ())
+        computed = [self.cache.query_start(r, s, p) for r, s, p in zip(req_ids, sequences, required)]
+        total = sum(len(s) - c for s, c in zip(sequences, computed))
+        padded = next((size for size in sizes if size >= total), total)
+        smaller = [size for size in sizes if size < total]
+        if padded <= 8 * total or not smaller or not any(c < p for c, p in zip(computed, required)):
+            return
+        # Reserve the whole group first, so per-request warming cannot evict
+        # another member. Only context rows are split; prediction stays packed.
+        self.cache.plan(req_ids, sequences, required)
+        chunk = max(smaller)
+        for req_id, sequence, end, start in zip(req_ids, sequences, required, computed):
+            while start < end:
+                start = min(start + chunk, end)
+                self._forward([sequence[:start]], [req_id], [start - 1])
 
     @torch.inference_mode()
     def verify_batches(self, prefixes, drafts, req_ids=None):
@@ -455,16 +644,27 @@ class IntermediateBackend:
         with self._context():
             for offset, rows in self._batches(sequences, req_ids, required_starts):
                 required = required_starts[offset : offset + len(rows)]
-                batch, _, _, hidden, _ = self._forward(rows, req_ids[offset : offset + len(rows)], required)
-                indices = [
-                    j
-                    for i in range(len(rows))
-                    for j in range(
-                        int(batch.query_start_loc_np[i]) + required[i] - int(batch.num_computed_tokens_np[i]),
-                        int(batch.query_start_loc_np[i + 1]),
-                    )
-                ]
-                logits = self.model.compute_logits(hidden[torch.tensor(indices, device=self.device, dtype=torch.int64)])
+                batch_ids = req_ids[offset : offset + len(rows)]
+                self._warm_prefixes(rows, batch_ids, required)
+                batch, _, _, hidden, _ = self._forward(rows, batch_ids, required)
+                # On cache hits every forwarded row predicts a candidate/bonus.
+                # Avoid a CPU index list, H2D index copy and device gather there.
+                if np.array_equal(batch.num_computed_tokens_np, required):
+                    prediction_hidden = hidden
+                elif len(rows) == 1:
+                    prediction_hidden = hidden[required[0] - int(batch.num_computed_tokens_np[0]) :]
+                else:
+                    indices = [
+                        j
+                        for i in range(len(rows))
+                        for j in range(
+                            int(batch.query_start_loc_np[i]) + required[i] - int(batch.num_computed_tokens_np[i]),
+                            int(batch.query_start_loc_np[i + 1]),
+                        )
+                    ]
+                    host_indices = torch.tensor(indices, dtype=torch.int64, pin_memory=self.device.type != "cpu")
+                    prediction_hidden = hidden.index_select(0, host_indices.to(self.device, non_blocking=True))
+                logits = self.model.compute_logits(prediction_hidden)
                 # Keep microbatches packed through acceptance, without retaining
                 # batch * draft * vocab storage across forwards.
                 yield logits, [len(drafts[offset + i]) + 1 for i in range(len(rows))]
@@ -483,21 +683,28 @@ class IntermediateBackend:
             for offset, rows in self._batches([prefixes[i][:-1] for i in active], active_ids):
                 n = len(rows)
                 batch_ids = active_ids[offset : offset + n]
-                batch, metadata, slots, hidden, aux = self._forward(rows, batch_ids)
-                anchors = torch.zeros(self.max_num_reqs, device=self.device, dtype=torch.int64)
-                anchors[:n] = torch.tensor([prefixes[i][-1] for i in active[offset : offset + n]], device=self.device)
+                batch, metadata, slots, hidden, aux = self._forward(rows, batch_ids, reuse_context=True)
+                anchors = self._proposal_anchors
+                # Fresh pinned host storage avoids an asynchronous H2D reuse
+                # race while keeping the captured device pointer stable.
+                host_anchors = torch.tensor(
+                    [prefixes[i][-1] for i in active[offset : offset + n]],
+                    dtype=torch.int64,
+                    pin_memory=self.device.type != "cpu",
+                )
+                anchors[:n].copy_(host_anchors, non_blocking=True)
                 tokens = self.drafter.propose(
                     batch,
                     metadata,
                     slots,
                     hidden,
                     aux,
-                    torch.ones(n, device=self.device, dtype=torch.int32),
-                    torch.zeros(n, device=self.device, dtype=torch.int32),
+                    self._proposal_ones[:n],
+                    self._proposal_zeros[:n],
                     anchors,
                     anchors,
-                    torch.zeros(self.max_num_reqs, device=self.device),
-                    torch.zeros(self.max_num_reqs, device=self.device, dtype=torch.int64),
+                    self._proposal_temperature,
+                    self._proposal_seeds,
                 )
                 for i, token_ids in zip(active[offset : offset + n], tokens.tolist()):
                     result[i] = token_ids
@@ -523,3 +730,4 @@ class IntermediateBackend:
         for logits in self.verify([row[: max(1, len(row) - width)] for row in rows], [[0] * width for _ in rows]):
             logits.topk(min(self.config.verification.get("top_k", 5), logits.shape[-1]), dim=-1)
         self.cache.retain(())
+        self._context_rows = [None] * self.max_num_reqs

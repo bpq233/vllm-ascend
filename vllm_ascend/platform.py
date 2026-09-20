@@ -446,7 +446,7 @@ class NPUPlatform(Platform):
         # 6.Update compilation / cudagraph modes (ascend_config -> vllm_config).
         _update_compilation_modes(vllm_config, ascend_config)
 
-        from vllm_ascend.worker.v2.spec_decode.multi_stage_config import configure_long_target_graphs
+        from vllm_ascend.worker.v2.spec_decode.multi_stage.config import configure_long_target_graphs
 
         configure_long_target_graphs(vllm_config)
 

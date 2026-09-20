@@ -1240,7 +1240,7 @@ def init_ascend_config(vllm_config):
     # fields at their sentinel defaults.
     new_config.derive_and_validate(vllm_config)
     if new_config.multi_stage_speculative:
-        from vllm_ascend.worker.v2.spec_decode.multi_stage_config import validate_multi_stage
+        from vllm_ascend.worker.v2.spec_decode.multi_stage.config import validate_multi_stage
 
         validate_multi_stage(vllm_config, new_config.multi_stage_speculative)
     new_config.rl_config.apply(new_config)

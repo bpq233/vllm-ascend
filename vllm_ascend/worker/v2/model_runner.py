@@ -196,8 +196,8 @@ class NPUModelRunner(GPUModelRunner):
         if not options:
             return
         if "final_verification" in options and self.is_last_pp_rank:
-            from vllm_ascend.worker.v2.spec_decode.acceptance import AcceptancePolicy
-            from vllm_ascend.worker.v2.spec_decode.final_verification import FinalVerificationSampler
+            from vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance import AcceptancePolicy
+            from vllm_ascend.worker.v2.spec_decode.multi_stage.final_verification import FinalVerificationSampler
 
             self.rejection_sampler = FinalVerificationSampler(
                 self.sampler, self.speculative_config, self.device, AcceptancePolicy(**options["final_verification"])

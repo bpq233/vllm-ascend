@@ -41,10 +41,19 @@ def assemble_verified_tokens(
     MRV2 inputs contain one context token followed by draft tokens per request;
     each logit predicts the following token, with the final row for the bonus.
     """
-    draft_next = draft_sampled.roll(-1)
-    accepted = policy.accept(logits, draft_next)
     steps = torch.arange(num_speculative_steps + 1, device=logits.device)
     lengths = cu_num_logits[1:] - cu_num_logits[:-1]
+    if policy.method == "all":
+        # Every request terminates at its bonus row. No vocabulary scan,
+        # acceptance mask or first-rejection reduction is needed.
+        stop = lengths - 1
+        rows = (cu_num_logits[:-1, None] + steps + 1).clamp(max=draft_sampled.shape[0] - 1).long()
+        bonus = target_sampled[(cu_num_logits[1:] - 1).long()]
+        sampled = torch.where(steps < stop[:, None], draft_sampled[rows], bonus[:, None])
+        sampled.masked_fill_(steps > stop[:, None], -1)
+        return sampled.long(), lengths.to(torch.int32)
+    draft_next = draft_sampled.roll(-1)
+    accepted = policy.accept(logits, draft_next)
     rows = (cu_num_logits[:-1, None] + steps).clamp(max=logits.shape[0] - 1).long()
     is_draft = steps < lengths[:, None] - 1
     # Bonus positions also terminate the prefix, including requests with no draft.
