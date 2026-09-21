@@ -38,18 +38,19 @@ class IntermediatePipeline:
         self._decision_shapes.move_to_end(key)
         return self._decision_shapes[key]
 
-    def _decide(self, logits, drafts, lengths):
+    def _decide(self, logits, drafts, lengths, tokens=None):
         # Keep vocabulary-sized logits packed; only the small acceptance mask
         # is padded. One top-k and one decision D2H per model microbatch.
         sizes, starts, steps, rows, is_draft = self._decision_shape(logits, lengths)
         if self.policy.method == "all":
             replacement = logits.index_select(0, starts + sizes - 1).argmax(-1)
             return torch.stack((sizes - 1, replacement), dim=-1).cpu().tolist()
-        tokens = torch.tensor(
-            [t for draft in drafts for t in (*draft, 0)],
-            dtype=torch.int64,
-            pin_memory=logits.device.type != "cpu",
-        ).to(logits.device, non_blocking=True)
+        if tokens is None:
+            tokens = torch.tensor(
+                [t for draft in drafts for t in (*draft, 0)],
+                dtype=torch.int64,
+                pin_memory=logits.device.type != "cpu",
+            ).to(logits.device, non_blocking=True)
         values, indices = logits.topk(min(self.policy.top_k, logits.shape[-1]), dim=-1)
         # Use the values already returned by topk instead of launching a
         # second gather of the vocabulary logits. Keep topk's tie ordering;
@@ -103,7 +104,14 @@ class IntermediatePipeline:
                 contexts, round_drafts, req_ids=[req_ids[i] for i in active]
             ):
                 offset = len(decisions)
-                decisions.extend(self._decide(logits, round_drafts[offset : offset + len(lengths)], lengths))
+                decisions.extend(
+                    self._decide(
+                        logits,
+                        round_drafts[offset : offset + len(lengths)],
+                        lengths,
+                        getattr(self.backend, "verification_tokens", None),
+                    )
+                )
             intermediate_ms = (perf_counter() - started) * 1000
             continuing = []
             accepted_by_request = [0] * len(prefixes)

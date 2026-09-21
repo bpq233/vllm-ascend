@@ -176,6 +176,14 @@ class TestFinalVerificationSampler(unittest.TestCase):
             self.assertEqual("idx_mapping" in kwargs, not legacy)
             self.assertTrue(kwargs["return_logprobs"])
 
+        verifier.trace_forward = True
+        verifier.forward_events = (MagicMock(), MagicMock())
+        verifier.forward_events[0].elapsed_time.return_value = 1.0
+        with patch.object(module.logger, "debug") as debug:
+            verifier._verify(logits, None, draft, pos, cumulative, mapping, mapping_np, expanded, local)
+        verifier.forward_events[1].synchronize.assert_not_called()
+        self.assertEqual(debug.call_args.args[1:3], ([1], [1]))
+
 
 if __name__ == "__main__":
     unittest.main()

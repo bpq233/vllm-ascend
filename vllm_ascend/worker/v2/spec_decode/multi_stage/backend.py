@@ -404,6 +404,8 @@ class IntermediateBackend:
         self._proposal_zeros = torch.zeros(self.max_num_reqs, device=self.device, dtype=torch.int32)
         self._proposal_temperature = torch.zeros(self.max_num_reqs, device=self.device)
         self._proposal_seeds = torch.zeros(self.max_num_reqs, device=self.device, dtype=torch.int64)
+        self._request_offsets = torch.arange(self.max_num_reqs + 1, device=self.device, dtype=torch.int32)
+        self._query_padding = torch.zeros(self.max_num_tokens, device=self.device, dtype=torch.bool)
 
     def _batches(self, sequences, req_ids=None, required_starts=None):
         start, num_tokens = 0, 0
@@ -459,22 +461,22 @@ class IntermediateBackend:
         # Pack CPU-produced inputs/metadata into one pinned H2D transfer. Views
         # stay alive through the queued work; no reusable host buffer can race
         # with an asynchronous copy from a previous microbatch.
-        fields = [
-            cache_slots,
-            lengths.tolist(),
-            starts.tolist(),
-            np.repeat(np.arange(n, dtype=np.int64), query_lens).tolist(),
-            [p for s, c in zip(sequences, computed) for p in range(c, len(s))],
-            [t for s, c in zip(sequences, computed) for t in s[c:]],
-        ]
-        host_inputs = torch.tensor(
-            [value for field in fields for value in field],
-            dtype=torch.int64,
-            pin_memory=self.device.type != "cpu",
-        )
+        field_sizes = [n, n, n + 1, total, total, total]
+        host_inputs = torch.empty(sum(field_sizes), dtype=torch.int64, pin_memory=self.device.type != "cpu")
+        # numpy() is a view of CPU pinned storage, not a device read. Fill it
+        # in bulk instead of materializing multiple Python integers per token.
+        host_fields = np.split(host_inputs.numpy(), np.cumsum(field_sizes)[:-1])
+        host_fields[0][:] = cache_slots
+        host_fields[1][:] = lengths
+        host_fields[2][:] = starts
+        token_rows_cpu = np.repeat(np.arange(n), query_lens)
+        host_fields[3][:] = token_rows_cpu
+        host_fields[4][:] = np.arange(total) + computed[token_rows_cpu] - starts[token_rows_cpu]
+        for row, (sequence, count) in enumerate(zip(sequences, computed)):
+            host_fields[5][starts[row] : starts[row + 1]] = sequence[count:]
         cache_slots_gpu, lengths_gpu, starts_gpu, token_rows, positions_gpu, ids_gpu = host_inputs.to(
             self.device, non_blocking=True
-        ).split([len(field) for field in fields])
+        ).split(field_sizes)
         for table, cached in zip(self.block_tables.input_block_tables, self.cache_block_tables):
             table[:n].copy_(cached.index_select(0, cache_slots_gpu))
         positions = self.input_buffers.positions[:total]
@@ -483,7 +485,7 @@ class IntermediateBackend:
         ids.copy_(ids_gpu)
         self.input_buffers.input_ids[total:padded_total].zero_()
         self.input_buffers.positions[total:padded_total].zero_()
-        mapping = torch.arange(n, device=self.device, dtype=torch.int32)
+        mapping = self._request_offsets[:n]
         lengths_cpu = torch.from_numpy(lengths)
         seq_lens = lengths_gpu.int()
         starts_gpu = starts_gpu.int()
@@ -505,7 +507,7 @@ class IntermediateBackend:
             idx_mapping=mapping,
             idx_mapping_np=np.arange(n, dtype=np.int32),
             expanded_idx_mapping=mapping,
-            expanded_local_pos=torch.zeros_like(mapping),
+            expanded_local_pos=self._proposal_zeros[:n],
             num_scheduled_tokens=query_lens,
             num_tokens=total,
             num_tokens_after_padding=total,
@@ -523,9 +525,9 @@ class IntermediateBackend:
             max_seq_len_np=None,
             input_ids=ids,
             positions=positions,
-            is_padding=torch.zeros(total, device=self.device, dtype=torch.bool),
+            is_padding=self._query_padding[:total],
             logits_indices=starts_gpu[1:].long() - 1,
-            cu_num_logits=torch.arange(n + 1, device=self.device, dtype=torch.int32),
+            cu_num_logits=self._request_offsets[: n + 1],
             cu_num_logits_np=np.arange(n + 1, dtype=np.int32),
             has_structured_output_reqs=False,
             prompt_lens=None,
@@ -651,8 +653,11 @@ class IntermediateBackend:
                 # Avoid a CPU index list, H2D index copy and device gather there.
                 if np.array_equal(batch.num_computed_tokens_np, required):
                     prediction_hidden = hidden
+                    prediction_tokens = batch.input_ids
                 elif len(rows) == 1:
-                    prediction_hidden = hidden[required[0] - int(batch.num_computed_tokens_np[0]) :]
+                    begin = required[0] - int(batch.num_computed_tokens_np[0])
+                    prediction_hidden = hidden[begin:]
+                    prediction_tokens = batch.input_ids[begin:]
                 else:
                     indices = [
                         j
@@ -663,11 +668,23 @@ class IntermediateBackend:
                         )
                     ]
                     host_indices = torch.tensor(indices, dtype=torch.int64, pin_memory=self.device.type != "cpu")
-                    prediction_hidden = hidden.index_select(0, host_indices.to(self.device, non_blocking=True))
+                    device_indices = host_indices.to(self.device, non_blocking=True)
+                    prediction_hidden = hidden.index_select(0, device_indices)
+                    prediction_tokens = batch.input_ids.index_select(0, device_indices)
                 logits = self.model.compute_logits(prediction_hidden)
                 # Keep microbatches packed through acceptance, without retaining
                 # batch * draft * vocab storage across forwards.
-                yield logits, [len(drafts[offset + i]) + 1 for i in range(len(rows))]
+                # Predictor inputs are [anchor, draft...]. Shift on device;
+                # the value at each bonus row is ignored by the acceptance mask.
+                # This view is valid only until the generator resumes: the next
+                # model replay may overwrite input buffers.
+                self.verification_tokens = (
+                    prediction_tokens.roll(-1) if self.config.verification.get("method", "topk") != "all" else None
+                )
+                try:
+                    yield logits, [len(drafts[offset + i]) + 1 for i in range(len(rows))]
+                finally:
+                    self.verification_tokens = None
 
     @torch.inference_mode()
     def propose(self, prefixes, req_ids=None):

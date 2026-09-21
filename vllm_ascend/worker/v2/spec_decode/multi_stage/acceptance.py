@@ -22,10 +22,9 @@ class AcceptancePolicy:
     def accept(self, logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
         if self.method == "all":
             return torch.ones_like(token_ids, dtype=torch.bool)
-        top_ids = logits.topk(min(self.top_k, logits.shape[-1]), dim=-1).indices
+        values, top_ids = logits.topk(min(self.top_k, logits.shape[-1]), dim=-1)
         # Masked logits must never pass just because k exceeds the allowed set.
-        allowed = torch.isfinite(logits.gather(-1, token_ids.long().unsqueeze(-1)).squeeze(-1))
-        return (top_ids == token_ids.unsqueeze(-1)).any(dim=-1) & allowed
+        return ((top_ids == token_ids.unsqueeze(-1)) & torch.isfinite(values)).any(dim=-1)
 
 
 def assemble_verified_tokens(
@@ -35,13 +34,15 @@ def assemble_verified_tokens(
     cu_num_logits: torch.Tensor,
     num_speculative_steps: int,
     policy: AcceptancePolicy,
+    steps: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack each accepted prefix and its target replacement/bonus, on device.
 
     MRV2 inputs contain one context token followed by draft tokens per request;
     each logit predicts the following token, with the final row for the bonus.
     """
-    steps = torch.arange(num_speculative_steps + 1, device=logits.device)
+    if steps is None:
+        steps = torch.arange(num_speculative_steps + 1, device=logits.device)
     lengths = cu_num_logits[1:] - cu_num_logits[:-1]
     if policy.method == "all":
         # Every request terminates at its bonus row. No vocabulary scan,

@@ -43,7 +43,7 @@ def backend():
     )
     cls = load_class("backend.py", "IntermediateBackend", namespace)
     obj = cls.__new__(cls)
-    obj.config = NS(num_speculative_tokens=2)
+    obj.config = NS(num_speculative_tokens=2, verification={"method": "topk"})
     obj.device = torch.device("cpu")
     obj.max_num_reqs, obj.max_num_tokens, obj.max_model_len = 2, 12, 8
     cache_cls = load_class("backend.py", "IntermediateKVCache", dict(OrderedDict=OrderedDict))
@@ -300,6 +300,22 @@ def test_batch_budget_counts_new_queries_instead_of_cached_prefixes(backend):
     slots, _ = obj.cache.plan(["a", "b"], [[1] * 8, [2] * 8], [7, 7])
     obj.cache.commit(slots, [[1] * 8, [2] * 8])
     assert [(i, len(rows)) for i, rows in obj._batches([[1] * 8, [2] * 8], ["a", "b"], [7, 7])] == [(0, 2)]
+
+
+def test_device_verification_tokens_align_cold_warm_reordered_and_empty_drafts(backend):
+    obj, _, _ = backend
+    batches = [
+        ([[1, 2, 3], [4]], [[5, 6], []], ["a", "b"]),
+        ([[4], [1, 2, 3, 5]], [[], [9]], ["b", "a"]),
+        ([[1, 2, 7]], [[8, 9]], ["a"]),
+    ]
+    for prefixes, drafts, ids in batches:
+        offset = 0
+        for _, lengths in obj.verify_batches(prefixes, drafts, ids):
+            for tokens, draft in zip(obj.verification_tokens.split(lengths), drafts[offset:]):
+                assert tokens[: len(draft)].tolist() == draft
+            offset += len(lengths)
+        assert obj.verification_tokens is None
 
 
 def test_host_history_delta_reorder_growth_and_slot_reuse():

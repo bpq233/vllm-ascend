@@ -19,6 +19,7 @@ class FinalVerificationSampler(RejectionSampler):
     def __init__(self, sampler, spec_config, device: torch.device, policy: AcceptancePolicy):
         super().__init__(sampler, spec_config, device)
         self.policy = policy
+        self._verification_steps = torch.arange(self.num_speculative_steps + 1, device=device)
         self.forward_events = None
         self.trace_forward = False
         self.verification_path = "decode"
@@ -68,16 +69,18 @@ class FinalVerificationSampler(RejectionSampler):
             cu_num_logits,
             self.num_speculative_steps,
             self.policy,
+            self._verification_steps,
         )
         if self.trace_forward:
-            # Debug-only synchronization; normal execution stays on device.
-            self.forward_events[1].synchronize()
-            lengths = (cu_num_logits[1:] - cu_num_logits[:-1] - 1).cpu().tolist()
+            # One blocking transfer also completes the earlier forward events;
+            # do not synchronize them separately or copy each statistic alone.
+            counts = torch.stack((cu_num_logits[1:] - cu_num_logits[:-1] - 1, num_sampled - 1))
+            lengths, accepted = counts.cpu().tolist()
             logger.debug(
                 "multi_stage_final candidate_lengths=%s accepted_lengths=%s verification_path=%s target_ms=%.3f "
                 "timing=npu_forward",
                 lengths,
-                (num_sampled - 1).cpu().tolist(),
+                accepted,
                 self.verification_path,
                 self.forward_events[0].elapsed_time(self.forward_events[1]),
             )

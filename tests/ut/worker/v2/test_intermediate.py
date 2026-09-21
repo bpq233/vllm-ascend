@@ -251,6 +251,9 @@ def test_decisions_preserve_ties_and_nonfinite_policy(modules, top_k):
             expected.append([stop, logits[offset + stop].argmax().item()])
             offset += size
         assert pipe._decide(logits, drafts, lengths) == expected
+        # Bonus values need not be zero: they are masked before acceptance.
+        tokens = torch.tensor([1, 2, 3, 31, 30, 0, 6, 29])
+        assert pipe._decide(logits, None, lengths, tokens=tokens) == expected
 
 
 def test_shape_metadata_reused_and_bounded(modules):

@@ -38,25 +38,34 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
         lengths_gpu = self.req_states.total_len.gpu[indices]
         source = self.req_states.all_token_ids.gpu
         width = min(self.final_capacity + 1, source.shape[1])
-        offsets = torch.arange(width, device=primary.device)
+        offsets = getattr(self, "_history_offsets", None)
+        if offsets is None or offsets.numel() != width:
+            offsets = self._history_offsets = torch.arange(width, device=primary.device)
         positions = (lengths_gpu[:, None] - width + offsets).clamp(min=0)
         tails = source[indices[:, None], positions.long()]
         packed = torch.cat((lengths_gpu[:, None], primary, tails), dim=1).cpu().tolist()
+        missing = [
+            (req_id, int(index), int(row[0]))
+            for req_id, index, row in zip(input_batch.req_ids, input_batch.idx_mapping_np, packed)
+            if req_id not in histories or not 0 <= int(row[0]) - len(histories[req_id]) <= width
+        ]
+        if missing:
+            # Cold starts and prefill jumps share one D2H, regardless of batch
+            # size. Slices use CPU lengths, so no device scalar is extracted.
+            cold = torch.cat([source[index, :length] for _, index, length in missing]).cpu().tolist()
+            offset = 0
+            for req_id, _, length in missing:
+                histories[req_id] = cold[offset : offset + length]
+                offset += length
         lengths, prefixes, drafts = [], [], []
         for req_id, index, row in zip(input_batch.req_ids, input_batch.idx_mapping_np, packed):
             length = int(row[0])
-            previous = histories.get(req_id)
-            delta = length - len(previous) if previous is not None else width + 1
-            if previous is None or delta < 0 or delta > width:
-                prefix = source[int(index), :length].cpu().tolist()
-            else:
-                # The synchronous pipeline never mutates committed prefixes.
-                # Append the delta instead of copying the entire host history
-                # again on every decode step (especially costly at 40K+).
-                if delta:
-                    previous.extend(row[-delta:])
-                prefix = previous
-            histories[req_id] = prefix
+            prefix = histories[req_id]
+            delta = length - len(prefix)
+            # The synchronous pipeline never mutates committed prefixes.
+            # Append only the delta, avoiding an O(context) host copy per step.
+            if delta:
+                prefix.extend(row[-delta:])
             lengths.append(length)
             prefixes.append(prefix)
             drafts.append(row[1 : 1 + primary.shape[1]])
@@ -87,10 +96,11 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
     @torch.inference_mode()
     def propose(self, input_batch, *args, **kwargs):
         primary = super().propose(input_batch, *args, **kwargs)
-        output = primary.new_zeros((input_batch.num_reqs, self.final_capacity))
+        output = primary.new_empty((input_batch.num_reqs, self.final_capacity))
         # Profiling/capture must exercise the original drafter without accessing
         # live requests or publishing dummy candidate state.
         if kwargs.get("dummy_run", False):
+            output.zero_()
             if kwargs.get("is_profile", False):
                 self.pipeline.backend.profile()
             output[:, : primary.shape[1]] = primary

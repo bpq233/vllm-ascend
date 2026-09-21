@@ -4,6 +4,24 @@
 
 实现统一放在 `vllm_ascend/worker/v2/spec_decode/multi_stage/`：`adapter.py` 接入原 DFlash，`config.py` 管理配置，`pipeline.py` 控制迭代，`backend.py` 包含中间模型、KV/hidden 缓存及图状态，`acceptance.py` 与 `final_verification.py` 管理接受策略和最终验证。包入口保持轻量，配置校验时不会提前加载模型模块。原来的独立 cache/graph 辅助文件已合并，不保留重复实现；部署更新需要同步新目录和引用路径修改。
 
+## 热路径审计与传输边界
+
+调用链为：CPU scheduler 生成请求和候选长度 → Target 图执行及设备端采样/提交 → Primary DFlash 图生成候选 → `adapter._read_step` 回传有界历史增量 → `pipeline.refine` 驱动中间轮次 → `backend.verify_batches` 增量 KV 验证 → `_decide` 设备端验收并回传决策 → Secondary DFlash 图生成下一轮候选 → adapter 发布 CPU 候选并写入设备 draft buffer → 下一步 Target 验证。中间 KV 按请求隔离、核对前缀并截断分歧后缀；它不提交正式 Target 状态。
+
+| 优先级 | 位置及频率 | 成本与处理 |
+|---|---|---|
+| P0 | `adapter._read_step`，每个外层 decode step | 长度、Primary 和历史尾部一次 D2H；冷请求原来逐请求读完整历史，现在额外合并一次 D2H。热请求仍保留一次同步。 |
+| P0 | `pipeline._decide` / `backend.propose`，每个中间 microbatch | 决策和 Secondary token 仍需 D2H，供 CPU 活跃请求控制及 KV 前缀记录使用；尚未实现全设备控制循环。 |
+| P0 | `FinalVerificationSampler._verify`，仅 DEBUG | 原来 event 显式同步加两次统计 D2H；现在统计合并一次阻塞 D2H，该传输也等待此前 forward 完成。普通路径没有这项回传。 |
+| P1 | `pipeline._decide`，每轮 top-k 验收 | 删除从 Python draft 再构造 pinned tensor 并 H2D；直接使用当前 verifier 输入在设备上移位得到的 token。bonus 行被 mask，异长请求不会串入验收。 |
+| P1 | `backend._forward`，每个中间 forward | pinned CPU buffer 中批量生成位置和 request row，不再逐 token 构造多层 Python 整数列表；整个输入仍一次异步 H2D。CPU `.numpy()` 是 pinned 内存视图。 |
+| P2 | backend / adapter / final sampler，每步 | 固定 request offsets、padding、历史 offsets 和验收 steps 复用；正常输出采用 empty 后完整覆盖，dummy 输出仍清零；最终 top-k 使用返回值过滤非有限 logits，省去一次 vocabulary gather。 |
+| P3 | 图、KV 和模型初始化 | 固定 buffer 分配保留，不计作 decode 同步；不增加图捕获档位和 stream。 |
+
+复查范围包含 multi_stage 和 DFlash 中的 `.item/.tolist/.cpu/.numpy`、标量转换及 tensor 工厂调用。NumPy query 长度和 CPU metadata 上的转换不是 D2H；上游 DFlash 的 `seq_lens_cpu_upper_bound.max().item()` 同样操作 CPU tensor。DFlash replay 的 DP token-count tensor 创建仍保留，修改涉及原始 DFlash 通信上下文，应在 NPU 上验证其跨 stream 生命周期后再调整。
+
+设备 token 只在 `verify_batches` 当前 yield 期间有效，恢复生成器后即清除引用，防止下一次图重放覆盖后误用。异步 H2D 的 pinned 源仍按调用独立分配，避免未经 event 保护的主机缓冲区复用造成数据竞争。CPU 控制循环、EOS/长度裁剪、前缀比较和 scheduler 发布仍存在；当前实现不能宣称全流水线已图捕获，也不能以 CPU 测试推断 NPU 加速比。
+
 ## 配置
 
 启用 MRV2（`VLLM_USE_V2_MODEL_RUNNER=1`），使用同步调度（`--no-async-scheduling`）。例如：
