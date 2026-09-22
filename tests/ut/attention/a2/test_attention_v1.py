@@ -14,6 +14,7 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionPCPMetadataBuilder,
     AscendAttentionState,
     AscendC8AttentionBackendImpl,
+    _normalize_fia_query_metadata,
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -30,6 +31,21 @@ LARGE_HEAD_PREFILL_PATH = "vllm_ascend.device.utils.npu_large_head_prefill_atten
 
 
 class TestAttentionGraphHelpers(TestBase):
+    def test_normalize_fia_query_metadata_drops_graph_padding(self):
+        block_table = torch.zeros(2, 4, dtype=torch.int32)
+        q, kv, blocks = _normalize_fia_query_metadata(1, [1, 4094], [32, 4094], block_table, 1)
+
+        assert q == [1]
+        assert kv == [32]
+        assert blocks.shape == (1, 4)
+
+    def test_normalize_fia_query_metadata_repairs_stale_single_boundary(self):
+        q, kv, blocks = _normalize_fia_query_metadata(1, [4094], [4094], None, 1)
+
+        assert q == [1]
+        assert kv == [4094]
+        assert blocks is None
+
     def test_cache_graph_workspace_keeps_first_workspace_by_default(self):
         graph_params = SimpleNamespace(workspaces={1: torch.empty(4)})
         candidate_workspace = torch.empty(8)

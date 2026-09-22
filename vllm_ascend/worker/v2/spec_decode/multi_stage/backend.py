@@ -29,6 +29,7 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_metadata, get_kv_cache_s
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_states import init_asecnd_model_state
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import AscendDFlashSpeculator
+from vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance import AcceptancePolicy, IntermediateDecisionRunner
 from vllm_ascend.worker.v2.spec_decode.multi_stage.config import intermediate_capture_sizes, primary_draft_width
 
 logger = logging.getLogger(__name__)
@@ -298,6 +299,19 @@ class IntermediateBackend:
             _setup_compile_backend(cfg, self.parent_config.compilation_config.oot_compiler)
         with self._context():
             self.model = get_model_loader(cfg.load_config).load_model(vllm_config=cfg, model_config=cfg.model_config)
+            self.decision_runner = IntermediateDecisionRunner(
+                self.model.compute_logits,
+                AcceptancePolicy(**self.config.verification),
+                max(
+                    self.config.num_speculative_tokens,
+                    primary_draft_width(
+                        self.parent_config.additional_config["multi_stage_speculative"],
+                        self.parent_config.speculative_config.num_speculative_tokens,
+                    ),
+                )
+                + 1,
+                graph_enabled=self.graph_enabled,
+            )
             set_eagle3_aux_hidden_state_layers(self.model, cfg.speculative_config)
             self.drafter = AscendDFlashSpeculator(cfg, self.device)
             self.drafter.load_model(self.model)
@@ -345,6 +359,21 @@ class IntermediateBackend:
             progress_bar_desc="Capturing intermediate verifier graphs",
         )
         capture_secondary_graphs(self.drafter)
+        # Capture in the same deterministic order on every TP rank. Keep
+        # first-request latency and graph allocation out of the decode loop.
+        requests = 1
+        while True:
+            width = self.decision_runner.query_width
+            hidden = torch.zeros(
+                (requests * width, self.vllm_config.model_config.get_hidden_size()),
+                dtype=self.vllm_config.model_config.dtype,
+                device=self.device,
+            )
+            tokens = torch.zeros(requests * width, dtype=torch.int64, device=self.device)
+            self.decision_runner(hidden, tokens, [width] * requests)
+            if requests == self.max_num_reqs:
+                break
+            requests = min(requests * 2, self.max_num_reqs)
         # Dummy capture inputs must not publish a valid token prefix.
         self.cache.retain(())
 
@@ -599,8 +628,11 @@ class IntermediateBackend:
             # its slot mappings are -1 and its output is discarded below.
             if padded_total > total:
                 for item in {id(value): value for value in metadata.values()}.values():
+                    padding_len = min(padded_total - total, self.max_model_len)
                     item.actual_seq_lengths_q = [*item.actual_seq_lengths_q, padded_total]
-                    item.seq_lens_list = [*item.seq_lens_list, min(padded_total - total, self.max_model_len)]
+                    item.seq_lens_list = [*item.seq_lens_list, padding_len]
+                    item.seq_lens = torch.cat((item.seq_lens, item.seq_lens.new_tensor([padding_len])))
+                    item.seq_lens_cpu = torch.cat((item.seq_lens_cpu, item.seq_lens_cpu.new_tensor([padding_len])))
                     item.block_tables = torch.cat((item.block_tables, torch.zeros_like(item.block_tables[:1])))
             self.model_state.attn_metadata = metadata
         with set_forward_context(
@@ -679,7 +711,7 @@ class IntermediateBackend:
                 self._forward([sequence[:start]], [req_id], [start - 1], retain_hidden=False)
 
     @torch.inference_mode()
-    def verify_batches(self, prefixes, drafts, req_ids=None, retain_hidden=True):
+    def verify_batches(self, prefixes, drafts, req_ids=None, retain_hidden=True, decision=None):
         if len(prefixes) != len(drafts) or any(not p for p in prefixes):
             raise ValueError("Intermediate verification requires one nonempty prefix per draft.")
         sequences = [p + d for p, d in zip(prefixes, drafts)]
@@ -712,6 +744,11 @@ class IntermediateBackend:
                     ]
                     prediction_hidden = torch.cat([hidden[span] for span in spans])
                     prediction_tokens = torch.cat([batch.input_ids[span] for span in spans])
+                lengths = [len(drafts[offset + i]) + 1 for i in range(len(rows))]
+                if decision is not None:
+                    tokens = prediction_tokens.roll(-1) if decision.policy.method != "all" else None
+                    yield decision(prediction_hidden, tokens, lengths), lengths
+                    continue
                 logits = self.model.compute_logits(prediction_hidden)
                 # Keep microbatches packed through acceptance, without retaining
                 # batch * draft * vocab storage across forwards.
@@ -723,7 +760,7 @@ class IntermediateBackend:
                     prediction_tokens.roll(-1) if self.config.verification.get("method", "topk") != "all" else None
                 )
                 try:
-                    yield logits, [len(drafts[offset + i]) + 1 for i in range(len(rows))]
+                    yield logits, lengths
                 finally:
                     self.verification_tokens = None
 

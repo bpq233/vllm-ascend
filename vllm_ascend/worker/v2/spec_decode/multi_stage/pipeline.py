@@ -102,12 +102,21 @@ class IntermediatePipeline:
                 reused_before = getattr(self.backend, "reused_tokens", 0)
                 started = perf_counter()
             decisions = []
+            decision_tensors = []
+            decision_runner = getattr(self.backend, "decision_runner", None)
             for logits, lengths in self.backend.verify_batches(
                 contexts,
                 round_drafts,
                 req_ids=[req_ids[i] for i in active],
                 retain_hidden=round_id + 1 < self.config.num_rounds,
+                **({"decision": decision_runner} if decision_runner is not None else {}),
             ):
+                if decision_runner is not None:
+                    # Keep graph output alive until all microbatches finish;
+                    # perform one compact D2H copy instead of synchronizing
+                    # once per microbatch.
+                    decision_tensors.append(logits.clone() if decision_runner.graph_enabled else logits)
+                    continue
                 offset = len(decisions)
                 decisions.extend(
                     self._decide(
@@ -117,6 +126,11 @@ class IntermediatePipeline:
                         getattr(self.backend, "verification_tokens", None),
                     )
                 )
+            if decision_tensors:
+                decision_output = (
+                    decision_tensors[0] if len(decision_tensors) == 1 else torch.cat(decision_tensors, dim=0)
+                )
+                decisions.extend(decision_output.cpu().tolist())
             intermediate_ms = (perf_counter() - started) * 1000 if trace else 0.0
             continuing = []
             accepted_by_request = [0] * len(prefixes)

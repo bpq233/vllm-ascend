@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 import importlib.util
 import sys
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -92,6 +93,119 @@ def test_empty_active_batch_does_not_run_backend(modules):
     backend = Backend([])
     assert Pipeline(backend, config.IntermediateConfig("v", "d"), 4).refine([[1]], [[2]], [0]) == [[]]
     assert backend.calls == []
+
+
+@pytest.mark.parametrize("method,top_k", [("all", 1), ("topk", 1), ("topk", 5)])
+def test_fused_head_decision_matches_packed_reference(modules, method, top_k):
+    config, Pipeline = modules
+    acceptance = sys.modules["vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance"]
+    policy = acceptance.AcceptancePolicy(method, top_k)
+    runner = acceptance.IntermediateDecisionRunner(lambda hidden: hidden, policy, 5)
+    reference = Pipeline(None, config.IntermediateConfig("v", "d", verification=vars(policy)), 16)
+    generator = torch.Generator().manual_seed(91)
+    for lengths in ([5], [2, 5], [1, 4, 3], [1, 1, 1, 1]):
+        logits = torch.randn(sum(lengths), 17, generator=generator)
+        logits[0].fill_(float("-inf"))
+        # Include ties and masked rows in the semantic comparison.
+        if len(logits) > 2:
+            logits[2, :3] = 9
+        tokens = torch.randint(17, (sum(lengths),), generator=generator)
+        expected = reference._decide(logits, None, lengths, tokens=tokens)
+        assert runner(logits, tokens, lengths).tolist() == expected
+
+
+def test_all_policy_projects_only_bonus_rows(modules):
+    acceptance = sys.modules["vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance"]
+    projected = []
+    runner = acceptance.IntermediateDecisionRunner(
+        lambda hidden: projected.append(hidden.clone()) or hidden,
+        acceptance.AcceptancePolicy("all"),
+        16,
+    )
+    hidden = torch.arange(32 * 8, dtype=torch.float32).reshape(32, 8)
+    result = runner(hidden, None, [16, 16])
+    assert result.tolist() == [[15, 7], [15, 7]]
+    assert projected[0].shape[0] == 2
+    torch.testing.assert_close(projected[0], hidden[[15, 31]])
+
+
+@pytest.mark.parametrize("method", ["topk", "all"])
+def test_decision_graph_reuses_buffers_for_changing_lengths(modules, monkeypatch, method):
+    acceptance = sys.modules["vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance"]
+    policy = acceptance.AcceptancePolicy(method, 2)
+    runner = acceptance.IntermediateDecisionRunner(lambda hidden: hidden, policy, 5, graph_enabled=True)
+    eager = acceptance.IntermediateDecisionRunner(lambda hidden: hidden, policy, 5)
+    state = NS(capturing=None, captures=0, streams=0, pools=0)
+
+    class Graph:
+        def replay(self):
+            self.output.copy_(self.fn())
+
+    def stream(**kwargs):
+        state.streams += 1
+        return NS(wait_stream=lambda other: None)
+
+    def pool():
+        state.pools += 1
+        return object()
+
+    @contextmanager
+    def capture(graph, **kwargs):
+        state.captures += 1
+        state.capturing = graph
+        try:
+            yield
+        finally:
+            state.capturing = None
+
+    original_run = runner._run
+
+    def record(*args):
+        output = original_run(*args)
+        if state.capturing is not None:
+            state.capturing.fn = lambda: original_run(*args)
+            state.capturing.output = output
+        return output
+
+    runner._run = record
+    tensor = torch.tensor
+    monkeypatch.setattr(
+        torch, "tensor", lambda *a, **kw: tensor(*a, **{k: v for k, v in kw.items() if k != "pin_memory"})
+    )
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        NS(
+            Stream=stream,
+            graph_pool_handle=pool,
+            NPUGraph=Graph,
+            graph=capture,
+            current_stream=lambda: NS(wait_stream=lambda other: None),
+            stream=lambda stream: nullcontext(),
+        ),
+        raising=False,
+    )
+    monkeypatch.setitem(sys.modules, "vllm_ascend.worker.v2.utils", NS(communicator_switch=nullcontext))
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.distributed.parallel_state",
+        NS(
+            GraphCaptureContext=lambda stream: NS(stream=stream),
+            get_tp_group=lambda: NS(graph_capture=lambda context: nullcontext()),
+        ),
+    )
+    generator = torch.Generator().manual_seed(4)
+    addresses = {}
+    for lengths in ([5, 5, 5], [1], [1, 4, 2, 3], [4, 1, 1], [3]):
+        hidden = torch.randn(sum(lengths), 11, generator=generator)
+        tokens = torch.randint(11, (sum(lengths),), generator=generator)
+        torch.testing.assert_close(runner(hidden, tokens, lengths), eager(hidden, tokens, lengths))
+        for bucket, entry in runner.entries.items():
+            pointers = tuple(t.data_ptr() for t in entry[:4])
+            assert addresses.setdefault(bucket, pointers) == pointers
+    assert state.captures == 2  # request buckets 1 and 4, independent of lengths
+    assert state.streams == state.pools == 1
+    assert runner.replays == 5
 
 
 def test_resident_requests_run_first_and_results_restore_original_order(modules):
