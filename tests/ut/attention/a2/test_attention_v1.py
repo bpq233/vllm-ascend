@@ -14,6 +14,7 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionPCPMetadataBuilder,
     AscendAttentionState,
     AscendC8AttentionBackendImpl,
+    _fit_fia_query_to_output,
     _normalize_fia_query_metadata,
 )
 from vllm_ascend.attention.utils import (
@@ -45,6 +46,15 @@ class TestAttentionGraphHelpers(TestBase):
         assert q == [1]
         assert kv == [4094]
         assert blocks is None
+
+    def test_fit_fia_query_to_output_uses_output_extent(self):
+        query = torch.empty(4094, 32, 128)
+        output = torch.empty(1, 32, 128)
+
+        fitted_query, num_tokens = _fit_fia_query_to_output(query, output)
+
+        assert num_tokens == 1
+        assert fitted_query.shape == output.shape
 
     def test_cache_graph_workspace_keeps_first_workspace_by_default(self):
         graph_params = SimpleNamespace(workspaces={1: torch.empty(4)})

@@ -111,6 +111,14 @@ def _normalize_fia_query_metadata(
     )
 
 
+def _fit_fia_query_to_output(query: torch.Tensor, output: torch.Tensor) -> tuple[torch.Tensor, int]:
+    query_tokens = query.shape[0]
+    output_tokens = output.shape[0]
+    if query_tokens <= output_tokens:
+        return query, query_tokens
+    return query[:output_tokens], output_tokens
+
+
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
 class AscendAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
@@ -974,7 +982,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
 
-        num_tokens = query.shape[0]
+        query, num_tokens = _fit_fia_query_to_output(query, output)
         actual_seq_lengths_q, actual_seq_lengths_kv, block_table = _normalize_fia_query_metadata(
             num_tokens,
             attn_metadata.actual_seq_lengths_q,
@@ -1150,7 +1158,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
         actual_seq_lengths_kv = attn_metadata.seq_lens
-        num_tokens = query.shape[0]
+        query, num_tokens = _fit_fia_query_to_output(query, output)
         actual_seq_lengths_q, actual_seq_lengths_kv, block_table = _normalize_fia_query_metadata(
             num_tokens,
             attn_metadata.actual_seq_lengths_q,
@@ -1424,7 +1432,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache
         )
-        num_tokens = query.shape[0]
+        query, num_tokens = _fit_fia_query_to_output(query, output)
         actual_seq_lengths_q, actual_seq_lengths_kv, block_table = _normalize_fia_query_metadata(
             num_tokens,
             attn_metadata.actual_seq_lengths_q,
@@ -1792,7 +1800,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             raise NotImplementedError("fused output quantization is not yet supported for AscendAttentionBackendImpl")
 
         assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
-        num_tokens = query.shape[0]
+        query, num_tokens = _fit_fia_query_to_output(query, output)
         if attn_metadata is None:
             return output.fill_(0)
 
@@ -1901,7 +1909,7 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError("fused output quantization is not yet supported for AscendC8AttentionBackendImpl")
 
-        num_tokens = query.shape[0]
+        query, num_tokens = _fit_fia_query_to_output(query, output)
         if attn_metadata is None:
             return output.fill_(0)
 
@@ -2136,7 +2144,7 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         """
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_decodes = attn_metadata.num_decodes
-        num_tokens = query.shape[0]
+        query, num_tokens = _fit_fia_query_to_output(query, output)
         actual_seq_qlen, seq_lens_list, block_table = _normalize_fia_query_metadata(
             num_tokens,
             attn_metadata.actual_seq_lengths_q,
@@ -2242,7 +2250,7 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         """
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
 
-        num_tokens = query.shape[0]
+        query, num_tokens = _fit_fia_query_to_output(query, output)
         actual_seq_qlen, actual_seq_lengths_kv, block_table = _normalize_fia_query_metadata(
             num_tokens,
             attn_metadata.actual_seq_lengths_q,
