@@ -80,10 +80,11 @@ def _normalize_fia_query_metadata(
     actual_seq_lengths_q: list[int],
     actual_seq_lengths_kv,
     block_table: torch.Tensor | None,
-    num_actual_tokens: int,
 ):
     """Drop graph-padding requests when the caller supplied an unpadded query."""
-    if not actual_seq_lengths_q or actual_seq_lengths_q[-1] == query_tokens:
+    if not actual_seq_lengths_q:
+        return [query_tokens], actual_seq_lengths_kv[:1], block_table[:1] if block_table is not None else None
+    if actual_seq_lengths_q[-1] == query_tokens:
         return actual_seq_lengths_q, actual_seq_lengths_kv, block_table
     if actual_seq_lengths_q[-1] < query_tokens:
         raise RuntimeError(
@@ -93,7 +94,7 @@ def _normalize_fia_query_metadata(
     try:
         request_count = actual_seq_lengths_q.index(query_tokens) + 1
     except ValueError as exc:
-        if len(actual_seq_lengths_q) == 1 and num_actual_tokens == query_tokens:
+        if len(actual_seq_lengths_q) == 1:
             return (
                 [query_tokens],
                 actual_seq_lengths_kv[:1],
@@ -723,6 +724,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         seq_lens = attn_metadata[metadata_key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[metadata_key].actual_seq_lengths_q
 
+                    actual_seq_lengths_q, seq_lens, block_tables = _normalize_fia_query_metadata(
+                        query.shape[0], actual_seq_lengths_q, seq_lens, block_tables
+                    )
+
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     torch_npu.npu_fused_infer_attention_score_v2.out(
                         query=query,
@@ -914,6 +919,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             block_tables = attn_metadata[metadata_key].block_tables
                     layer_count += 1
 
+                    actual_seq_lengths_q, seq_lens, block_tables = _normalize_fia_query_metadata(
+                        query.shape[0], actual_seq_lengths_q, seq_lens, block_tables
+                    )
+
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     input_layout = "TND"
                     extra_args = {}
@@ -965,7 +974,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
 
-        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        num_tokens = query.shape[0]
+        actual_seq_lengths_q, actual_seq_lengths_kv, block_table = _normalize_fia_query_metadata(
+            num_tokens,
+            attn_metadata.actual_seq_lengths_q,
+            actual_seq_lengths_kv,
+            block_table,
+        )
         if _EXTRA_CTX.is_draft_model:
             if _EXTRA_CTX.is_draft_model_prefill:
                 graph_params = get_draft_graph_prefill_params()
@@ -973,7 +988,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 graph_params = get_draft_graph_params()
         else:
             graph_params = get_graph_params()
-        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
         input_layout = "TND"
         attn_mask = attn_metadata.attn_mask
@@ -1136,13 +1150,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
         actual_seq_lengths_kv = attn_metadata.seq_lens
-        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        num_tokens = query.shape[0]
+        actual_seq_lengths_q, actual_seq_lengths_kv, block_table = _normalize_fia_query_metadata(
+            num_tokens,
+            attn_metadata.actual_seq_lengths_q,
+            actual_seq_lengths_kv,
+            block_table,
+        )
         if _EXTRA_CTX.is_draft_model:
             graph_params = get_draft_graph_params()
         else:
             graph_params = get_graph_params()
 
-        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
         use_max_workspace = self._use_max_workspace_for_fia_graph
         workspace = graph_params.workspaces.get(num_tokens)
@@ -1411,7 +1430,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_metadata.actual_seq_lengths_q,
             actual_seq_lengths_kv,
             block_table,
-            attn_metadata.num_actual_tokens,
         )
         if (
             attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
@@ -2124,7 +2142,6 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
             attn_metadata.actual_seq_lengths_q,
             attn_metadata.seq_lens_list,
             attn_metadata.block_tables,
-            attn_metadata.num_actual_tokens,
         )
 
         if num_decode_tokens > 0:
@@ -2231,7 +2248,6 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
             attn_metadata.actual_seq_lengths_q,
             actual_seq_lengths_kv,
             block_table,
-            attn_metadata.num_actual_tokens,
         )
         if (
             attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
