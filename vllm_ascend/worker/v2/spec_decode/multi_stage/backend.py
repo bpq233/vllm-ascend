@@ -153,9 +153,14 @@ def init_secondary_graphs(drafter, mode, device):
     enabled = mode != CUDAGraphMode.NONE
     drafter.update_stream = torch.npu.Stream(device=device) if enabled else None
     # DFlash's parallel query is uniform, including when verifier queries are
-    # ragged. Request its full decode graph separately from verifier piecewise.
-    drafter.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY if enabled else CUDAGraphMode.NONE)
-    if enabled and not drafter.query_cudagraph_manager.needs_capture():
+    # ragged. Request its full decode graph separately from verifier FULL.
+    drafter.init_cudagraph_manager(
+        CUDAGraphMode.FULL_DECODE_ONLY
+        if mode in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL_DECODE_ONLY)
+        else mode
+    )
+    drafter.query_cudagraph_manager.require_full_graph = mode == CUDAGraphMode.FULL
+    if drafter.query_cudagraph_manager.require_full_graph and not drafter.query_cudagraph_manager.needs_capture():
         raise ValueError("Secondary DFlash requires full graph attention support and nonempty capture sizes.")
 
 
@@ -196,7 +201,9 @@ class IntermediateBackend:
         self.vllm_config.additional_config.pop("multi_stage_speculative", None)
         self.vllm_config.compilation_config = CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE if self.graph_enabled else CompilationMode.NONE,
-            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE if self.graph_enabled else CUDAGraphMode.NONE,
+            cudagraph_mode=parent_config.compilation_config.cudagraph_mode
+            if self.graph_enabled
+            else CUDAGraphMode.NONE,
             custom_ops=list(parent_config.compilation_config.custom_ops),
         )
         self.vllm_config.scheduler_config = copy(parent_config.scheduler_config)
@@ -268,6 +275,9 @@ class IntermediateBackend:
             draft_tensor_parallel_size=cfg.parallel_config.tensor_parallel_size,
             draft_sample_method="greedy",
         )
+        # ModelAclGraphManager uses the runner interface for FIA task updates.
+        self.speculative_config = cfg.speculative_config
+        self.dp_size = cfg.parallel_config.data_parallel_size
         if cfg.speculative_config.draft_model_config.max_model_len < self.max_model_len:
             raise ValueError("Set intermediate.max_model_len within the secondary drafter's context limit.")
         if self.max_model_len <= self.config.num_speculative_tokens + 1:
@@ -303,14 +313,15 @@ class IntermediateBackend:
         self.cudagraph_manager = ModelAclGraphManager(
             self.vllm_config,
             self.device,
-            CUDAGraphMode.PIECEWISE,
+            self.vllm_config.compilation_config.cudagraph_mode,
             1,
             self,
         )
         logger.info(
-            "multi_stage_graph_plan verifier=%s verifier_mode=PIECEWISE verifier_sizes=%s "
-            "secondary_mode=FULL_DECODE_ONLY secondary_sizes=%s max_model_len=%d max_num_tokens=%d",
+            "multi_stage_graph_plan verifier=%s verifier_mode=%s verifier_sizes=%s "
+            "secondary_sizes=%s max_model_len=%d max_num_tokens=%d",
             self.config.verifier_model,
+            self.vllm_config.compilation_config.cudagraph_mode,
             self.cudagraph_manager.capture_sizes,
             sorted(
                 {
@@ -438,7 +449,7 @@ class IntermediateBackend:
             rows.append(saved[3][offset : offset + 1])
         return torch.cat(rows, dim=0) if rows else None
 
-    def _forward(self, sequences, req_ids=None, required_starts=None, reuse_context=False):
+    def _forward(self, sequences, req_ids=None, required_starts=None, reuse_context=False, retain_hidden=True):
         n = len(sequences)
         if req_ids is None:
             req_ids = [str(i) for i in range(n)]
@@ -455,30 +466,43 @@ class IntermediateBackend:
             raise ValueError("Intermediate incremental query exceeds the token buffer.")
         manager = self.cudagraph_manager if cached_context is None else None
         desc = manager.dispatch(n, total, None, 0) if manager is not None else None
-        if desc is not None and desc.cg_mode != CUDAGraphMode.PIECEWISE:
-            raise RuntimeError("Intermediate query has no captured piecewise graph; refusing silent eager fallback.")
+        if (
+            desc is not None
+            and self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
+            and desc.cg_mode != CUDAGraphMode.FULL
+        ):
+            raise RuntimeError("Intermediate query has no captured FULL graph; refusing silent eager fallback.")
         padded_total = desc.num_tokens if desc is not None else total
         # Pack CPU-produced inputs/metadata into one pinned H2D transfer. Views
         # stay alive through the queued work; no reusable host buffer can race
         # with an asynchronous copy from a previous microbatch.
-        field_sizes = [n, n, n + 1, total, total, total]
-        host_inputs = torch.empty(sum(field_sizes), dtype=torch.int64, pin_memory=self.device.type != "cpu")
+        # Put all 64-bit fields first to keep every dtype view aligned. Preserve
+        # one H2D while sending lengths/boundaries/token IDs in their real dtype.
+        field_sizes = [n, total, total, n, n, n + 1, total]
+        dtypes = [torch.int64] * 4 + [torch.int32] * 3
+        byte_sizes = [size * (8 if dtype == torch.int64 else 4) for size, dtype in zip(field_sizes, dtypes)]
+        host_inputs = torch.empty(sum(byte_sizes), dtype=torch.uint8, pin_memory=self.device.type != "cpu")
         # numpy() is a view of CPU pinned storage, not a device read. Fill it
         # in bulk instead of materializing multiple Python integers per token.
-        host_fields = np.split(host_inputs.numpy(), np.cumsum(field_sizes)[:-1])
+        host_fields = [
+            field.view(np.int64 if dtype == torch.int64 else np.int32)
+            for field, dtype in zip(np.split(host_inputs.numpy(), np.cumsum(byte_sizes)[:-1]), dtypes)
+        ]
         host_fields[0][:] = cache_slots
-        host_fields[1][:] = lengths
-        host_fields[2][:] = starts
         token_rows_cpu = np.repeat(np.arange(n), query_lens)
-        host_fields[3][:] = token_rows_cpu
-        host_fields[4][:] = np.arange(total) + computed[token_rows_cpu] - starts[token_rows_cpu]
+        host_fields[1][:] = token_rows_cpu
+        host_fields[2][:] = np.arange(total) + computed[token_rows_cpu] - starts[token_rows_cpu]
+        host_fields[3][:] = starts[1:] - 1
+        host_fields[4][:] = lengths
+        host_fields[5][:] = starts
         for row, (sequence, count) in enumerate(zip(sequences, computed)):
-            host_fields[5][starts[row] : starts[row + 1]] = sequence[count:]
-        cache_slots_gpu, lengths_gpu, starts_gpu, token_rows, positions_gpu, ids_gpu = host_inputs.to(
-            self.device, non_blocking=True
-        ).split(field_sizes)
+            host_fields[6][starts[row] : starts[row + 1]] = sequence[count:]
+        device_fields = host_inputs.to(self.device, non_blocking=True).split(byte_sizes)
+        cache_slots_gpu, token_rows, positions_gpu, logits_indices, seq_lens, starts_gpu, ids_gpu = (
+            field.view(dtype) for field, dtype in zip(device_fields, dtypes)
+        )
         for table, cached in zip(self.block_tables.input_block_tables, self.cache_block_tables):
-            table[:n].copy_(cached.index_select(0, cache_slots_gpu))
+            torch.index_select(cached, 0, cache_slots_gpu, out=table[:n])
         positions = self.input_buffers.positions[:total]
         positions.copy_(positions_gpu)
         ids = self.input_buffers.input_ids[:total]
@@ -487,8 +511,6 @@ class IntermediateBackend:
         self.input_buffers.positions[total:padded_total].zero_()
         mapping = self._request_offsets[:n]
         lengths_cpu = torch.from_numpy(lengths)
-        seq_lens = lengths_gpu.int()
-        starts_gpu = starts_gpu.int()
         is_prefilling = computed == 0
         attn_state = (
             AscendAttentionState.PrefillNoCache if np.all(is_prefilling) else AscendAttentionState.ChunkedPrefill
@@ -526,7 +548,7 @@ class IntermediateBackend:
             input_ids=ids,
             positions=positions,
             is_padding=self._query_padding[:total],
-            logits_indices=starts_gpu[1:].long() - 1,
+            logits_indices=logits_indices,
             cu_num_logits=self._request_offsets[: n + 1],
             cu_num_logits_np=np.arange(n + 1, dtype=np.int32),
             has_structured_output_reqs=False,
@@ -571,17 +593,32 @@ class IntermediateBackend:
         padding[:total].fill_(False)
         padding[total:].fill_(True)
         rope.update_cos_sin(model_positions)
+        if desc is not None and desc.cg_mode == CUDAGraphMode.FULL:
+            # FIA's TND query boundaries must cover the captured token shape.
+            # The dummy request reads reserved block 0 and never writes KV:
+            # its slot mappings are -1 and its output is discarded below.
+            if padded_total > total:
+                for item in {id(value): value for value in metadata.values()}.values():
+                    item.actual_seq_lengths_q = [*item.actual_seq_lengths_q, padded_total]
+                    item.seq_lens_list = [*item.seq_lens_list, min(padded_total - total, self.max_model_len)]
+                    item.block_tables = torch.cat((item.block_tables, torch.zeros_like(item.block_tables[:1])))
+            self.model_state.attn_metadata = metadata
         with set_forward_context(
             metadata,
             self.vllm_config,
             num_tokens=padded_total,
             slot_mapping=slots,
             cudagraph_runtime_mode=desc.cg_mode if desc is not None else CUDAGraphMode.NONE,
-            batch_descriptor=BatchDescriptor(num_tokens=padded_total) if desc is not None else None,
+            batch_descriptor=BatchDescriptor(padded_total)
+            if desc is not None and desc.cg_mode == CUDAGraphMode.PIECEWISE
+            else None,
             is_padding=padding,
         ):
             model_inputs = dict(input_ids=self.input_buffers.input_ids[:padded_total], positions=model_positions)
-            if manager is not None:
+            if desc is not None and desc.cg_mode == CUDAGraphMode.FULL:
+                output = manager.run_fullgraph(desc)
+                self.graph_replays += 1
+            elif desc is not None and desc.cg_mode == CUDAGraphMode.PIECEWISE:
                 output = manager.run_pw_graph(self.model, model_inputs)
                 self.graph_replays += 1
             else:
@@ -603,6 +640,11 @@ class IntermediateBackend:
         self.drafter.model.precompute_and_store_context_kv(context_hidden, positions, context_slots)
         self.cache.commit(cache_slots, sequences)
         for row, (req_id, slot, sequence, required) in enumerate(zip(req_ids, cache_slots, sequences, required_starts)):
+            if not retain_hidden:
+                # The last verification round has no following secondary
+                # proposal. Keep KV, but do not copy unused hidden activations.
+                self._context_rows[slot] = None
+                continue
             # Only retain prediction rows, never the full prompt activations.
             # clone owns storage: future graph replay overwrites model outputs.
             begin = int(starts[row]) + required - int(computed[row])
@@ -634,10 +676,10 @@ class IntermediateBackend:
         for req_id, sequence, end, start in zip(req_ids, sequences, required, computed):
             while start < end:
                 start = min(start + chunk, end)
-                self._forward([sequence[:start]], [req_id], [start - 1])
+                self._forward([sequence[:start]], [req_id], [start - 1], retain_hidden=False)
 
     @torch.inference_mode()
-    def verify_batches(self, prefixes, drafts, req_ids=None):
+    def verify_batches(self, prefixes, drafts, req_ids=None, retain_hidden=True):
         if len(prefixes) != len(drafts) or any(not p for p in prefixes):
             raise ValueError("Intermediate verification requires one nonempty prefix per draft.")
         sequences = [p + d for p, d in zip(prefixes, drafts)]
@@ -648,7 +690,7 @@ class IntermediateBackend:
                 required = required_starts[offset : offset + len(rows)]
                 batch_ids = req_ids[offset : offset + len(rows)]
                 self._warm_prefixes(rows, batch_ids, required)
-                batch, _, _, hidden, _ = self._forward(rows, batch_ids, required)
+                batch, _, _, hidden, _ = self._forward(rows, batch_ids, required, retain_hidden=retain_hidden)
                 # On cache hits every forwarded row predicts a candidate/bonus.
                 # Avoid a CPU index list, H2D index copy and device gather there.
                 if np.array_equal(batch.num_computed_tokens_np, required):
@@ -659,18 +701,17 @@ class IntermediateBackend:
                     prediction_hidden = hidden[begin:]
                     prediction_tokens = batch.input_ids[begin:]
                 else:
-                    indices = [
-                        j
-                        for i in range(len(rows))
-                        for j in range(
+                    # Cold/mixed batches have contiguous prediction tails.
+                    # Concatenate views instead of uploading per-token indices.
+                    spans = [
+                        slice(
                             int(batch.query_start_loc_np[i]) + required[i] - int(batch.num_computed_tokens_np[i]),
                             int(batch.query_start_loc_np[i + 1]),
                         )
+                        for i in range(len(rows))
                     ]
-                    host_indices = torch.tensor(indices, dtype=torch.int64, pin_memory=self.device.type != "cpu")
-                    device_indices = host_indices.to(self.device, non_blocking=True)
-                    prediction_hidden = hidden.index_select(0, device_indices)
-                    prediction_tokens = batch.input_ids.index_select(0, device_indices)
+                    prediction_hidden = torch.cat([hidden[span] for span in spans])
+                    prediction_tokens = torch.cat([batch.input_ids[span] for span in spans])
                 logits = self.model.compute_logits(prediction_hidden)
                 # Keep microbatches packed through acceptance, without retaining
                 # batch * draft * vocab storage across forwards.

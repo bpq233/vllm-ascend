@@ -25,7 +25,15 @@ def load_class(filename, name, namespace):
 
 @pytest.fixture
 def backend():
-    metadata = Mock(side_effect=lambda **kw: kw)
+    metadata = Mock(
+        side_effect=lambda **kw: {
+            "layer": NS(
+                actual_seq_lengths_q=kw["query_start_loc_cpu"][1:].tolist(),
+                seq_lens_list=kw["seq_lens_np"].tolist(),
+                block_tables=kw["block_tables"][0],
+            )
+        }
+    )
     rope = NS(update_cos_sin=Mock(), _cos=object())
     namespace = dict(
         torch=torch,
@@ -37,7 +45,8 @@ def backend():
         set_forward_context=lambda *a, **kw: nullcontext(),
         AscendInputBatch=NS,
         AscendAttentionState=NS(PrefillNoCache="prefill", ChunkedPrefill="extend"),
-        CUDAGraphMode=NS(NONE=None),
+        CUDAGraphMode=NS(NONE=None, FULL="full", PIECEWISE="piecewise"),
+        BatchDescriptor=lambda n: NS(num_tokens=n),
         build_attn_metadata=metadata,
         build_slot_mappings_by_layer=lambda slots, config: {"layer": slots[0]},
     )
@@ -55,8 +64,9 @@ def backend():
     obj.executed_tokens = 0
     obj.reused_hidden_tokens = 0
     obj._context_rows = [None] * obj.max_num_reqs
+    obj.model_state = NS()
     obj._init_proposal_scratch()
-    obj.vllm_config, obj.kv_cache_config, obj.attn_groups = NS(), NS(), []
+    obj.vllm_config, obj.kv_cache_config, obj.attn_groups = NS(compilation_config=NS(cudagraph_mode="full")), NS(), []
     obj._rope_state = {"_cos": object()}
     obj.block_tables = NS(
         input_block_tables=[torch.tensor([[1, 2], [3, 4]])],
@@ -91,6 +101,26 @@ def test_verify_alignment_and_request_isolation(backend):
     # A shorter, unrelated request reuses scratch slot 0 without a stale prefix.
     assert list(obj.verify([[7]], [[8]]))[0].tolist() == [[7, 0], [8, 1]]
     assert metadata.call_args.kwargs["seq_lens"].tolist() == [2]
+
+
+@pytest.mark.parametrize("prefixes", [[[2147483647, 16777217, 3]], [[2147483647], [16777217, 5]]])
+def test_packed_input_dtypes_alignment_and_stable_graph_addresses(backend, prefixes):
+    obj, _, _ = backend
+    pointers = (obj.input_buffers.input_ids.data_ptr(), obj.input_buffers.positions.data_ptr())
+    for _ in range(2):
+        batch, *_ = obj._forward(prefixes)
+        assert batch.input_ids.dtype == torch.int32
+        assert batch.positions.dtype == torch.int64
+        assert batch.seq_lens.dtype == batch.query_start_loc.dtype == torch.int32
+        assert batch.logits_indices.dtype == torch.int64
+        assert batch.logits_indices.tolist() == (batch.query_start_loc_np[1:] - 1).tolist()
+        expected = [t for p, c in zip(prefixes, batch.num_computed_tokens_np) for t in p[c:]]
+        assert batch.input_ids.tolist() == expected
+        assert pointers == (batch.input_ids.data_ptr(), batch.positions.data_ptr())
+        # Metadata is reinterpreted from a single transfer, not dtype copies.
+        storage = batch.seq_lens.untyped_storage().data_ptr()
+        assert batch.query_start_loc.untyped_storage().data_ptr() == storage
+        assert batch.logits_indices.untyped_storage().data_ptr() == storage
 
 
 def test_secondary_uses_last_token_as_anchor_and_excludes_it_from_context(backend):
@@ -138,6 +168,8 @@ def test_adapter_replaces_only_candidate_buffer_and_publishes_real_lengths():
     history = torch.tensor([[1, 2, 3, 4, 0], [5, 6, 0, 0, 0]])
     obj.req_states = NS(
         total_len=NS(gpu=torch.tensor([4, 2])),
+        num_computed_tokens=NS(gpu=torch.tensor([3, 2])),
+        num_computed_tokens_cpu=torch.zeros(2, dtype=torch.int32),
         all_token_ids=NS(gpu=history),
         max_seq_len=np.array([16, 16]),
         prefill_len=NS(np=np.array([3, 2])),
@@ -230,6 +262,20 @@ def test_cold_prompt_retains_only_prediction_context(backend):
     assert saved[3].shape[0] == 3
 
 
+def test_final_round_drops_hidden_but_preserves_incremental_kv(backend):
+    obj, _, _ = backend
+    list(obj.verify([[1, 2]], [[3, 4]], req_ids=["a"]))
+    assert obj._context_rows[obj.cache.slots["a"]] is not None
+    list(obj.verify_batches([[1, 2, 3]], [[5]], req_ids=["a"], retain_hidden=False))
+    assert obj._context_rows[obj.cache.slots["a"]] is None
+    assert obj.cache.tokens[obj.cache.slots["a"]] == [1, 2, 3, 5]
+    # Target rejects 5 and supplies 7: next cycle reuses the accepted prefix.
+    before = obj.forward_tokens
+    list(obj.verify([[1, 2, 3, 7]], [[8]], req_ids=["a"]))
+    assert obj.forward_tokens - before == 2
+    assert obj._context_rows[obj.cache.slots["a"]] is not None
+
+
 def test_sparse_graph_gap_warms_context_without_large_padding(backend):
     obj, metadata, _ = backend
     obj.max_model_len = obj.max_num_tokens = 128
@@ -241,12 +287,13 @@ def test_sparse_graph_gap_warms_context_without_large_padding(backend):
         positions=torch.empty(128, dtype=torch.int64),
         is_padding=torch.empty(128, dtype=torch.bool),
     )
-    obj._forward.__globals__["CUDAGraphMode"].PIECEWISE = "piecewise"
-    obj._forward.__globals__["BatchDescriptor"] = NS
     obj.cudagraph_manager = NS(
         capture_sizes=[8, 128],
-        dispatch=lambda n, total, *a: NS(cg_mode="piecewise", num_tokens=8 if total <= 8 else 128),
-        run_pw_graph=lambda model, inputs: model(**inputs),
+        dispatch=lambda n, total, *a: NS(cg_mode="full", num_tokens=8 if total <= 8 else 128),
+        run_fullgraph=lambda desc: obj.model(
+            input_ids=obj.input_buffers.input_ids[: desc.num_tokens],
+            positions=obj.input_buffers.positions[: desc.num_tokens],
+        ),
     )
     values = torch.zeros(28)
 
@@ -324,17 +371,26 @@ def test_host_history_delta_reorder_growth_and_slot_reuse():
     obj.final_capacity = 2
     history = torch.arange(24).reshape(2, 12)
     lengths = torch.tensor([6, 4])
-    obj.req_states = NS(total_len=NS(gpu=lengths), all_token_ids=NS(gpu=history), req_id_to_index={"a": 0, "b": 1})
+    obj.req_states = NS(
+        total_len=NS(gpu=lengths),
+        num_computed_tokens=NS(gpu=torch.tensor([5, 3])),
+        num_computed_tokens_cpu=torch.full((2,), -1, dtype=torch.int32),
+        all_token_ids=NS(gpu=history),
+        req_id_to_index={"a": 0, "b": 1},
+    )
     batch = NS(idx_mapping=torch.tensor([0, 1]), idx_mapping_np=np.array([0, 1]), req_ids=["a", "b"])
     drafts = torch.tensor([[7, 8], [9, 10]])
     assert obj._read_step(batch, drafts) == ([6, 4], [list(range(6)), list(range(12, 16))], drafts.tolist())
+    assert obj.req_states.num_computed_tokens_cpu.tolist() == [5, 3]
     # Poison the device prefix to prove the warm path does not transfer it.
     history[:, :2] = -99
     lengths[:] = torch.tensor([8, 5])
     batch.idx_mapping = torch.tensor([1, 0])
     batch.idx_mapping_np = np.array([1, 0])
     batch.req_ids = ["b", "a"]
+    obj.req_states.num_computed_tokens.gpu[:] = torch.tensor([7, 4])
     assert obj._read_step(batch, drafts)[1] == [list(range(12, 17)), list(range(8))]
+    assert obj.req_states.num_computed_tokens_cpu.tolist() == [7, 4]
     # A large prefill jump must read the full row rather than lose tokens.
     lengths[1] = 10
     assert obj._read_step(batch, drafts)[1][0] == history[1, :10].tolist()
@@ -383,11 +439,14 @@ def test_cached_causal_output_matches_full_prefix_after_rejection(backend):
 def test_intermediate_graph_padding_keeps_real_kv_and_logits(backend):
     obj, metadata, _ = backend
     # A captured 8-token gear serves a real 5-token query.
-    obj._forward.__globals__["CUDAGraphMode"].PIECEWISE = "piecewise"
-    obj._forward.__globals__["BatchDescriptor"] = NS
     obj.cudagraph_manager = NS(
-        dispatch=Mock(return_value=NS(cg_mode="piecewise", num_tokens=8)),
-        run_pw_graph=Mock(side_effect=lambda model, inputs: model(**inputs)),
+        dispatch=Mock(return_value=NS(cg_mode="full", num_tokens=8)),
+        run_fullgraph=Mock(
+            side_effect=lambda desc: obj.model(
+                input_ids=obj.input_buffers.input_ids[: desc.num_tokens],
+                positions=obj.input_buffers.positions[: desc.num_tokens],
+            )
+        ),
     )
     result = list(obj.verify([[1, 2]], [[3, 4, 5]], req_ids=["a"]))
     assert result[0].tolist() == [[2, 1], [3, 2], [4, 3], [5, 4]]
@@ -399,6 +458,10 @@ def test_intermediate_graph_padding_keeps_real_kv_and_logits(backend):
     assert obj.graph_replays == 1
     assert obj.forward_tokens == 5
     assert obj.executed_tokens == 8
+    assert obj.model_state.attn_metadata["layer"].actual_seq_lengths_q == [5, 8]
+    assert obj.model_state.attn_metadata["layer"].seq_lens_list == [5, 3]
+    assert obj.model_state.attn_metadata["layer"].block_tables[-1].tolist() == [0, 0]
+    obj.cudagraph_manager.run_fullgraph.assert_called_once()
 
 
 def test_prediction_hidden_uses_views_for_single_request_and_cached_batch(backend):
@@ -441,11 +504,26 @@ def test_proposal_scratch_addresses_stay_stable_across_batch_sizes(backend):
 
 def test_missing_intermediate_graph_fails_instead_of_silent_eager(backend):
     obj, _, _ = backend
-    obj._forward.__globals__["CUDAGraphMode"].PIECEWISE = "piecewise"
     obj.cudagraph_manager = NS(dispatch=Mock(return_value=NS(cg_mode=None)))
     with pytest.raises(RuntimeError, match="refusing silent eager"):
         list(obj.verify([[1]], [[2]], req_ids=["a"]))
     obj.model.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", [None, "piecewise"])
+def test_configured_non_full_path_preserves_predictions(backend, mode):
+    obj, _, _ = backend
+    obj.vllm_config.compilation_config.cudagraph_mode = mode
+    obj.cudagraph_manager = NS(
+        dispatch=Mock(return_value=NS(cg_mode=mode, num_tokens=5)),
+        run_fullgraph=Mock(side_effect=AssertionError("Unexpected FULL replay")),
+        run_pw_graph=Mock(side_effect=lambda model, inputs: model(**inputs)),
+    )
+    result = list(obj.verify([[1, 2]], [[3, 4, 5]], req_ids=["a"]))
+    assert result[0].tolist() == [[2, 1], [3, 2], [4, 3], [5, 4]]
+    assert obj.graph_replays == int(mode == "piecewise")
+    assert obj.cudagraph_manager.run_pw_graph.call_count == int(mode == "piecewise")
+    obj.cudagraph_manager.run_fullgraph.assert_not_called()
 
 
 @pytest.mark.parametrize("mismatch", [None, 0, 1023, 1024, 2047, 4095, 4096])

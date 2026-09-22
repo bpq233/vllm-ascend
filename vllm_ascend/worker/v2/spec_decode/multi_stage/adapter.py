@@ -4,6 +4,7 @@ import logging
 from copy import copy
 
 import torch
+from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.outputs import DraftTokenIds
 
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import AscendDFlashSpeculator
@@ -17,6 +18,10 @@ logger = logging.getLogger(__name__)
 class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
     """An output adapter: the original DFlash propose runs unchanged."""
 
+    # The synchronous propose path publishes committed progress along with its
+    # existing D2H. The runner must not enqueue a second progress-only transfer.
+    updates_computed_tokens_cpu = True
+
     def __init__(self, vllm_config, device):
         options = vllm_config.additional_config["multi_stage_speculative"]
         self.final_capacity = vllm_config.speculative_config.num_speculative_tokens
@@ -29,6 +34,12 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
         self.req_ids = []
         self._host_histories = {}
 
+    def init_cudagraph_manager(self, cudagraph_mode):
+        super().init_cudagraph_manager(cudagraph_mode)
+        self.query_cudagraph_manager.require_full_graph = cudagraph_mode == CUDAGraphMode.FULL
+        if self.query_cudagraph_manager.require_full_graph and not self.query_cudagraph_manager.needs_capture():
+            raise ValueError("Primary DFlash requires FULL graphs with nonempty capture sizes.")
+
     def _read_step(self, input_batch, primary):
         """One bounded D2H for warm requests; read full history only on a miss."""
         histories = getattr(self, "_host_histories", {})
@@ -36,6 +47,7 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
         histories = {key: value for key, value in histories.items() if key in live}
         indices = input_batch.idx_mapping
         lengths_gpu = self.req_states.total_len.gpu[indices]
+        computed_gpu = self.req_states.num_computed_tokens.gpu[indices]
         source = self.req_states.all_token_ids.gpu
         width = min(self.final_capacity + 1, source.shape[1])
         offsets = getattr(self, "_history_offsets", None)
@@ -43,7 +55,11 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
             offsets = self._history_offsets = torch.arange(width, device=primary.device)
         positions = (lengths_gpu[:, None] - width + offsets).clamp(min=0)
         tails = source[indices[:, None], positions.long()]
-        packed = torch.cat((lengths_gpu[:, None], primary, tails), dim=1).cpu().tolist()
+        packed_cpu = torch.cat((lengths_gpu[:, None], computed_gpu[:, None], primary, tails), dim=1).cpu()
+        # Publish only real request rows; unused/recycled slots must retain
+        # their add_request state. numpy() views already completed CPU storage.
+        self.req_states.num_computed_tokens_cpu.numpy()[input_batch.idx_mapping_np] = packed_cpu.numpy()[:, 1]
+        packed = packed_cpu.tolist()
         missing = [
             (req_id, int(index), int(row[0]))
             for req_id, index, row in zip(input_batch.req_ids, input_batch.idx_mapping_np, packed)
@@ -68,7 +84,7 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
                 prefix.extend(row[-delta:])
             lengths.append(length)
             prefixes.append(prefix)
-            drafts.append(row[1 : 1 + primary.shape[1]])
+            drafts.append(row[2 : 2 + primary.shape[1]])
         self._host_histories = histories
         return lengths, prefixes, drafts
 

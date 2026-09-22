@@ -7,6 +7,7 @@ import importlib.util
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -24,8 +25,8 @@ def config(width=32, enabled=True):
         speculative_config=NS(num_speculative_tokens=width, method="dflash"),
         additional_config={"multi_stage_speculative": {"intermediate": {"num_rounds": 4}}} if enabled else {},
         model_config=NS(runner_type="generate", max_model_len=256, enforce_eager=False),
-        compilation_config=NS(cudagraph_mode=GraphMode.FULL_AND_PIECEWISE, splitting_ops=[]),
-        scheduler_config=NS(enable_chunked_prefill=False),
+        compilation_config=NS(cudagraph_mode=GraphMode.FULL, splitting_ops=[], cudagraph_capture_sizes=[16, 64]),
+        scheduler_config=NS(enable_chunked_prefill=False, max_num_batched_tokens=256, max_num_seqs=4),
     )
 
 
@@ -47,6 +48,52 @@ def function(path, name, namespace):
     tree.body = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name]
     exec(compile(tree, str(path), "exec"), namespace)
     return namespace[name]
+
+
+@pytest.mark.parametrize("mode", ["plain", "dflash", "multi_stage"])
+@pytest.mark.parametrize("empty", [False, True])
+def test_progress_boundary_preserves_reordered_new_and_inactive_rows(mode, empty):
+    tree = ast.parse((ROOT / "worker/v2/model_runner.py").read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "NPUModelRunner")
+    cls.body = [
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name in ("postprocess_sampled", "_update_seq_lens_cpu")
+    ]
+    base = type("Base", (), {"postprocess_sampled": Mock()})
+    cls.bases = [ast.Name(id="Base", ctx=ast.Load())]
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), cls],
+        type_ignores=[],
+    )
+    ns = dict(Base=base, np=np)
+    exec(compile(ast.fix_missing_locations(module), "progress", "exec"), ns)
+    runner = ns["NPUModelRunner"]()
+    runner.speculator = None if mode == "plain" else NS(updates_computed_tokens_cpu=mode == "multi_stage")
+    runner._copy_num_computed_tokens_to_cpu = Mock()
+    runner.num_computed_tokens_event = NS(synchronize=Mock())
+    # Multi-stage's combined D2H already published the committed progress.
+    runner.req_states = NS(
+        req_id_to_index={"a": 0, "new": 1, "b": 2, "idle": 3},
+        num_computed_tokens_cpu=torch.tensor(
+            [7, 3, 9, 99] if mode == "multi_stage" else [-7, 3, -9, 99], dtype=torch.int32
+        ),
+        num_computed_tokens_np=np.array([7, 300, 9, 999], dtype=np.int32),
+    )
+    runner.num_computed_tokens_cpu = torch.tensor([7, 300, 9, 999], dtype=torch.int32)
+    runner.input_buffers = NS(seq_lens_cpu=torch.full((5,), -1, dtype=torch.int32))
+    runner.postprocess_sampled(None, None, None, None)
+    base.postprocess_sampled.assert_called_once()
+    assert runner._copy_num_computed_tokens_to_cpu.call_count == int(mode == "dflash")
+    scheduler = NS(
+        scheduled_cached_reqs=NS(req_ids=[] if empty else ["a", "b"]),
+        num_scheduled_tokens={"b": 4, "new": 2, "a": 1},
+    )
+    runner._update_seq_lens_cpu(scheduler, [] if empty else ["b", "new", "a"])
+    assert runner.num_computed_tokens_event.synchronize.call_count == int(mode == "dflash")
+    expected_progress = [-7, 3, -9, 99] if empty and mode != "multi_stage" else [7, 3, 9, 99]
+    assert runner.req_states.num_computed_tokens_cpu.tolist() == expected_progress
+    assert runner.input_buffers.seq_lens_cpu.tolist() == ([-1] * 5 if empty else [13, 5, 8, -1, -1])
 
 
 STATES = NS(
@@ -157,13 +204,13 @@ def test_both_graph_manager_versions_capture_long_target_piecewise():
         )
         ns["target_graph_mode"] = function("worker/v2/aclgraph_utils.py", "target_graph_mode", ns)
         exec(compile(ast.fix_missing_locations(module), "graph_manager", "exec"), ns)
-        assert ns["Manager"](config(), "cpu", GraphMode.FULL, 33, NS(update_stream=None)).mode == GraphMode.PIECEWISE
+        assert ns["Manager"](config(), "cpu", GraphMode.FULL, 33, NS(update_stream=None)).mode == GraphMode.FULL
         assert ns["Manager"](config(4), "cpu", GraphMode.FULL, 5, NS(update_stream=None)).mode == GraphMode.FULL
         assert ns["Manager"](config(), "cpu", GraphMode.NONE, 33, NS(update_stream=None)).mode == GraphMode.NONE
         cfg = config()
-        cfg.compilation_config.cudagraph_mode = GraphMode.FULL
-        with pytest.raises(ValueError, match="before model loading"):
-            ns["Manager"](cfg, "cpu", GraphMode.FULL, 33, NS(update_stream=None))
+        cfg.compilation_config.cudagraph_mode = GraphMode.PIECEWISE
+        for mode in GraphMode:
+            assert ns["Manager"](cfg, "cpu", mode, 33, NS(update_stream=None)).mode == mode
 
 
 @pytest.mark.parametrize("mode", list(GraphMode))
@@ -173,7 +220,12 @@ def test_graph_config_prepares_compilation_and_keeps_draft_full_mode(mode, width
     tree = ast.parse((ROOT / "worker/v2/spec_decode/multi_stage/config.py").read_text(encoding="utf-8"))
     fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "configure_long_target_graphs")
     fn.body = [n for n in fn.body if not isinstance(n, ast.ImportFrom)]
-    ns = dict(CUDAGraphMode=GraphMode, CompilationMode=NS(VLLM_COMPILE="compile"), **vars(routing))
+    ns = dict(
+        CUDAGraphMode=GraphMode,
+        CompilationMode=NS(VLLM_COMPILE="compile"),
+        primary_draft_width=lambda options, width: 4 if width > 15 else width,
+        **vars(routing),
+    )
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "configure_graphs", "exec"), ns)
     cfg = config(width)
     cfg.model_config.enforce_eager = eager
@@ -181,16 +233,10 @@ def test_graph_config_prepares_compilation_and_keeps_draft_full_mode(mode, width
     cfg.compilation_config.mode = "original"
     cfg.compilation_config.splitting_ops = splits
     ns["configure_long_target_graphs"](cfg)
-    enabled = width == 32 and not eager and mode != GraphMode.NONE
-    expected = GraphMode.FULL_AND_PIECEWISE if enabled and mode.has_full_cudagraphs() else mode
-    assert cfg.compilation_config.cudagraph_mode == expected
-    assert cfg.compilation_config.mode == ("compile" if enabled else "original")
-    if enabled:
-        assert cfg.compilation_config.splitting_ops == (
-            [*splits, "vllm::unified_attention_with_output"] if splits else None
-        )
-    else:
-        assert cfg.compilation_config.splitting_ops == splits
+    assert cfg.compilation_config.cudagraph_mode == mode
+    assert cfg.compilation_config.mode == "original"
+    assert cfg.compilation_config.splitting_ops == splits
+    assert cfg.compilation_config.cudagraph_capture_sizes == [16, 64]
 
 
 def test_both_runner_versions_sort_short_queries_before_long_candidates():

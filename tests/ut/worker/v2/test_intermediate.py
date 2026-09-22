@@ -37,8 +37,10 @@ class Backend:
         self.verification = iter(verification)
         self.proposals = iter(proposals)
         self.calls = []
+        self.retain_hidden = []
 
-    def verify_batches(self, contexts, drafts, req_ids=None):
+    def verify_batches(self, contexts, drafts, req_ids=None, retain_hidden=True):
+        self.retain_hidden.append(retain_hidden)
         self.calls.append(("verify", contexts, drafts))
         rows = next(self.verification)
         yield torch.cat([scores(row) for row in rows]), [len(row) for row in rows]
@@ -58,6 +60,7 @@ def test_three_rounds_preserve_primary_and_use_only_accepted_context(modules):
     primary, prefixes = [[1, 2]], [[20]]
     result = Pipeline(backend, options, capacity=8).refine(prefixes, primary, [8])
     assert result == [[1, 7, 3, 4, 5, 9, 10]]
+    assert backend.retain_hidden == [True, True, False]
     assert primary == [[1, 2]]
     assert prefixes == [[20]]
     assert backend.calls == [

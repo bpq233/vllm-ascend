@@ -80,7 +80,7 @@ class TestAcceptancePolicy(unittest.TestCase):
     def test_batched_prefix_matches_sequential_reference(self):
         rng = torch.Generator().manual_seed(71)
         lengths = [1, 5, 3, 2, 4]
-        boundaries = torch.tensor([0, *np.cumsum(lengths)])
+        boundaries = torch.tensor([0, *np.cumsum(lengths)], dtype=torch.int32)
         logits = torch.randn(sum(lengths), 7, generator=rng)
         drafts = torch.randint(7, (sum(lengths),), generator=rng)
         # Distinct supplied samples verify replacement uses target sampling,

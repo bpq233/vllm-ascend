@@ -27,7 +27,9 @@ def graph_helpers():
         contextmanager=contextmanager,
         acl_graph=params,
         torch=NS(npu=NS(Stream=stream)),
-        CUDAGraphMode=NS(NONE="none", FULL_DECODE_ONLY="full_decode"),
+        CUDAGraphMode=NS(
+            NONE="none", FULL="full", FULL_AND_PIECEWISE="full_and_piecewise", FULL_DECODE_ONLY="full_decode"
+        ),
     )
     exec(compile(tree, str(path), "exec"), namespace)
     return NS(**namespace)
@@ -97,4 +99,42 @@ def test_requested_graphs_do_not_silently_fall_back(graph_helpers):
     h = graph_helpers
     drafter = NS(query_cudagraph_manager=NS(needs_capture=lambda: False), init_cudagraph_manager=Mock())
     with pytest.raises(ValueError, match="full graph attention support"):
-        h.init_secondary_graphs(drafter, "full_and_piecewise", "npu:0")
+        h.init_secondary_graphs(drafter, "full", "npu:0")
+
+
+@pytest.mark.parametrize("draft", [False, True])
+def test_full_graph_dispatch_rejects_piecewise_and_eager_after_capture(draft):
+    root = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2"
+    path = root / ("spec_decode/dflash/aclgraph.py" if draft else "aclgraph_utils.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    name = "DFlashAclGraphManager" if draft else "ModelAclGraphManager"
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name)
+    cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "dispatch"]
+    cls.bases = [ast.Name(id="Base", ctx=ast.Load())]
+
+    class Base:
+        def dispatch(self, desc):
+            return desc
+
+    ns = dict(Base=Base, CUDAGraphMode=NS(FULL="full"))
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), "dispatch", "exec"), ns)
+    manager = ns[name]()
+    manager._graphs_captured = True
+    manager.require_full_graph = True
+    manager.vllm_config = NS(
+        compilation_config=NS(cudagraph_mode="full"),
+        model_config=NS(enforce_eager=False),
+        additional_config={"multi_stage_speculative": {"intermediate": {"verifier": "v"}}},
+    )
+    full = NS(cg_mode="full", num_tokens=55)
+    assert manager.dispatch(full) is full
+    for mode in (None, "piecewise"):
+        with pytest.raises(RuntimeError, match="refusing eager/PIECEWISE"):
+            manager.dispatch(NS(cg_mode=mode, num_tokens=55))
+    # Initialization warmups and ordinary non-multi-stage paths keep their API.
+    manager._graphs_captured = False
+    assert manager.dispatch(NS(cg_mode=None, num_tokens=55)).cg_mode is None
+    manager._graphs_captured = True
+    manager.require_full_graph = False
+    manager.vllm_config.additional_config = {}
+    assert manager.dispatch(NS(cg_mode=None, num_tokens=55)).cg_mode is None

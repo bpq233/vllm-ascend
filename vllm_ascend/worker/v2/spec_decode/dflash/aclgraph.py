@@ -24,6 +24,19 @@ from vllm_ascend.worker.v2.utils import communicator_switch
 
 
 class DFlashAclGraphManager(DFlashCudaGraphManager):
+    require_full_graph = False
+
+    def dispatch(self, *args, **kwargs):
+        desc = super().dispatch(*args, **kwargs)
+        if (
+            self.require_full_graph
+            and self._graphs_captured
+            and desc.num_tokens > 0
+            and desc.cg_mode != CUDAGraphMode.FULL
+        ):
+            raise RuntimeError("Multi-stage DFlash requires a captured FULL graph; refusing eager/PIECEWISE fallback.")
+        return desc
+
     def __init__(
         self,
         vllm_config: VllmConfig,

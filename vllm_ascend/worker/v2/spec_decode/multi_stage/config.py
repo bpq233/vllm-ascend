@@ -31,35 +31,35 @@ def primary_draft_width(options, final_capacity):
 
 
 def configure_long_target_graphs(vllm_config):
-    """Enable attention splitting before compilation and graph sizing.
-
-    The target manager uses PIECEWISE for variable cached-prefill queries.
-    Keep FULL decode enabled at the config level so the independent DFlash
-    manager still captures its short, uniform queries and gets an update stream.
-    """
-    from vllm.config import CompilationMode
+    """Supply sparse FULL defaults without overriding explicit user settings."""
     from vllm.config.compilation import CUDAGraphMode
 
-    from vllm_ascend.attention.spec_decode import uses_long_speculative_queries
-
     compilation = vllm_config.compilation_config
+    options = (vllm_config.additional_config or {}).get("multi_stage_speculative", {})
+    intermediate = options.get("intermediate")
+    if not intermediate or intermediate.get("num_rounds", 3) <= 0:
+        return
     if (
-        not uses_long_speculative_queries(vllm_config)
-        or vllm_config.model_config.enforce_eager
-        or compilation.cudagraph_mode == CUDAGraphMode.NONE
+        vllm_config.model_config.enforce_eager
+        or compilation.cudagraph_mode != CUDAGraphMode.FULL
+        or compilation.cudagraph_capture_sizes is not None
+        or getattr(compilation, "max_cudagraph_capture_size", None) is not None
     ):
         return
-    if compilation.cudagraph_mode.has_full_cudagraphs():
-        compilation.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
-    compilation.mode = CompilationMode.VLLM_COMPILE
-    # FULL configurations may already carry an empty split list. Upstream
-    # otherwise silently resolves FULL_AND_PIECEWISE back to FULL, leaving no
-    # compiled pieces to capture. Preserve custom splits and add the dynamic
-    # attention boundary; None lets upstream install its complete default set.
-    if not compilation.splitting_ops:
-        compilation.splitting_ops = None
-    elif "vllm::unified_attention_with_output" not in compilation.splitting_ops:
-        compilation.splitting_ops = [*compilation.splitting_ops, "vllm::unified_attention_with_output"]
+    # Cover scheduled prefill and the independent primary draft shape. When
+    # defaults have not been resolved yet, use sparse gears, not just one huge
+    # bucket (which could leave DFlash with no capturable decode descriptor).
+    maximum = vllm_config.scheduler_config.max_num_batched_tokens
+    sizes = set(compilation.cudagraph_capture_sizes or [1])
+    if not compilation.cudagraph_capture_sizes:
+        size = 16
+        while size < maximum:
+            sizes.add(size)
+            size *= 4
+    width = primary_draft_width(options, vllm_config.speculative_config.num_speculative_tokens)
+    sizes.update((maximum, min(maximum, vllm_config.scheduler_config.max_num_seqs * (width + 1))))
+    compilation.cudagraph_capture_sizes = sorted(sizes)
+    compilation.max_cudagraph_capture_size = max(compilation.cudagraph_capture_sizes)
 
 
 @dataclass

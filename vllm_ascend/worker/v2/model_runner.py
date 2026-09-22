@@ -743,9 +743,10 @@ class NPUModelRunner(GPUModelRunner):
             query_start_loc,
         )
 
-        # Skip D2H copy without MTP: num_computed_tokens_cpu is synced
-        # from num_computed_tokens_np in _update_seq_lens_cpu instead.
-        if self.speculator is not None:
+        # Ordinary speculation needs progress D2H after rejection. Multi-stage
+        # publishes it in propose's combined D2H; without speculation the CPU
+        # scheduler metadata is authoritative.
+        if self.speculator is not None and not getattr(self.speculator, "updates_computed_tokens_cpu", False):
             self._copy_num_computed_tokens_to_cpu()
 
     def _copy_num_computed_tokens_to_cpu(self):
@@ -768,24 +769,29 @@ class NPUModelRunner(GPUModelRunner):
         req_ids: list[str],
     ):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        cached_indices = np.fromiter(
+            (self.req_states.req_id_to_index[r] for r in scheduler_output.scheduled_cached_reqs.req_ids),
+            dtype=np.intp,
+        )
+        computed = self.req_states.num_computed_tokens_cpu.numpy()
 
         # MTP needs D2H copy to get reverted num_computed_tokens after rejection.
         # Without MTP, num_computed_tokens_np is already correct from update_requests.
         if self.speculator is not None:
-            self.num_computed_tokens_event.synchronize()
-            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
-                req_index = self.req_states.req_id_to_index[req_id]
-                self.req_states.num_computed_tokens_cpu[req_index] = self.num_computed_tokens_cpu[req_index]
+            if not getattr(self.speculator, "updates_computed_tokens_cpu", False):
+                self.num_computed_tokens_event.synchronize()
+                computed[cached_indices] = self.num_computed_tokens_cpu.numpy()[cached_indices]
+            # Multi-stage propose already published these rows in its combined
+            # blocking D2H. Waiting on the unused copy event is unnecessary.
         else:
-            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
-                req_index = self.req_states.req_id_to_index[req_id]
-                self.req_states.num_computed_tokens_cpu[req_index] = self.req_states.num_computed_tokens_np[req_index]
+            computed[cached_indices] = self.req_states.num_computed_tokens_np[cached_indices]
 
         # update seq_lens_cpu
-        for i, req_id in enumerate(req_ids):  # type: ignore
-            req_index = self.req_states.req_id_to_index[req_id]
-            num_computed_tokens = self.req_states.num_computed_tokens_cpu[req_index]
-            self.input_buffers.seq_lens_cpu[i] = num_computed_tokens + num_scheduled_tokens[req_id]
+        indices = np.fromiter((self.req_states.req_id_to_index[r] for r in req_ids), dtype=np.intp)
+        scheduled = np.fromiter((num_scheduled_tokens[r] for r in req_ids), dtype=np.int32)
+        # These are CPU storage views. Avoid per-request tensor scalar copies
+        # and dtype promotions at every Target -> next-decode boundary.
+        np.add(computed[indices], scheduled, out=self.input_buffers.seq_lens_cpu.numpy()[: len(req_ids)])
 
     def _pad_query_start_loc_for_fia(
         self,

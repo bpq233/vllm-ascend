@@ -22,6 +22,26 @@
 
 设备 token 只在 `verify_batches` 当前 yield 期间有效，恢复生成器后即清除引用，防止下一次图重放覆盖后误用。异步 H2D 的 pinned 源仍按调用独立分配，避免未经 event 保护的主机缓冲区复用造成数据竞争。CPU 控制循环、EOS/长度裁剪、前缀比较和 scheduler 发布仍存在；当前实现不能宣称全流水线已图捕获，也不能以 CPU 测试推断 NPU 加速比。
 
+## `aten::to` / `_to_copy` / `copy_` 专项检查
+
+`backend._forward` 原先把长度、query 边界和 token 全部作为 int64 上传，再转换成 attention 所需的 int32。现在将 int64 索引/位置与 int32 长度/边界/token 按对齐字节布局打包，一次 H2D 后通过 dtype view 解释，共享存储而不做数值转换。图模型的 input IDs/positions 仍写入原固定地址，避免图重放读取旧输入。block table 改为 `index_select(..., out=table[:n])`，消除临时结果后的显式 copy。
+
+最终验收将 MRV2 的 int32 累积边界统一转换一次为 int64，后续索引和 mask 复用该类型，避免各表达式反复隐式提升。`aten::to` 本身不一定复制；需结合子事件 `_to_copy`、输入 dtype/device 和调用栈判断。Triton kernel 内的 `.to(tl.int32)` 不等于 Python 层 tensor 搬运。
+
+CPU stand-in 单次 warm `_forward` 的同输入算子追踪：`aten::to` 6→3，`aten::_to_copy` 3→0，`aten::copy_` 10→6。这只证明该调用路径减少转换，不是 NPU 全模型统计或加速比。CPU 模型替身、block table dtype 与真机不同。新增 NPU 用例 `test_packed_metadata_views_and_block_table_out_on_npu` 验证混合 dtype 视图、整数精度和 out 写入，完整多级图用例继续验证动态请求与图重放；本地无 NPU，尚未执行这些硬件用例。
+
+必须保留的复制：异步 H2D、固定图输入更新、与图输出解耦的 hidden clone，以及 CPU 轮次控制所需的小结果 D2H。删除这些操作前必须替换其数据所有权/控制机制，不能只为降低 profiler 的 copy 计数而删掉。
+
+## 中间轮次与 Target 周期边界
+
+`NPUModelRunner._update_seq_lens_cpu` 原先按请求逐项读写 CPU tensor，并计算标量加法。64 请求的 CPU profiler 对照中，单次该函数包含 192 次 `aten::copy_`、64 次 `aten::_to_copy`、64 次 `aten::add`。现在在原 CPU storage 的 NumPy 视图上批量更新，相同输入下上述三项均为 0（保留两次 `.numpy()` 对应的无复制 `aten::to`）。这部分是 CPU 小操作，不能把 profiler 中这些 copy 全算成 NPU DMA。
+
+多级 adapter 的同步 `_read_step` 同时回传 `num_computed_tokens`，按 request index 发布至 runner 的 CPU 状态。`updates_computed_tokens_cpu` 仅由该 adapter 声明，runner 因此不再另行回传整个进度缓冲区，也不等待对应的独立 event。普通 DFlash 保留原异步进度回传和等待，无投机路径继续使用 scheduler 元数据。仅更新实际请求行，保持新请求、未调度槽位和请求重排的语义；不能把这一约定直接移植到异步调度器。
+
+中间最后一轮 `retain_hidden=False`，删除无后续 Secondary 消费者的预测 hidden clone，并清除旧引用；KV 写入仍执行，下一次 Target 接受/拒绝后继续校验前缀并增量复用。稀疏图的前缀预热同样不保存无用 hidden。其余轮次仍保留独立 hidden 存储，防止图输出被覆盖。
+
+CPU 回归覆盖普通/多级/无投机分支、空批次、请求重排、新请求/未调度槽位、最后一轮后 Target 拒绝及下一周期 KV 复用。NPU DMA 时长和完整周期吞吐尚需真机验证。
+
 ## 配置
 
 启用 MRV2（`VLLM_USE_V2_MODEL_RUNNER=1`），使用同步调度（`--no-async-scheduling`）。例如：
@@ -67,7 +87,7 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /models/Qwen-8B \
 
 cached-prefill 复用 `attention_v1` 的 paged FIA：Q 长度为累计 query 长度，KV 长度为各请求的有效总长度，`block_table` 指向已有前缀，右下因果遮罩使用 `sparse_mode=3`。同一 FIA 接口由实际 query 形状执行多 token prefill，未提高 Decode kernel 的上限，也不重新计算正式前缀。该路径限制为 full-attention Target 和未量化 Target KV；MLA、混合状态模型不在首版范围内。参数语义参见 [TorchNPU FIA 文档](https://www.hiascend.com/document/detail/en/Pytorch/2610/apiref/customapi/docs/en/custom_APIs/torch_npu/torch_npu-npu_fused_infer_attention_score.md)。
 
-长容量配置在启用图时，Target 使用 PIECEWISE 分段图：动态 paged attention 留在图外，其余模型计算按捕获的 token 桶重放。编译配置在模型加载前设置 attention 分割边界；Primary DFlash 继续使用独立的短 query 图管理器。显式 enforce_eager/NONE 仍关闭图，容量不超过 15 的原配置保持原图行为。NPU 集成测试检查实际捕获、重放调用以及重复生成时没有新增捕获。
+图执行遵循 `enforce_eager`、`cudagraph_mode` 和显式 Target 捕获桶配置，允许 eager 和 NONE。设置 `compilation_config={"cudagraph_mode": "FULL"}` 可捕获四个模型的 forward（包含 attention）。只有未指定 FULL 捕获范围时才补充稀疏默认桶。NPU 集成测试覆盖 eager 和 FULL；尚未在本地执行真机验证。
 
 logits 仍通过原 `combine_sampled_and_draft_tokens` / `logits_indices` 选取：context 行预测 candidate 第一个 token，最后一个 candidate 行预测 bonus。拒绝后复用原 `num_rejected` 和 `postprocess_sampled` 更新有效 computed length；多算的尾部 KV 留在预分配 slot 中，但下一轮的长度和位置不会读取它，并在新 token forward 时覆盖。修正/bonus token 在下一轮 forward 才获得自己的 KV，不能把 sampled token 数直接当成已计算 KV 长度。
 
@@ -88,9 +108,9 @@ logits 仍通过原 `combine_sampled_and_draft_tokens` / `logits_indices` 选取
 
 原 Target 的 `postprocess_sampled` 提交结果后，适配层才读取请求历史并处理原 draft。适配层只替换返回的 draft tensor 和交给 scheduler 的候选列表；Target 最终拒绝时仍使用原计数和 KV 回退流程。
 
-支持文本、full-attention、未量化的中间 verifier，复用 TP；不支持中间流水线的 PP/DP/CP、LoRA、异步调度或 adaptive verification。启用图时，Target 和中间 verifier 使用分段图，Primary/Secondary DFlash 使用独立完整 query 图。中间 verifier 在模型加载后预捕获小 token 桶和覆盖完整 context 的几何桶；稳定输入缓冲区填入实际 query，padding 槽置为 -1，实际 KV 长度保持不变。中间图参数、更新流及 RoPE 与主模型隔离；缺少匹配图会报错，不静默回退 eager。显式 enforce_eager/NONE 用于关闭图作对照。图捕获与中间 KV 在加载期计入内存预算，中间激活也参与 profile。按缓存容量分组完成多轮，避免轮间反复淘汰；microbatch token 预算按实际新增 query 计算。尚未提供真机吞吐收益数据。
+支持文本、full-attention、未量化的中间 verifier，复用 TP；不支持中间流水线的 PP/DP/CP、LoRA、异步调度或 adaptive verification。显式选择 FULL 时，四个模型的正式 forward 使用完整图，缺少匹配图即报错；其他模式遵循用户配置。中间 verifier 预捕获稀疏 token 桶；稳定输入缓冲区填入实际 query，padding 槽置为 -1，通过只读 block 0 的虚拟请求补齐 FIA 的 TND 边界，真实 KV 长度不变。中间图参数、更新流及 RoPE 与主模型隔离。图捕获、预热和内存 profile 是初始化过程，不属于正式重放。按缓存容量分组完成多轮，避免轮间反复淘汰；microbatch 预算按新增 query 计算。
 
-这里的四模型图执行不代表整个 Python 调度循环是单张完整图：两个 verifier 的动态 attention 仍在分段图边界外执行，候选列表、接受决策回传和调度控制也在图外。中间图首次捕获会增加加载时间和常驻内存。
+FULL 的范围是四个模型的 forward（包含 attention），不是把整个多级周期封装成一张图：logits/验收、候选列表、必要回传、FIA 参数更新和 CPU 轮次控制仍在模型图外。选择 FULL 时不使用 PIECEWISE；首次捕获会增加加载时间和常驻内存。仍需在目标 CANN/torch_npu 版本上验证长 query 的 FIA task update、图资源占用及吞吐。冷启动混合批次直接拼接设备端预测片段，避免额外上传预测行索引；关闭 DEBUG 时跳过逐 token 接受率统计和计时。
 
 遇到 `EE1023 / Alloc Stream resource failed / Too many streams are created` 时，需要降低总捕获桶数量，而不是增加候选 token 限额。中间层默认采用稀疏桶（例如 token buffer 为 4096、4 请求、DFlash 宽度 15 时为 `[1,16,64,256,1024,4096]`），不再捕获完整的 `1..32` 小桶。可在 `intermediate` 中设置 `"cudagraph_capture_sizes": [64,256]`；实现会补齐最大中间 token buffer 和 Secondary 最大批次桶，确保全部输入长度仍有图覆盖。更少桶会增加 padding 计算量，需要真机测量权衡。主模型的 `compilation_config.cudagraph_capture_sizes` 单独控制 Target/Primary，不能替代此中间层选项。捕获资源耗尽后应退出并重新启动该任务，不能在已报异步错误的进程内继续捕获。不要同时开启 `ASCEND_LAUNCH_BLOCKING=1` 与 ACL 图。
 

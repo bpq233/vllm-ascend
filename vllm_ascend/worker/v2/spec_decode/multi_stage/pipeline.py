@@ -90,18 +90,23 @@ class IntermediatePipeline:
         drafts = [tokens[:limit] for tokens, limit in zip(primary_tokens, limits)]
         active = [i for i, limit in enumerate(limits) if limit > 0]
         contexts_by_request = list(prefixes)
+        trace = logger.isEnabledFor(logging.DEBUG)
         for round_id in range(self.config.num_rounds):
             if not active:
                 break
             contexts = [contexts_by_request[i] for i in active]
             round_drafts = [drafts[i] for i in active]
-            forward_before = getattr(self.backend, "forward_tokens", 0)
-            executed_before = getattr(self.backend, "executed_tokens", 0)
-            reused_before = getattr(self.backend, "reused_tokens", 0)
-            started = perf_counter()
+            if trace:
+                forward_before = getattr(self.backend, "forward_tokens", 0)
+                executed_before = getattr(self.backend, "executed_tokens", 0)
+                reused_before = getattr(self.backend, "reused_tokens", 0)
+                started = perf_counter()
             decisions = []
             for logits, lengths in self.backend.verify_batches(
-                contexts, round_drafts, req_ids=[req_ids[i] for i in active]
+                contexts,
+                round_drafts,
+                req_ids=[req_ids[i] for i in active],
+                retain_hidden=round_id + 1 < self.config.num_rounds,
             ):
                 offset = len(decisions)
                 decisions.extend(
@@ -112,7 +117,7 @@ class IntermediatePipeline:
                         getattr(self.backend, "verification_tokens", None),
                     )
                 )
-            intermediate_ms = (perf_counter() - started) * 1000
+            intermediate_ms = (perf_counter() - started) * 1000 if trace else 0.0
             continuing = []
             accepted_by_request = [0] * len(prefixes)
             for i, (length, replacement) in zip(active, decisions):
@@ -120,7 +125,8 @@ class IntermediatePipeline:
                 stopped = False
                 for position, token in enumerate(additions[: limits[i] - len(accepted[i])]):
                     accepted[i].append(token)
-                    accepted_by_request[i] += int(position < length)
+                    if trace:
+                        accepted_by_request[i] += int(position < length)
                     if token in self.eos_ids:
                         stopped = True
                         break
@@ -133,34 +139,35 @@ class IntermediatePipeline:
                 # Never extend it in place: backends may retain references.
                 for i in active:
                     contexts_by_request[i] = prefixes[i] + accepted[i]
-                started = perf_counter()
+                started = perf_counter() if trace else 0.0
                 proposals = self.backend.propose(
                     [contexts_by_request[i] for i in active], req_ids=[req_ids[i] for i in active]
                 )
-                secondary_ms = (perf_counter() - started) * 1000
+                secondary_ms = (perf_counter() - started) * 1000 if trace else 0.0
                 for i, tokens in zip(active, proposals):
                     drafts[i] = tokens[: limits[i] - len(accepted[i])]
             # Host wall times include metadata/model/required D2H, plus the
             # acceptance policy for verification; no extra NPU synchronization.
-            logger.debug(
-                "multi_stage_intermediate round=%d proposed=%d accepted=%d accepted_by_request=%s "
-                "intermediate_model_ms=%.3f secondary_model_ms=%.3f timing=host_wall_with_acceptance "
-                "request_ids=%s forward_tokens=%d kv_reused_tokens=%d executed_tokens=%d padding_tokens=%d",
-                round_id,
-                sum(map(len, round_drafts)),
-                sum(accepted_by_request),
-                accepted_by_request,
-                intermediate_ms,
-                secondary_ms,
-                req_ids,
-                getattr(self.backend, "forward_tokens", 0) - forward_before,
-                getattr(self.backend, "reused_tokens", 0) - reused_before,
-                getattr(self.backend, "executed_tokens", 0) - executed_before,
-                max(
-                    0,
-                    getattr(self.backend, "executed_tokens", 0)
-                    - executed_before
-                    - (getattr(self.backend, "forward_tokens", 0) - forward_before),
-                ),
-            )
+            if trace:
+                logger.debug(
+                    "multi_stage_intermediate round=%d proposed=%d accepted=%d accepted_by_request=%s "
+                    "intermediate_model_ms=%.3f secondary_model_ms=%.3f timing=host_wall_with_acceptance "
+                    "request_ids=%s forward_tokens=%d kv_reused_tokens=%d executed_tokens=%d padding_tokens=%d",
+                    round_id,
+                    sum(map(len, round_drafts)),
+                    sum(accepted_by_request),
+                    accepted_by_request,
+                    intermediate_ms,
+                    secondary_ms,
+                    req_ids,
+                    getattr(self.backend, "forward_tokens", 0) - forward_before,
+                    getattr(self.backend, "reused_tokens", 0) - reused_before,
+                    getattr(self.backend, "executed_tokens", 0) - executed_before,
+                    max(
+                        0,
+                        getattr(self.backend, "executed_tokens", 0)
+                        - executed_before
+                        - (getattr(self.backend, "forward_tokens", 0) - forward_before),
+                    ),
+                )
         return accepted

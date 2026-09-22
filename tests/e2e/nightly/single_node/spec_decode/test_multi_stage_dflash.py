@@ -11,6 +11,23 @@ from tests.e2e.pull_request.one_card.spec_decode.utils import DFLASH
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl, AscendAttentionState
 
 
+def test_packed_metadata_views_and_block_table_out_on_npu():
+    """Check dtype reinterpretation and out= on the actual NPU backend."""
+    host = torch.empty(36, dtype=torch.uint8, pin_memory=True)
+    host[:24].view(torch.int64).copy_(torch.tensor([2, 0, 1]))
+    host[24:].view(torch.int32).copy_(torch.tensor([2147483647, 16777217, 3], dtype=torch.int32))
+    packed = host.to("npu", non_blocking=True)
+    indices, ids = packed[:24].view(torch.int64), packed[24:].view(torch.int32)
+    assert indices.untyped_storage().data_ptr() == ids.untyped_storage().data_ptr()
+    source = torch.arange(12, dtype=torch.int32, device="npu").reshape(3, 4)
+    output = torch.empty_like(source)
+    pointer = output.data_ptr()
+    torch.index_select(source, 0, indices, out=output)
+    assert output.data_ptr() == pointer
+    assert output.cpu().tolist() == [[8, 9, 10, 11], [0, 1, 2, 3], [4, 5, 6, 7]]
+    assert ids.cpu().tolist() == [2147483647, 16777217, 3]
+
+
 def _target_graph_probe(worker, install=False):
     """Run inside each worker, including subprocess/TP executors."""
     from vllm.compilation.counter import compilation_counter
@@ -19,14 +36,14 @@ def _target_graph_probe(worker, install=False):
     manager = worker.model_runner.cudagraph_manager
     backend = worker.model_runner.speculator.pipeline.backend
     if install:
-        worker._long_target_pw_calls = 0
-        original = manager.run_pw_graph
+        worker._long_target_full_calls = 0
+        original = manager.run_fullgraph
 
         def record_replay(*args, **kwargs):
-            worker._long_target_pw_calls += 1
+            worker._long_target_full_calls += 1
             return original(*args, **kwargs)
 
-        manager.run_pw_graph = record_replay
+        manager.run_fullgraph = record_replay
         for label, draft_manager in (
             ("primary", worker.model_runner.speculator.query_cudagraph_manager),
             ("secondary", backend.drafter.query_cudagraph_manager),
@@ -44,17 +61,28 @@ def _target_graph_probe(worker, install=False):
         "piecewise_sizes": [desc.num_tokens for desc in manager._capture_descs.get(CUDAGraphMode.PIECEWISE, [])],
         "full_sizes": [desc.num_tokens for desc in manager._capture_descs.get(CUDAGraphMode.FULL, [])],
         "captures": compilation_counter.num_cudagraph_captured,
-        "calls": worker._long_target_pw_calls,
+        "calls": worker._long_target_full_calls,
         "forward_tokens": backend.forward_tokens,
         "reused_tokens": backend.reused_tokens,
         "reused_hidden_tokens": backend.reused_hidden_tokens,
         "intermediate_calls": backend.graph_replays,
         "intermediate_sizes": [
-            desc.num_tokens for desc in backend.cudagraph_manager._capture_descs.get(CUDAGraphMode.PIECEWISE, [])
+            desc.num_tokens for desc in backend.cudagraph_manager._capture_descs.get(CUDAGraphMode.FULL, [])
         ],
         "secondary_graphs": len(backend.drafter.query_cudagraph_manager.graphs),
         "primary_calls": worker._primary_graph_calls,
         "secondary_calls": worker._secondary_graph_calls,
+        "non_full_capture_count": sum(
+            len(descs)
+            for graph_manager in (
+                manager,
+                backend.cudagraph_manager,
+                worker.model_runner.speculator.query_cudagraph_manager,
+                backend.drafter.query_cudagraph_manager,
+            )
+            for mode, descs in graph_manager._capture_descs.items()
+            if mode != CUDAGraphMode.FULL
+        ),
     }
 
 
@@ -97,7 +125,7 @@ def test_long_cached_prefill_attention_matches_causal_reference():
 
 
 @pytest.mark.parametrize("method", ["topk", "all"])
-@pytest.mark.parametrize("long_candidates,graph", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("long_candidates,graph", [(False, False), (False, True), (True, False), (True, True)])
 def test_multi_stage_dflash(method, long_candidates, graph, monkeypatch):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     models = DFLASH["dflash"]
@@ -131,6 +159,7 @@ def test_multi_stage_dflash(method, long_candidates, graph, monkeypatch):
     with VllmRunner(
         models["main"],
         **{**common, "enforce_eager": not graph},
+        compilation_config={"cudagraph_mode": "FULL" if graph else "NONE"},
         speculative_config={
             "method": "dflash",
             "model": models["spec"],
@@ -141,11 +170,12 @@ def test_multi_stage_dflash(method, long_candidates, graph, monkeypatch):
         if graph:
             before = runner.model.llm_engine.collective_rpc(_target_graph_probe, kwargs={"install": True})
             assert all(
-                row["piecewise_sizes"]
-                and not row["full_sizes"]
+                not row["piecewise_sizes"]
+                and row["full_sizes"]
                 and row["captures"] > 0
                 and row["intermediate_sizes"]
                 and row["secondary_graphs"] > 0
+                and row["non_full_capture_count"] == 0
                 for row in before
             )
         tokens = [out.outputs[0].token_ids for out in runner.model.generate(prompts, params)]

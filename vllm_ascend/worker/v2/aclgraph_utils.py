@@ -36,7 +36,6 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.attention.spec_decode import uses_long_speculative_queries
 from vllm_ascend.compilation.acl_graph import set_graph_params, update_full_graph_params
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.utils import vllm_version_is
@@ -58,11 +57,7 @@ def collect_sorted_captured_token_sizes(capture_descs: dict) -> list[int]:
 
 
 def target_graph_mode(vllm_config, cudagraph_mode):
-    if not uses_long_speculative_queries(vllm_config) or cudagraph_mode == CUDAGraphMode.NONE:
-        return cudagraph_mode
-    if not vllm_config.compilation_config.cudagraph_mode.requires_piecewise_compilation():
-        raise ValueError("Long target graphs require piecewise compilation configured before model loading.")
-    return CUDAGraphMode.PIECEWISE
+    return cudagraph_mode
 
 
 def _get_graph_update_backend(
@@ -79,8 +74,8 @@ def _get_graph_update_backend(
 class ModelAclGraphManager(ModelCudaGraphManager):
     """ACL Model Cuda Graph Manager for Ascend NPUs."""
 
-    # Piecewise capture pads token shapes while executing dynamic cached-prefix
-    # attention outside the graphs. DFlash retains its own full decode manager.
+    # FULL FIA graphs refresh lengths and page tables through task updates.
+    # DFlash retains its own independent full decode manager.
 
     if vllm_version_is("0.27.1"):
 
@@ -136,6 +131,21 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:
             self.breakable_cg_runner = BreakableACLGraphWrapper(model, self.vllm_config)
+
+    def dispatch(self, *args, **kwargs):
+        desc = super().dispatch(*args, **kwargs)
+        options = (self.vllm_config.additional_config or {}).get("multi_stage_speculative", {})
+        if (
+            self._graphs_captured
+            and self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
+            and not self.vllm_config.model_config.enforce_eager
+            and options.get("intermediate")
+            and options["intermediate"].get("num_rounds", 3) > 0
+            and desc.num_tokens > 0
+            and desc.cg_mode != CUDAGraphMode.FULL
+        ):
+            raise RuntimeError("Multi-stage Target requires a captured FULL graph; refusing eager/PIECEWISE fallback.")
+        return desc
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
