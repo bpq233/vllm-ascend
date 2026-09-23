@@ -90,13 +90,12 @@ def long_verification_capture_shapes(vllm_config):
     return shapes
 
 
-def select_long_verification_graph(candidates, num_reqs, num_tokens, num_active_loras, num_ubatches):
+def select_long_verification_graph(candidates, num_reqs, num_tokens, num_active_loras):
     for desc in candidates:
         if (
             desc.num_tokens >= num_tokens
             and desc.num_reqs == num_reqs
             and desc.num_active_loras == num_active_loras
-            and desc.num_ubatches == num_ubatches
         ):
             return desc
     return None
@@ -224,7 +223,6 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             num_reqs,
             num_tokens,
             effective_loras,
-            num_ubatches,
         )
         if graph_desc is None:
             logger.warning_once(

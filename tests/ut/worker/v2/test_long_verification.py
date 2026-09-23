@@ -284,6 +284,7 @@ def test_long_target_graph_dispatch_is_opt_in_and_uses_compatible_bucket():
     manager.long_verification_active = True
     graph = manager.dispatch(1, 20, None, 0, max_query_len=20)
     assert graph.num_tokens == 32
+    assert not hasattr(graph, "num_ubatches")
 
 
 def test_long_full_replay_uses_full_mode_fia_query_boundaries():
