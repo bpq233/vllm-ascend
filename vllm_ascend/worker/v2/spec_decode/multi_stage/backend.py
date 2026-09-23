@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 def _validate_full_graph_capture(mode, planned_sizes, captured_sizes):
-    if mode != CUDAGraphMode.FULL:
+    if mode.decode_mode() != CUDAGraphMode.FULL:
         return
     missing = sorted(set(planned_sizes) - set(captured_sizes))
     if missing:
@@ -165,16 +165,8 @@ def init_secondary_graphs(drafter, mode, device):
     """Initialize after set_attn, inside the intermediate graph-state scope."""
     enabled = mode != CUDAGraphMode.NONE
     drafter.update_stream = torch.npu.Stream(device=device) if enabled else None
-    # DFlash's parallel query is uniform, including when verifier queries are
-    # ragged. Request its full decode graph separately from verifier FULL.
-    drafter.init_cudagraph_manager(
-        CUDAGraphMode.FULL_DECODE_ONLY
-        if mode in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL_DECODE_ONLY)
-        else mode
-    )
-    drafter.query_cudagraph_manager.require_full_graph = mode == CUDAGraphMode.FULL
-    if drafter.query_cudagraph_manager.require_full_graph and not drafter.query_cudagraph_manager.needs_capture():
-        raise ValueError("Secondary DFlash requires full graph attention support and nonempty capture sizes.")
+    # Let upstream DFlash resolve the selected mode, including FULL_DECODE_ONLY.
+    drafter.init_cudagraph_manager(mode)
 
 
 def capture_secondary_graphs(drafter):
@@ -208,6 +200,11 @@ class IntermediateBackend:
         self.reused_tokens = 0
         self.reused_hidden_tokens = 0
         self._context_rows = [None] * self.max_num_reqs
+        options = (parent_config.additional_config or {}).get("multi_stage_speculative", {})
+        self.decode_query_len = max(
+            config.num_speculative_tokens,
+            primary_draft_width(options, parent_config.speculative_config.num_speculative_tokens),
+        ) + 1
         self.max_model_len = config.max_model_len or parent_config.model_config.max_model_len
         # Full prefixes may exceed the main runner's chunked-prefill budget.
         self.max_num_tokens = min(
@@ -273,9 +270,9 @@ class IntermediateBackend:
             seed=parent.seed,
             trust_remote_code=parent.trust_remote_code,
             max_model_len=self.max_model_len,
-            # ACL graph capture is performed explicitly by ModelAclGraphManager;
-            # keep FX/AOT compilation out of the isolated verifier model.
-            enforce_eager=True,
+            # Keep the model graph-eligible when the isolated ACL graph manager
+            # captures it; CompilationMode.NONE still disables FX/AOT compile.
+            enforce_eager=not self.graph_enabled,
         )
         # A copied target config may carry target-specific quantization state.
         cfg.quant_config = None
@@ -313,7 +310,7 @@ class IntermediateBackend:
             cfg.compilation_config.cudagraph_capture_sizes = intermediate_capture_sizes(
                 self.max_num_tokens,
                 self.max_num_reqs,
-                self.config.num_speculative_tokens,
+                self.decode_query_len - 1,
                 self.config.cudagraph_capture_sizes,
             )
             cfg.compilation_config.max_cudagraph_capture_size = self.max_num_tokens
@@ -348,7 +345,7 @@ class IntermediateBackend:
             self.vllm_config,
             self.device,
             self.vllm_config.compilation_config.cudagraph_mode,
-            1,
+            self.decode_query_len,
             self,
         )
         logger.info(
@@ -379,9 +376,12 @@ class IntermediateBackend:
             progress_bar_desc="Capturing intermediate verifier graphs",
         )
         captured_sizes = self.cudagraph_manager.captured_token_counts()
+        planned_full_sizes = sorted(
+            {desc.num_tokens for desc in self.cudagraph_manager._capture_descs.get(CUDAGraphMode.FULL, ())}
+        )
         _validate_full_graph_capture(
             self.vllm_config.compilation_config.cudagraph_mode,
-            self.cudagraph_manager.capture_sizes,
+            planned_full_sizes,
             captured_sizes,
         )
         logger.info(
@@ -527,13 +527,30 @@ class IntermediateBackend:
         if total > self.max_num_tokens:
             raise ValueError("Intermediate incremental query exceeds the token buffer.")
         manager = self.cudagraph_manager if cached_context is None else None
-        desc = manager.dispatch(n, total, None, 0) if manager is not None else None
-        if (
-            desc is not None
-            and self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
-            and desc.cg_mode != CUDAGraphMode.FULL
-        ):
-            raise RuntimeError("Intermediate query has no captured FULL graph; refusing silent eager fallback.")
+        uniform_token_count = int(query_lens[0]) if np.all(query_lens == query_lens[0]) else None
+        desc = (
+            manager.dispatch(
+                n,
+                total,
+                uniform_token_count,
+                0,
+                max_query_len=int(query_lens.max()),
+            )
+            if manager is not None
+            else None
+        )
+        mode = self.vllm_config.compilation_config.cudagraph_mode
+        requires_decode_graph = mode == CUDAGraphMode.FULL or (
+            mode.decode_mode() == CUDAGraphMode.FULL
+            and np.all(computed > 0)
+            and uniform_token_count == self.decode_query_len
+        )
+        if desc is not None and requires_decode_graph and desc.cg_mode != CUDAGraphMode.FULL:
+            raise RuntimeError(
+                "Intermediate decode query has no captured FULL graph; "
+                f"mode={mode}, num_tokens={total}, num_reqs={n}, uniform_token_count={uniform_token_count}, "
+                f"captured_sizes={manager.captured_token_counts()}."
+            )
         padded_total = desc.num_tokens if desc is not None else total
         # Pack CPU-produced inputs/metadata into one pinned H2D transfer. Views
         # stay alive through the queued work; no reusable host buffer can race
@@ -861,7 +878,11 @@ class IntermediateBackend:
         for logits in self.verify([row[: max(1, len(row) - width)] for row in rows], [[0] * width for _ in rows]):
             logits.topk(min(self.config.verification.get("top_k", 5), logits.shape[-1]), dim=-1)
         graph_replays = self.graph_replays - graph_replays_before
-        if self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL and rows and not graph_replays:
+        if (
+            self.vllm_config.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            and rows
+            and not graph_replays
+        ):
             raise RuntimeError("Intermediate FULL ACL graphs were captured but profiling replayed none.")
         logger.info(
             "multi_stage_graph_profile verifier=%s mode=%s replay_count=%d captured_sizes=%s",

@@ -34,38 +34,6 @@ def primary_draft_width(options, final_capacity):
     return options.get("primary_num_speculative_tokens", default)
 
 
-def configure_long_target_graphs(vllm_config):
-    """Supply sparse FULL defaults without overriding explicit user settings."""
-    from vllm.config.compilation import CUDAGraphMode
-
-    compilation = vllm_config.compilation_config
-    options = (vllm_config.additional_config or {}).get("multi_stage_speculative", {})
-    intermediate = options.get("intermediate")
-    if not intermediate or intermediate.get("num_rounds", 3) <= 0:
-        return
-    if (
-        vllm_config.model_config.enforce_eager
-        or compilation.cudagraph_mode != CUDAGraphMode.FULL
-        or compilation.cudagraph_capture_sizes is not None
-        or getattr(compilation, "max_cudagraph_capture_size", None) is not None
-    ):
-        return
-    # Cover scheduled prefill and the independent primary draft shape. When
-    # defaults have not been resolved yet, use sparse gears, not just one huge
-    # bucket (which could leave DFlash with no capturable decode descriptor).
-    maximum = vllm_config.scheduler_config.max_num_batched_tokens
-    sizes = set(compilation.cudagraph_capture_sizes or [1])
-    if not compilation.cudagraph_capture_sizes:
-        size = 16
-        while size < maximum:
-            sizes.add(size)
-            size *= 4
-    width = primary_draft_width(options, vllm_config.speculative_config.num_speculative_tokens)
-    sizes.update((maximum, min(maximum, vllm_config.scheduler_config.max_num_seqs * (width + 1))))
-    compilation.cudagraph_capture_sizes = sorted(sizes)
-    compilation.max_cudagraph_capture_size = max(compilation.cudagraph_capture_sizes)
-
-
 @dataclass
 class IntermediateConfig:
     verifier_model: str

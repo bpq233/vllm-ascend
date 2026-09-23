@@ -5,6 +5,7 @@
 import ast
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -25,6 +26,14 @@ def load_class(filename, name, namespace):
 
 @pytest.fixture
 def backend():
+    class GraphMode(Enum):
+        NONE = "none"
+        FULL = "full"
+        PIECEWISE = "piecewise"
+
+        def decode_mode(self):
+            return self
+
     metadata = Mock(
         side_effect=lambda **kw: {
             "layer": NS(
@@ -47,13 +56,14 @@ def backend():
         set_forward_context=lambda *a, **kw: nullcontext(),
         AscendInputBatch=NS,
         AscendAttentionState=NS(PrefillNoCache="prefill", ChunkedPrefill="extend"),
-        CUDAGraphMode=NS(NONE=None, FULL="full", PIECEWISE="piecewise"),
+        CUDAGraphMode=GraphMode,
         BatchDescriptor=lambda n: NS(num_tokens=n),
         build_attn_metadata=metadata,
         build_slot_mappings_by_layer=lambda slots, config: {"layer": slots[0]},
     )
     cls = load_class("backend.py", "IntermediateBackend", namespace)
     obj = cls.__new__(cls)
+    obj.CUDAGraphMode = GraphMode
     obj.config = NS(num_speculative_tokens=2, verification={"method": "topk"})
     obj.device = torch.device("cpu")
     obj.max_num_reqs, obj.max_num_tokens, obj.max_model_len = 2, 12, 8
@@ -68,7 +78,8 @@ def backend():
     obj._context_rows = [None] * obj.max_num_reqs
     obj.model_state = NS()
     obj._init_proposal_scratch()
-    obj.vllm_config, obj.kv_cache_config, obj.attn_groups = NS(compilation_config=NS(cudagraph_mode="full")), NS(), []
+    obj.vllm_config = NS(compilation_config=NS(cudagraph_mode=GraphMode.FULL))
+    obj.kv_cache_config, obj.attn_groups = NS(), []
     obj._rope_state = {"_cos": object()}
     obj.block_tables = NS(
         input_block_tables=[torch.tensor([[1, 2], [3, 4]])],
@@ -291,7 +302,11 @@ def test_sparse_graph_gap_warms_context_without_large_padding(backend):
     )
     obj.cudagraph_manager = NS(
         capture_sizes=[8, 128],
-        dispatch=lambda n, total, *a: NS(cg_mode="full", num_tokens=8 if total <= 8 else 128),
+        dispatch=lambda n, total, *a, **kw: NS(
+            cg_mode=obj.CUDAGraphMode.FULL,
+            num_tokens=8 if total <= 8 else 128,
+        ),
+        captured_token_counts=lambda: [8, 128],
         run_fullgraph=lambda desc: obj.model(
             input_ids=obj.input_buffers.input_ids[: desc.num_tokens],
             positions=obj.input_buffers.positions[: desc.num_tokens],
@@ -442,7 +457,8 @@ def test_intermediate_graph_padding_keeps_real_kv_and_logits(backend):
     obj, metadata, _ = backend
     # A captured 8-token gear serves a real 5-token query.
     obj.cudagraph_manager = NS(
-        dispatch=Mock(return_value=NS(cg_mode="full", num_tokens=8)),
+        dispatch=Mock(return_value=NS(cg_mode=obj.CUDAGraphMode.FULL, num_tokens=8)),
+        captured_token_counts=Mock(return_value=[8]),
         run_fullgraph=Mock(
             side_effect=lambda desc: obj.model(
                 input_ids=obj.input_buffers.input_ids[: desc.num_tokens],
@@ -508,18 +524,22 @@ def test_proposal_scratch_addresses_stay_stable_across_batch_sizes(backend):
 
 def test_missing_intermediate_graph_fails_instead_of_silent_eager(backend):
     obj, _, _ = backend
-    obj.cudagraph_manager = NS(dispatch=Mock(return_value=NS(cg_mode=None)))
-    with pytest.raises(RuntimeError, match="refusing silent eager"):
+    obj.cudagraph_manager = NS(
+        dispatch=Mock(return_value=NS(cg_mode=None)),
+        captured_token_counts=Mock(return_value=[]),
+    )
+    with pytest.raises(RuntimeError, match="Intermediate decode query has no captured FULL graph"):
         list(obj.verify([[1]], [[2]], req_ids=["a"]))
     obj.model.assert_not_called()
 
 
-@pytest.mark.parametrize("mode", [None, "piecewise"])
+@pytest.mark.parametrize("mode", ["none", "piecewise"])
 def test_configured_non_full_path_preserves_predictions(backend, mode):
     obj, _, _ = backend
-    obj.vllm_config.compilation_config.cudagraph_mode = mode
+    graph_mode = obj.CUDAGraphMode.NONE if mode == "none" else obj.CUDAGraphMode.PIECEWISE
+    obj.vllm_config.compilation_config.cudagraph_mode = graph_mode
     obj.cudagraph_manager = NS(
-        dispatch=Mock(return_value=NS(cg_mode=mode, num_tokens=5)),
+        dispatch=Mock(return_value=NS(cg_mode=None if mode == "none" else graph_mode, num_tokens=5)),
         run_fullgraph=Mock(side_effect=AssertionError("Unexpected FULL replay")),
         run_pw_graph=Mock(side_effect=lambda model, inputs: model(**inputs)),
     )

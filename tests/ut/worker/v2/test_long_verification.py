@@ -213,32 +213,6 @@ def test_both_graph_manager_versions_capture_long_target_piecewise():
             assert ns["Manager"](cfg, "cpu", mode, 33, NS(update_stream=None)).mode == mode
 
 
-@pytest.mark.parametrize("mode", list(GraphMode))
-@pytest.mark.parametrize("width,eager", [(32, False), (32, True), (4, False)])
-@pytest.mark.parametrize("splits", [None, [], ["custom::op"]])
-def test_graph_config_prepares_compilation_and_keeps_draft_full_mode(mode, width, eager, splits):
-    tree = ast.parse((ROOT / "worker/v2/spec_decode/multi_stage/config.py").read_text(encoding="utf-8"))
-    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "configure_long_target_graphs")
-    fn.body = [n for n in fn.body if not isinstance(n, ast.ImportFrom)]
-    ns = dict(
-        CUDAGraphMode=GraphMode,
-        CompilationMode=NS(VLLM_COMPILE="compile"),
-        primary_draft_width=lambda options, width: 4 if width > 15 else width,
-        **vars(routing),
-    )
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), "configure_graphs", "exec"), ns)
-    cfg = config(width)
-    cfg.model_config.enforce_eager = eager
-    cfg.compilation_config.cudagraph_mode = mode
-    cfg.compilation_config.mode = "original"
-    cfg.compilation_config.splitting_ops = splits
-    ns["configure_long_target_graphs"](cfg)
-    assert cfg.compilation_config.cudagraph_mode == mode
-    assert cfg.compilation_config.mode == "original"
-    assert cfg.compilation_config.splitting_ops == splits
-    assert cfg.compilation_config.cudagraph_capture_sizes == [16, 64]
-
-
 def test_both_runner_versions_sort_short_queries_before_long_candidates():
     tree = ast.parse((ROOT / "worker/v2/model_runner.py").read_text(encoding="utf-8"))
     methods = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "prepare_inputs"]

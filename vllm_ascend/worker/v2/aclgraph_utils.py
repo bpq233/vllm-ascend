@@ -132,21 +132,6 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         if self.breakable_cg_runner is None:
             self.breakable_cg_runner = BreakableACLGraphWrapper(model, self.vllm_config)
 
-    def dispatch(self, *args, **kwargs):
-        desc = super().dispatch(*args, **kwargs)
-        options = (self.vllm_config.additional_config or {}).get("multi_stage_speculative", {})
-        if (
-            self._graphs_captured
-            and self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
-            and not self.vllm_config.model_config.enforce_eager
-            and options.get("intermediate")
-            and options["intermediate"].get("num_rounds", 3) > 0
-            and desc.num_tokens > 0
-            and desc.cg_mode != CUDAGraphMode.FULL
-        ):
-            raise RuntimeError("Multi-stage Target requires a captured FULL graph; refusing eager/PIECEWISE fallback.")
-        return desc
-
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens

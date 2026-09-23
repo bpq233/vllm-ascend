@@ -4,7 +4,6 @@ import logging
 from copy import copy
 
 import torch
-from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.outputs import DraftTokenIds
 
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import AscendDFlashSpeculator
@@ -33,12 +32,6 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
         self.candidates = []
         self.req_ids = []
         self._host_histories = {}
-
-    def init_cudagraph_manager(self, cudagraph_mode):
-        super().init_cudagraph_manager(cudagraph_mode)
-        self.query_cudagraph_manager.require_full_graph = cudagraph_mode == CUDAGraphMode.FULL
-        if self.query_cudagraph_manager.require_full_graph and not self.query_cudagraph_manager.needs_capture():
-            raise ValueError("Primary DFlash requires FULL graphs with nonempty capture sizes.")
 
     def _read_step(self, input_batch, primary):
         """One bounded D2H for warm requests; read full history only on a miss."""
