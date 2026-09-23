@@ -296,6 +296,11 @@ class IntermediateBackend:
                 self.config.cudagraph_capture_sizes,
             )
             cfg.compilation_config.max_cudagraph_capture_size = self.max_num_tokens
+            # Compile one concrete FX/ACL artifact per capture size. Without
+            # this, npugraph_ex may specialize output allocation at the first
+            # size (typically 1 token) and reuse an output shaped [1, ...] for
+            # a later 4094-token verifier call.
+            cfg.compilation_config.compile_sizes = list(cfg.compilation_config.cudagraph_capture_sizes)
             _setup_compile_backend(cfg, self.parent_config.compilation_config.oot_compiler)
         with self._context():
             self.model = get_model_loader(cfg.load_config).load_model(vllm_config=cfg, model_config=cfg.model_config)
