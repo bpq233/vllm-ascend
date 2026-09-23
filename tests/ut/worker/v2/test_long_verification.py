@@ -184,6 +184,9 @@ def test_both_graph_manager_versions_capture_long_target_piecewise():
         def needs_capture(self):
             return False
 
+        def _add_long_verification_graphs(self, config):
+            return ()
+
     for constructor in constructors:
         wrapper = ast.ClassDef(
             name="Manager",
@@ -211,6 +214,128 @@ def test_both_graph_manager_versions_capture_long_target_piecewise():
         cfg.compilation_config.cudagraph_mode = GraphMode.PIECEWISE
         for mode in GraphMode:
             assert ns["Manager"](cfg, "cpu", mode, 33, NS(update_stream=None)).mode == mode
+
+
+def test_full_decode_only_has_sparse_target_gears_for_long_verification():
+    fn = function(
+        "worker/v2/aclgraph_utils.py",
+        "long_verification_capture_shapes",
+        dict(
+            CUDAGraphMode=NS(FULL_DECODE_ONLY="full_decode_only"),
+            MAX_DECODE_QUERY_LEN=16,
+            uses_long_speculative_queries=lambda cfg: True,
+        ),
+    )
+    cfg = NS(
+        compilation_config=NS(
+            cudagraph_mode="full_decode_only",
+            max_cudagraph_capture_size=128,
+            cudagraph_capture_sizes=[16, 32, 64, 100],
+        ),
+        scheduler_config=NS(max_num_batched_tokens=100, max_num_seqs=4),
+        speculative_config=NS(num_speculative_tokens=31),
+        parallel_config=NS(tensor_parallel_size=1),
+    )
+    assert fn(cfg) == [(1, 32), (2, 64), (3, 96), (4, 100)]
+
+    cfg.parallel_config.tensor_parallel_size = 8
+    assert fn(cfg) == [(1, 32), (2, 64), (3, 96), (4, 96)]
+
+
+def test_long_target_graph_dispatch_is_opt_in_and_uses_compatible_bucket():
+    tree = ast.parse((ROOT / "worker/v2/aclgraph_utils.py").read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ModelAclGraphManager")
+    dispatch = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "dispatch")
+
+    class Base:
+        def dispatch(self, *args, **kwargs):
+            return NS(cg_mode="none")
+
+        def _resolve_effective_loras(self, count):
+            return count
+
+    namespace = dict(
+        Base=Base,
+        CUDAGraphMode=NS(NONE="none"),
+        MAX_DECODE_QUERY_LEN=16,
+        select_long_verification_graph=lambda *args: next(
+            desc for desc in args[0] if desc.num_tokens >= args[2]
+        ),
+    )
+    cls_copy = ast.ClassDef(
+        name="Manager",
+        bases=[ast.Name(id="Base", ctx=ast.Load())],
+        keywords=[],
+        body=[dispatch],
+        decorator_list=[],
+    )
+    module = ast.Module(body=[cls_copy], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), "dispatch", "exec"), namespace)
+    manager = namespace["Manager"]()
+    manager.long_verification_graphs = [NS(num_tokens=32), NS(num_tokens=64)]
+    manager.long_verification_active = False
+    eager = manager.dispatch(1, 20, None, 0, max_query_len=20)
+    assert eager.cg_mode == "none"
+    manager.long_verification_active = True
+    graph = manager.dispatch(1, 20, None, 0, max_query_len=20)
+    assert graph.num_tokens == 32
+
+
+def test_long_full_replay_uses_full_mode_fia_query_boundaries():
+    method = next(
+        node
+        for node in ast.walk(ast.parse((ROOT / "worker/v2/model_runner.py").read_text(encoding="utf-8")))
+        if isinstance(node, ast.FunctionDef) and node.name == "_pad_query_start_loc_for_fia"
+    )
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), method],
+        type_ignores=[],
+    )
+    namespace = dict(np=np, CUDAGraphMode=NS(FULL="full"))
+    exec(compile(ast.fix_missing_locations(module), "fia_graph_boundaries", "exec"), namespace)
+    runner = NS(
+        compilation_config=NS(cudagraph_mode="full_decode_only"),
+        cudagraph_manager=NS(long_verification_active=True),
+        decode_query_len=5,
+    )
+    starts, padded_reqs = namespace["_pad_query_start_loc_for_fia"](
+        runner,
+        num_tokens_padded=32,
+        num_reqs_padded=4,
+        num_reqs=1,
+        query_start_loc_np=np.array([0, 20, 32, 32, 32, 32], dtype=np.int32),
+        cudagraph_runtime_mode="full",
+        batch_desc_num_reqs=4,
+    )
+    assert padded_reqs == 2
+    assert starts[2] == 32
+
+
+def test_capture_model_preserves_long_verification_capture_state():
+    tree = ast.parse((ROOT / "worker/v2/model_runner.py").read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner")
+    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "capture_model")
+    cls_copy = ast.ClassDef(
+        name="Runner",
+        bases=[ast.Name(id="Base", ctx=ast.Load())],
+        keywords=[],
+        body=[method],
+        decorator_list=[],
+    )
+
+    class Base:
+        def capture_model(self):
+            assert self.cudagraph_manager.long_verification_active
+            return [17, 32]
+
+    namespace = dict(Base=Base, torch=NS(inference_mode=lambda: lambda function: function))
+    module = ast.Module(body=[cls_copy], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), "capture_state", "exec"), namespace)
+    manager = NS(long_verification_graphs=[object()], long_verification_active=False)
+    runner = namespace["Runner"]()
+    runner.cudagraph_manager = manager
+    assert runner.capture_model() == [17, 32]
+    assert manager.long_verification_active is False
 
 
 def test_both_runner_versions_sort_short_queries_before_long_candidates():

@@ -26,6 +26,7 @@ def graph_helpers():
             "init_secondary_graphs",
             "capture_secondary_graphs",
             "_validate_full_graph_capture",
+            "intermediate_graph_mode",
         )
     ]
     params = NS(_graph_params=object(), _draft_graph_params=object(), _draft_graph_prefill_params=object())
@@ -123,3 +124,14 @@ def test_full_graph_capture_validation_requires_every_planned_size(graph_helpers
     with pytest.raises(RuntimeError, match=r"missing_sizes=\[64\]"):
         validate(graph_helpers.CUDAGraphMode.FULL_DECODE_ONLY, [1, 16, 64], [1, 16])
     validate(graph_helpers.CUDAGraphMode.FULL_AND_PIECEWISE, [1, 16, 64], [1])
+
+
+def test_full_decode_only_uses_full_graph_for_intermediate_verifier(graph_helpers):
+    assert (
+        graph_helpers.intermediate_graph_mode(graph_helpers.CUDAGraphMode.FULL_DECODE_ONLY)
+        is graph_helpers.CUDAGraphMode.FULL
+    )
+    assert (
+        graph_helpers.intermediate_graph_mode(graph_helpers.CUDAGraphMode.FULL_AND_PIECEWISE)
+        is graph_helpers.CUDAGraphMode.FULL_AND_PIECEWISE
+    )

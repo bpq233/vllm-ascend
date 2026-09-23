@@ -87,7 +87,7 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /models/Qwen-8B \
 
 cached-prefill 复用 `attention_v1` 的 paged FIA：Q 长度为累计 query 长度，KV 长度为各请求的有效总长度，`block_table` 指向已有前缀，右下因果遮罩使用 `sparse_mode=3`。同一 FIA 接口由实际 query 形状执行多 token prefill，未提高 Decode kernel 的上限，也不重新计算正式前缀。该路径限制为 full-attention Target 和未量化 Target KV；MLA、混合状态模型不在首版范围内。参数语义参见 [TorchNPU FIA 文档](https://www.hiascend.com/document/detail/en/Pytorch/2610/apiref/customapi/docs/en/custom_APIs/torch_npu/torch_npu-npu_fused_infer_attention_score.md)。
 
-图执行遵循 `enforce_eager`、`cudagraph_mode` 和显式 Target 捕获桶配置，允许 eager 和 NONE。设置 `compilation_config={"cudagraph_mode": "FULL"}` 可捕获四个模型的 forward（包含 attention）。只有未指定 FULL 捕获范围时才补充稀疏默认桶。NPU 集成测试覆盖 eager 和 FULL；尚未在本地执行真机验证。
+图执行遵循 `enforce_eager` 和 `cudagraph_mode`。`FULL` 捕获四个模型的 forward（包含 attention）；`FULL_DECODE_ONLY` 保留 Target 与 DFlash 的官方 decode-only 语义，中间 verifier 使用隔离的 FULL 图捕获不规则前缀和每轮校验。对超过 16-token 的最终 Target 校验，`FULL_DECODE_ONLY` 会额外捕获 TP 对齐的稀疏 FULL 桶，并只在长 speculative 校验时 dispatch 到这些图；普通 prefill/mixed 请求仍按原模式执行。Target 桶受 `cudagraph_capture_sizes`、`max_cudagraph_capture_size`、`max_num_batched_tokens` 和序列数限制。
 
 logits 仍通过原 `combine_sampled_and_draft_tokens` / `logits_indices` 选取：context 行预测 candidate 第一个 token，最后一个 candidate 行预测 bonus。拒绝后复用原 `num_rejected` 和 `postprocess_sampled` 更新有效 computed length；多算的尾部 KV 留在预分配 slot 中，但下一轮的长度和位置不会读取它，并在新 token forward 时覆盖。修正/bonus token 在下一轮 forward 才获得自己的 KV，不能把 sampled token 数直接当成已计算 KV 长度。
 

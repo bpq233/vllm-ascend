@@ -241,35 +241,61 @@ class NPUModelRunner(GPUModelRunner):
             profiling_config,
             scheduler_output,
         )
+        graph_manager = self.cudagraph_manager
+        long_verification_active = (
+            not dummy_run
+            and hasattr(self.speculator, "initialize_intermediate")
+            and any(
+                len(tokens) + 1 > MAX_DECODE_QUERY_LEN
+                for tokens in scheduler_output.scheduled_spec_decode_tokens.values()
+            )
+        )
+        if graph_manager is not None and not dummy_run:
+            graph_manager.long_verification_active = long_verification_active
         trace_verification = hasattr(self.rejection_sampler, "begin_forward")
-        if trace_verification:
-            self.rejection_sampler.begin_forward(scheduler_output, dummy_run)
+        try:
+            if trace_verification:
+                self.rejection_sampler.begin_forward(scheduler_output, dummy_run)
 
-        if vllm_version_is("0.27.1"):
-            output = super().execute_model(
-                scheduler_output,
-                intermediate_tensors=intermediate_tensors,
-                dummy_run=dummy_run,
-                skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-                is_profile=is_profile,
-            )
-        else:
-            output = super().execute_model(
-                scheduler_output,
-                intermediate_tensors=intermediate_tensors,
-                dummy_run=dummy_run,
-                skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-                is_profile=is_profile,
-                context_len=context_len,
-            )
-
-        if trace_verification:
-            self.rejection_sampler.end_forward()
+            if vllm_version_is("0.27.1"):
+                output = super().execute_model(
+                    scheduler_output,
+                    intermediate_tensors=intermediate_tensors,
+                    dummy_run=dummy_run,
+                    skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                    is_profile=is_profile,
+                )
+            else:
+                output = super().execute_model(
+                    scheduler_output,
+                    intermediate_tensors=intermediate_tensors,
+                    dummy_run=dummy_run,
+                    skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                    is_profile=is_profile,
+                    context_len=context_len,
+                )
+        finally:
+            if trace_verification:
+                self.rejection_sampler.end_forward()
+            if graph_manager is not None and not dummy_run:
+                graph_manager.long_verification_active = False
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
             profiling_config,
             execution_start_time,
         )
         return output
+
+    @torch.inference_mode()
+    def capture_model(self):
+        graph_manager = self.cudagraph_manager
+        capture_long_verification = bool(graph_manager and graph_manager.long_verification_graphs)
+        if capture_long_verification:
+            graph_manager.long_verification_active = True
+        try:
+            return super().capture_model()
+        finally:
+            if capture_long_verification:
+                graph_manager.long_verification_active = False
 
     @torch.inference_mode()
     def profile_run(self) -> None:
@@ -810,7 +836,10 @@ class NPUModelRunner(GPUModelRunner):
         # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
         if (
             cudagraph_runtime_mode == CUDAGraphMode.FULL
-            and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
+            and (
+                self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
+                or getattr(self.cudagraph_manager, "long_verification_active", False)
+            )
         ):
             num_reqs_padded = num_reqs
         else:

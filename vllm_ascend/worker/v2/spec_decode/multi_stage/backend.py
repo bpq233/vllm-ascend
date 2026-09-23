@@ -47,6 +47,11 @@ def _validate_full_graph_capture(mode, planned_sizes, captured_sizes):
         )
 
 
+def intermediate_graph_mode(mode):
+    """Use full graphs for the isolated verifier's variable-length queries."""
+    return CUDAGraphMode.FULL if mode == CUDAGraphMode.FULL_DECODE_ONLY else mode
+
+
 class IntermediateKVCache:
     def __init__(self, capacity):
         self.capacity = capacity
@@ -215,14 +220,13 @@ class IntermediateBackend:
         self.vllm_config = copy(parent_config)
         self.vllm_config.additional_config = deepcopy(parent_config.additional_config or {})
         self.vllm_config.additional_config.pop("multi_stage_speculative", None)
+        verifier_graph_mode = intermediate_graph_mode(parent_config.compilation_config.cudagraph_mode)
         self.vllm_config.compilation_config = CompilationConfig(
             # The verifier is captured directly by ModelAclGraphManager below.
             # Do not wrap its forward in torch.compile: AOT shape-guard creation
             # fails for these multiple concrete FULL graph sizes.
             mode=CompilationMode.NONE,
-            cudagraph_mode=parent_config.compilation_config.cudagraph_mode
-            if self.graph_enabled
-            else CUDAGraphMode.NONE,
+            cudagraph_mode=verifier_graph_mode if self.graph_enabled else CUDAGraphMode.NONE,
             custom_ops=list(parent_config.compilation_config.custom_ops),
         )
         self.vllm_config.scheduler_config = copy(parent_config.scheduler_config)
