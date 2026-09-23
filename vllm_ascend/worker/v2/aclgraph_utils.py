@@ -63,30 +63,24 @@ def target_graph_mode(vllm_config, cudagraph_mode):
 
 
 def long_verification_capture_shapes(vllm_config):
-    """Capture one TP-aligned FULL bucket for each long-verification batch size."""
+    """Capture exact TP-aligned query shapes for long verification batches."""
     compilation = vllm_config.compilation_config
     if (
         compilation.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
         or not uses_long_speculative_queries(vllm_config)
-        or not compilation.cudagraph_capture_sizes
     ):
         return []
-    max_size = min(
-        compilation.max_cudagraph_capture_size or compilation.cudagraph_capture_sizes[-1],
-        compilation.cudagraph_capture_sizes[-1],
-        vllm_config.scheduler_config.max_num_batched_tokens,
-        vllm_config.scheduler_config.max_num_seqs * (vllm_config.speculative_config.num_speculative_tokens + 1),
-    )
+    max_size = vllm_config.scheduler_config.max_num_batched_tokens
     tp_size = vllm_config.parallel_config.tensor_parallel_size
-    max_size = max_size // tp_size * tp_size
     query_width = vllm_config.speculative_config.num_speculative_tokens + 1
-    if max_size <= MAX_DECODE_QUERY_LEN or query_width <= MAX_DECODE_QUERY_LEN:
+    if query_width <= MAX_DECODE_QUERY_LEN:
         return []
     shapes = []
     for num_reqs in range(1, vllm_config.scheduler_config.max_num_seqs + 1):
-        num_tokens = min((num_reqs * query_width + tp_size - 1) // tp_size * tp_size, max_size)
-        if num_tokens > MAX_DECODE_QUERY_LEN:
-            shapes.append((num_reqs, num_tokens))
+        num_tokens = (num_reqs * query_width + tp_size - 1) // tp_size * tp_size
+        if num_tokens > max_size:
+            break
+        shapes.append((num_reqs, num_tokens))
     return shapes
 
 
@@ -210,12 +204,12 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             num_active_loras,
             **dispatch_kwargs,
         )
-        if (
-            desc.cg_mode != CUDAGraphMode.NONE
-            or not getattr(self, "long_verification_active", False)
-            or max_query_len is None
-            or max_query_len <= MAX_DECODE_QUERY_LEN
-        ):
+        long_verification = (
+            getattr(self, "long_verification_active", False)
+            and max_query_len is not None
+            and max_query_len > MAX_DECODE_QUERY_LEN
+        )
+        if not long_verification:
             return desc
         effective_loras = self._resolve_effective_loras(num_active_loras)
         graph_desc = select_long_verification_graph(
@@ -225,13 +219,13 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             effective_loras,
         )
         if graph_desc is None:
-            logger.warning_once(
-                "No captured FULL graph for long Target verification: num_reqs=%d num_tokens=%d. "
-                "Increase max_num_batched_tokens/max_cudagraph_capture_size to cover this query.",
-                num_reqs,
-                num_tokens,
+            raise RuntimeError(
+                "No captured FULL graph matches long Target verification: "
+                f"num_reqs={num_reqs}, num_tokens={num_tokens}, uniform_token_count={uniform_token_count}, "
+                f"max_query_len={max_query_len}, ordinary_dispatch_mode={desc.cg_mode}, "
+                f"captured_shapes={[(desc.num_reqs, desc.num_tokens) for desc in self.long_verification_graphs]}. "
+                "Refusing an unexpected eager fallback."
             )
-            return desc
         return graph_desc
 
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
@@ -243,8 +237,9 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         num_tokens = desc.num_tokens
         logger.info_once("run_fullgraph with num_tokens=%s", num_tokens)
         assert self.update_stream is not None
-        self.update_stream.wait_stream(torch.npu.current_stream())
-        ret = super().run_fullgraph(desc)
+        current_stream = torch.npu.current_stream()
+        logger.debug("Target FULL graph %d: waiting for parameter-update stream", num_tokens)
+        self.update_stream.wait_stream(current_stream)
 
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
         # calculate num_tokens_across_dp.
@@ -278,6 +273,10 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 self.vllm_config,
                 self.model_runner.speculative_config,
             )
+        current_stream.wait_stream(self.update_stream)
+        logger.debug("Target FULL graph %d: attention parameters updated; replay begin", num_tokens)
+        ret = super().run_fullgraph(desc)
+        logger.debug("Target FULL graph %d: replay complete", num_tokens)
         return ret
 
     def capture(
@@ -297,7 +296,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         """Capture CUDA graphs for model forward pass."""
         model = ModelWithContext(model)
         with communicator_switch():
-            return super().capture(
+            result = super().capture(
                 model,
                 model_state,
                 input_buffers,
@@ -310,6 +309,15 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 lora_capture_hook=lora_capture_hook,
                 progress_bar_desc=progress_bar_desc,
             )
+        if self._max_full_descs_to_capture is None:
+            missing = [desc for desc in self.long_verification_graphs if desc not in self.graphs]
+            if missing:
+                raise RuntimeError(
+                    "Long Target verification graph capture is incomplete: "
+                    f"missing_descriptors={missing}. Reduce max_num_seqs or speculative width, "
+                    "or increase max_num_batched_tokens/max_cudagraph_capture_size."
+                )
+        return result
 
 
 class ModelWithContext(nn.Module):

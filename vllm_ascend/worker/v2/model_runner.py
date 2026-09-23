@@ -845,21 +845,25 @@ class NPUModelRunner(GPUModelRunner):
         else:
             num_reqs_padded = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs
 
-        if num_tokens_padded == num_reqs_padded * self.decode_query_len:
-            # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
+        query_lens = np.diff(query_start_loc_np[: num_reqs + 1])
+        uniform_decode = len(query_lens) > 0 and np.all(query_lens == self.decode_query_len)
+        if uniform_decode and num_tokens_padded == num_reqs_padded * self.decode_query_len:
+            # Pad with complete decode queries only when the real requests are
+            # uniform and the descriptor has spare request rows.
             assert num_reqs <= num_reqs_padded
-
             last_loc = query_start_loc_np[num_reqs]
             query_start_loc_np[num_reqs + 1 : num_reqs_padded + 1] = (
                 np.arange(1, num_reqs_padded + 1 - num_reqs) * self.decode_query_len + last_loc
             )
+        elif query_start_loc_np[num_reqs] == num_tokens_padded:
+            # The real ragged boundaries already cover the captured token shape.
+            pass
         else:
-            # Mixed-batch case: num_reqs must equal num_reqs_padded
+            # A final dummy request covers token padding without changing any
+            # real request's query boundary, including ragged padded batches.
             assert num_reqs == num_reqs_padded
-
-            # Insert a dummy request instead of setting query_start_loc[num_reqs] = num_tokens_padded directly
             query_start_loc_np[num_reqs_padded + 1] = num_tokens_padded
-            num_reqs_padded = num_reqs_padded + 1
+            num_reqs_padded += 1
 
         return query_start_loc_np, num_reqs_padded
 
