@@ -309,7 +309,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 lora_capture_hook=lora_capture_hook,
                 progress_bar_desc=progress_bar_desc,
             )
-        if self._max_full_descs_to_capture is None:
+        if getattr(self, "_max_full_descs_to_capture", None) is None:
             missing = [desc for desc in self.long_verification_graphs if desc not in self.graphs]
             if missing:
                 raise RuntimeError(

@@ -463,6 +463,67 @@ def test_target_graph_parameter_update_precedes_replay():
     assert calls == ["update.wait(current)", "update", "current.wait(update)", "replay"]
 
 
+@pytest.mark.parametrize("capture_succeeds", [True, False])
+def test_long_graph_capture_validation_supports_old_manager_without_profile_field(capture_succeeds):
+    tree = ast.parse((ROOT / "worker/v2/aclgraph_utils.py").read_text(encoding="utf-8"))
+    manager_cls = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ModelAclGraphManager"
+    )
+    method = next(node for node in manager_cls.body if isinstance(node, ast.FunctionDef) and node.name == "capture")
+    expected = type("Descriptor", (), {"num_tokens": 216})()
+
+    class Base:
+        def capture(self, *args, **kwargs):
+            if capture_succeeds:
+                self.graphs[expected] = object()
+
+    class CaptureContext:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    manager_cls_copy = ast.ClassDef(
+        name="Manager",
+        bases=[ast.Name(id="Base", ctx=ast.Load())],
+        keywords=[],
+        body=[method],
+        decorator_list=[],
+    )
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), manager_cls_copy],
+        type_ignores=[],
+    )
+    namespace = dict(
+        Base=Base,
+        nn=NS(Module=object),
+        ModelState=object,
+        InputBuffers=object,
+        IntermediateTensors=object,
+        BlockTables=object,
+        AttentionGroup=object,
+        KVCacheConfig=object,
+        Callable=object,
+        ModelWithContext=lambda model: model,
+        communicator_switch=CaptureContext,
+        CUDAGraphMode=NS(FULL="full"),
+    )
+    exec(compile(ast.fix_missing_locations(module), "old_manager_capture", "exec"), namespace)
+    manager = namespace["Manager"]()
+    manager.long_verification_graphs = [expected]
+    manager.graphs = {}
+    args = (object(), object(), object(), None, object(), [], object())
+    if capture_succeeds:
+        manager.capture(*args)
+    else:
+        with pytest.raises(RuntimeError, match="Long Target verification graph capture is incomplete"):
+            manager.capture(*args)
+
+
 def test_both_runner_versions_sort_short_queries_before_long_candidates():
     tree = ast.parse((ROOT / "worker/v2/model_runner.py").read_text(encoding="utf-8"))
     methods = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "prepare_inputs"]
