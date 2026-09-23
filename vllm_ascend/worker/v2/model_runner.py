@@ -78,6 +78,18 @@ class NPUModelRunner(GPUModelRunner):
 
     execute_model_state: ExecuteModelState | None
 
+    @staticmethod
+    def _is_long_verification_batch(scheduler_output: SchedulerOutput) -> bool:
+        scheduled = scheduler_output.num_scheduled_tokens
+        drafts = scheduler_output.scheduled_spec_decode_tokens
+        return bool(scheduled) and all(
+            req_id in drafts
+            and drafts[req_id]
+            and num_tokens == len(drafts[req_id]) + 1
+            and num_tokens > MAX_DECODE_QUERY_LEN
+            for req_id, num_tokens in scheduled.items()
+        )
+
     @property
     def pcp_manager_cls(self) -> type[AscendPCPManager]:
         return AscendPCPManager
@@ -245,10 +257,7 @@ class NPUModelRunner(GPUModelRunner):
         long_verification_active = (
             not dummy_run
             and hasattr(self.speculator, "initialize_intermediate")
-            and any(
-                len(tokens) + 1 > MAX_DECODE_QUERY_LEN
-                for tokens in scheduler_output.scheduled_spec_decode_tokens.values()
-            )
+            and self._is_long_verification_batch(scheduler_output)
         )
         if graph_manager is not None and not dummy_run:
             graph_manager.long_verification_active = long_verification_active

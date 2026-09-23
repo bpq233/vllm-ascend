@@ -393,6 +393,38 @@ def test_capture_model_preserves_long_verification_capture_state():
     assert manager.long_verification_active is False
 
 
+@pytest.mark.parametrize(
+    "scheduled,drafts,expected",
+    [
+        ({"a": 131, "b": 102}, {"a": [0] * 130, "b": [0] * 101}, True),
+        ({"a": 131, "b": 102}, {"a": [0] * 130}, False),
+        ({"a": 131, "b": 1}, {"a": [0] * 130, "b": []}, False),
+        ({"a": 16}, {"a": [0] * 15}, False),
+    ],
+)
+def test_only_pure_long_verification_batches_enable_target_long_graphs(scheduled, drafts, expected):
+    tree = ast.parse((ROOT / "worker/v2/model_runner.py").read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner")
+    method = next(
+        node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_is_long_verification_batch"
+    )
+    cls_copy = ast.ClassDef(
+        name="Runner",
+        bases=[],
+        keywords=[],
+        body=[method],
+        decorator_list=[],
+    )
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), cls_copy],
+        type_ignores=[],
+    )
+    namespace = dict(MAX_DECODE_QUERY_LEN=16, SchedulerOutput=object)
+    exec(compile(ast.fix_missing_locations(module), "long_verify_gate", "exec"), namespace)
+    output = NS(num_scheduled_tokens=scheduled, scheduled_spec_decode_tokens=drafts)
+    assert namespace["Runner"]._is_long_verification_batch(output) is expected
+
+
 def test_target_graph_parameter_update_precedes_replay():
     tree = ast.parse((ROOT / "worker/v2/aclgraph_utils.py").read_text(encoding="utf-8"))
     manager_cls = next(
