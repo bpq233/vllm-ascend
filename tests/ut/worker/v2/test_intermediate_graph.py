@@ -19,7 +19,13 @@ def graph_helpers():
         n
         for n in tree.body
         if isinstance(n, (ast.ClassDef, ast.FunctionDef))
-        and n.name in ("IntermediateGraphState", "init_secondary_graphs", "capture_secondary_graphs")
+        and n.name
+        in (
+            "IntermediateGraphState",
+            "init_secondary_graphs",
+            "capture_secondary_graphs",
+            "_validate_full_graph_capture",
+        )
     ]
     params = NS(_graph_params=object(), _draft_graph_params=object(), _draft_graph_prefill_params=object())
     stream = Mock(return_value=object())
@@ -100,6 +106,14 @@ def test_requested_graphs_do_not_silently_fall_back(graph_helpers):
     drafter = NS(query_cudagraph_manager=NS(needs_capture=lambda: False), init_cudagraph_manager=Mock())
     with pytest.raises(ValueError, match="full graph attention support"):
         h.init_secondary_graphs(drafter, "full", "npu:0")
+
+
+def test_full_graph_capture_validation_requires_every_planned_size(graph_helpers):
+    validate = graph_helpers._validate_full_graph_capture
+    validate("full", [1, 16, 64], [1, 16, 64])
+    with pytest.raises(RuntimeError, match=r"missing_sizes=\[64\]"):
+        validate("full", [1, 16, 64], [1, 16])
+    validate("full_and_piecewise", [1, 16, 64], [1])
 
 
 @pytest.mark.parametrize("draft", [False, True])

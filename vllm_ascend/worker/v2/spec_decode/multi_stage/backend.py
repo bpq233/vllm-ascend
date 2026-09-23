@@ -35,6 +35,18 @@ from vllm_ascend.worker.v2.spec_decode.multi_stage.config import intermediate_ca
 logger = logging.getLogger(__name__)
 
 
+def _validate_full_graph_capture(mode, planned_sizes, captured_sizes):
+    if mode != CUDAGraphMode.FULL:
+        return
+    missing = sorted(set(planned_sizes) - set(captured_sizes))
+    if missing:
+        raise RuntimeError(
+            "Intermediate verifier FULL ACL graph capture is incomplete: "
+            f"planned_sizes={sorted(set(planned_sizes))}, captured_sizes={sorted(set(captured_sizes))}, "
+            f"missing_sizes={missing}."
+        )
+
+
 class IntermediateKVCache:
     def __init__(self, capacity):
         self.capacity = capacity
@@ -180,6 +192,12 @@ class IntermediateBackend:
             not parent_config.model_config.enforce_eager
             and parent_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         )
+        if not self.graph_enabled:
+            logger.warning(
+                "multi_stage_verifier_graphs_disabled enforce_eager=%s cudagraph_mode=%s",
+                parent_config.model_config.enforce_eager,
+                parent_config.compilation_config.cudagraph_mode,
+            )
         self.graph_state = IntermediateGraphState()
         self.cudagraph_manager = None
         self.graph_replays = 0
@@ -201,9 +219,9 @@ class IntermediateBackend:
         self.vllm_config.additional_config = deepcopy(parent_config.additional_config or {})
         self.vllm_config.additional_config.pop("multi_stage_speculative", None)
         self.vllm_config.compilation_config = CompilationConfig(
-            # Intermediate FULL ACL graphs capture the eager model directly.
-            # AOT/npugraph_ex compilation currently crashes in PyTorch shape
-            # guard creation for this multi-size verifier graph.
+            # The verifier is captured directly by ModelAclGraphManager below.
+            # Do not wrap its forward in torch.compile: AOT shape-guard creation
+            # fails for these multiple concrete FULL graph sizes.
             mode=CompilationMode.NONE,
             cudagraph_mode=parent_config.compilation_config.cudagraph_mode
             if self.graph_enabled
@@ -255,7 +273,9 @@ class IntermediateBackend:
             seed=parent.seed,
             trust_remote_code=parent.trust_remote_code,
             max_model_len=self.max_model_len,
-            enforce_eager=not self.graph_enabled,
+            # ACL graph capture is performed explicitly by ModelAclGraphManager;
+            # keep FX/AOT compilation out of the isolated verifier model.
+            enforce_eager=True,
         )
         # A copied target config may carry target-specific quantization state.
         cfg.quant_config = None
@@ -287,8 +307,6 @@ class IntermediateBackend:
         if self.max_model_len <= self.config.num_speculative_tokens + 1:
             raise ValueError("Intermediate max_model_len must leave room for DFlash's anchor and draft.")
         if self.graph_enabled:
-            from vllm_ascend.platform import _setup_compile_backend
-
             # Every bucket captures pieces in every verifier layer and holds
             # runtime/TP stream resources. Dense 1..32 gears are too costly
             # with four resident models; use sparse padding-compatible gears.
@@ -299,12 +317,6 @@ class IntermediateBackend:
                 self.config.cudagraph_capture_sizes,
             )
             cfg.compilation_config.max_cudagraph_capture_size = self.max_num_tokens
-            # Compile one concrete FX/ACL artifact per capture size. Without
-            # this, npugraph_ex may specialize output allocation at the first
-            # size (typically 1 token) and reuse an output shaped [1, ...] for
-            # a later 4094-token verifier call.
-            cfg.compilation_config.compile_sizes = list(cfg.compilation_config.cudagraph_capture_sizes)
-            _setup_compile_backend(cfg, self.parent_config.compilation_config.oot_compiler)
         with self._context():
             self.model = get_model_loader(cfg.load_config).load_model(vllm_config=cfg, model_config=cfg.model_config)
             self.decision_runner = IntermediateDecisionRunner(
@@ -365,6 +377,19 @@ class IntermediateBackend:
             self.kv_cache_config,
             use_aux_hidden_state_outputs=True,
             progress_bar_desc="Capturing intermediate verifier graphs",
+        )
+        captured_sizes = self.cudagraph_manager.captured_token_counts()
+        _validate_full_graph_capture(
+            self.vllm_config.compilation_config.cudagraph_mode,
+            self.cudagraph_manager.capture_sizes,
+            captured_sizes,
+        )
+        logger.info(
+            "multi_stage_graph_capture_complete verifier=%s mode=%s graph_count=%d captured_sizes=%s",
+            self.config.verifier_model,
+            self.vllm_config.compilation_config.cudagraph_mode,
+            len(self.cudagraph_manager.graphs),
+            captured_sizes,
         )
         capture_secondary_graphs(self.drafter)
         # Capture in the same deterministic order on every TP rank. Keep
@@ -815,6 +840,9 @@ class IntermediateBackend:
 
     def profile(self):
         # Include full-prefix activations in the main worker's peak measurement.
+        self.cache.retain(())
+        self._context_rows = [None] * self.max_num_reqs
+        graph_replays_before = self.graph_replays
         length = self.max_model_len - self.config.num_speculative_tokens
         rows, remaining = [], self.max_num_tokens
         while remaining >= 2 and len(rows) < self.max_num_reqs:
@@ -832,5 +860,15 @@ class IntermediateBackend:
         width = min(width, self.max_model_len - 1)
         for logits in self.verify([row[: max(1, len(row) - width)] for row in rows], [[0] * width for _ in rows]):
             logits.topk(min(self.config.verification.get("top_k", 5), logits.shape[-1]), dim=-1)
+        graph_replays = self.graph_replays - graph_replays_before
+        if self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL and rows and not graph_replays:
+            raise RuntimeError("Intermediate FULL ACL graphs were captured but profiling replayed none.")
+        logger.info(
+            "multi_stage_graph_profile verifier=%s mode=%s replay_count=%d captured_sizes=%s",
+            self.config.verifier_model,
+            self.vllm_config.compilation_config.cudagraph_mode,
+            graph_replays,
+            self.cudagraph_manager.captured_token_counts() if self.cudagraph_manager else [],
+        )
         self.cache.retain(())
         self._context_rows = [None] * self.max_num_reqs
