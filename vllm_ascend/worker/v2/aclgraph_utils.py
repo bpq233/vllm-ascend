@@ -18,6 +18,7 @@
 #
 from collections.abc import Callable
 from contextlib import contextmanager
+from inspect import signature
 from typing import Any
 
 import torch
@@ -138,6 +139,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             )
             self.model_runner = model_runner
             self.update_stream = self.model_runner.update_stream
+            self._dispatch_parameters = signature(super().dispatch).parameters
             self.long_verification_graphs = self._add_long_verification_graphs(vllm_config)
             self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
             if super().needs_capture():
@@ -166,6 +168,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             self.breakable_cg_runner: BreakableACLGraphWrapper | None = None
             self.model_runner = model_runner
             self.update_stream = self.model_runner.update_stream
+            self._dispatch_parameters = signature(super().dispatch).parameters
             self.long_verification_graphs = self._add_long_verification_graphs(vllm_config)
             self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
             if super().needs_capture():
@@ -196,13 +199,17 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         max_query_len=None,
         num_ubatches=1,
     ):
+        dispatch_kwargs = {}
+        if "max_query_len" in self._dispatch_parameters:
+            dispatch_kwargs["max_query_len"] = max_query_len
+        if "num_ubatches" in self._dispatch_parameters:
+            dispatch_kwargs["num_ubatches"] = num_ubatches
         desc = super().dispatch(
             num_reqs,
             num_tokens,
             uniform_token_count,
             num_active_loras,
-            max_query_len=max_query_len,
-            num_ubatches=num_ubatches,
+            **dispatch_kwargs,
         )
         if (
             desc.cg_mode != CUDAGraphMode.NONE

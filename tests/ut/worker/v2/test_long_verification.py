@@ -184,6 +184,9 @@ def test_both_graph_manager_versions_capture_long_target_piecewise():
         def needs_capture(self):
             return False
 
+        def dispatch(self, num_reqs, num_tokens, uniform_token_count, num_active_loras):
+            return NS(cg_mode=GraphMode.NONE)
+
         def _add_long_verification_graphs(self, config):
             return ()
 
@@ -202,6 +205,7 @@ def test_both_graph_manager_versions_capture_long_target_piecewise():
         ns = dict(
             Base=Base,
             CUDAGraphMode=GraphMode,
+            signature=__import__("inspect").signature,
             uses_long_speculative_queries=routing.uses_long_speculative_queries,
             collect_sorted_captured_token_sizes=lambda desc: [],
         )
@@ -248,7 +252,7 @@ def test_long_target_graph_dispatch_is_opt_in_and_uses_compatible_bucket():
     dispatch = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "dispatch")
 
     class Base:
-        def dispatch(self, *args, **kwargs):
+        def dispatch(self, num_reqs, num_tokens, uniform_token_count, num_active_loras):
             return NS(cg_mode="none")
 
         def _resolve_effective_loras(self, count):
@@ -273,6 +277,7 @@ def test_long_target_graph_dispatch_is_opt_in_and_uses_compatible_bucket():
     exec(compile(ast.fix_missing_locations(module), "dispatch", "exec"), namespace)
     manager = namespace["Manager"]()
     manager.long_verification_graphs = [NS(num_tokens=32), NS(num_tokens=64)]
+    manager._dispatch_parameters = {"num_reqs": None, "num_tokens": None}
     manager.long_verification_active = False
     eager = manager.dispatch(1, 20, None, 0, max_query_len=20)
     assert eager.cg_mode == "none"
