@@ -94,10 +94,8 @@ class AscendInputBatch(InputBatch):
                 num_tokens,
                 input_buffers,
             )
-            base_tokens = num_tokens // num_reqs
-            num_extra = num_tokens % num_reqs
-            input_buffers.seq_lens_np[: num_reqs - num_extra] = base_tokens
-            input_buffers.seq_lens_np[num_reqs - num_extra : num_reqs] = base_tokens + 1
+            # Upstream dummy batches can be ragged; preserve their Q/KV split.
+            input_buffers.seq_lens_np[:num_reqs] = input_batch.num_scheduled_tokens
             input_buffers.seq_lens_np[num_reqs:] = 0
             seq_lens_np = input_buffers.seq_lens_np[:num_reqs]
             update_cos_sin(input_batch.positions)
@@ -126,10 +124,8 @@ class AscendInputBatch(InputBatch):
                 input_buffers,
                 max_query_len=max_query_len,
             )
-            base_tokens = num_tokens // num_reqs
-            num_extra = num_tokens % num_reqs
-            input_buffers.seq_lens_np[: num_reqs - num_extra] = base_tokens
-            input_buffers.seq_lens_np[num_reqs - num_extra : num_reqs] = base_tokens + 1
+            # Upstream dummy batches can be ragged; preserve their Q/KV split.
+            input_buffers.seq_lens_np[:num_reqs] = input_batch.num_scheduled_tokens
             input_buffers.seq_lens_np[num_reqs:] = 0
             seq_lens_np = input_buffers.seq_lens_np[:num_reqs]
             update_cos_sin(input_batch.positions)

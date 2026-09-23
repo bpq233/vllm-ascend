@@ -83,7 +83,7 @@ def _normalize_fia_query_metadata(
 ):
     """Drop graph-padding requests when the caller supplied an unpadded query."""
     if not actual_seq_lengths_q:
-        return [query_tokens], actual_seq_lengths_kv[:1], block_table[:1] if block_table is not None else None
+        raise RuntimeError(f"FIA query boundaries are missing for query_tokens={query_tokens}.")
     if actual_seq_lengths_q[-1] == query_tokens:
         return actual_seq_lengths_q, actual_seq_lengths_kv, block_table
     if actual_seq_lengths_q[-1] < query_tokens:
@@ -94,15 +94,10 @@ def _normalize_fia_query_metadata(
     try:
         request_count = actual_seq_lengths_q.index(query_tokens) + 1
     except ValueError as exc:
-        if len(actual_seq_lengths_q) == 1:
-            return (
-                [query_tokens],
-                actual_seq_lengths_kv[:1],
-                block_table[:1] if block_table is not None else None,
-            )
         raise RuntimeError(
-            "FIA query metadata does not contain the unpadded query boundary: "
-            f"query_tokens={query_tokens}, actual_seq_lengths_q={actual_seq_lengths_q}."
+            "FIA query does not end at a request boundary: "
+            f"query_tokens={query_tokens}, actual_seq_lengths_q={actual_seq_lengths_q}. "
+            "Cannot infer request ownership or KV lengths by truncating the metadata."
         ) from exc
     return (
         actual_seq_lengths_q[:request_count],
@@ -111,12 +106,34 @@ def _normalize_fia_query_metadata(
     )
 
 
-def _fit_fia_query_to_output(query: torch.Tensor, output: torch.Tensor) -> tuple[torch.Tensor, int]:
+def _fit_fia_query_to_output(
+    query: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    layer_name=None,
+    attn_metadata=None,
+    key=None,
+    value=None,
+) -> tuple[torch.Tensor, int]:
     query_tokens = query.shape[0]
     output_tokens = output.shape[0]
-    if query_tokens <= output_tokens:
-        return query, query_tokens
-    return query[:output_tokens], output_tokens
+    boundaries = attn_metadata.actual_seq_lengths_q if attn_metadata is not None else None
+    invalid_boundary = boundaries is not None and (
+        not boundaries or (boundaries[-1] != query_tokens and query_tokens not in boundaries)
+    )
+    actual_tokens = getattr(attn_metadata, "num_actual_tokens", 0)
+    if query_tokens > output_tokens or invalid_boundary or actual_tokens > query_tokens:
+        raise RuntimeError(
+            "FIA input contract mismatch before KV cache update; refusing to discard query tokens. "
+            f"layer={layer_name}, query_shape={tuple(query.shape)}, output_shape={tuple(output.shape)}, "
+            f"key_shape={tuple(key.shape) if key is not None else None}, "
+            f"value_shape={tuple(value.shape) if value is not None else None}, "
+            f"actual_seq_lengths_q={boundaries}, "
+            f"num_actual_tokens={actual_tokens}, "
+            f"attn_state={getattr(attn_metadata, 'attn_state', None)}, capturing={_EXTRA_CTX.capturing}. "
+            "Check the caller's FX output allocation and the active batch metadata."
+        )
+    return query, query_tokens
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -1800,7 +1817,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             raise NotImplementedError("fused output quantization is not yet supported for AscendAttentionBackendImpl")
 
         assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
-        query, num_tokens = _fit_fia_query_to_output(query, output)
+        query, num_tokens = _fit_fia_query_to_output(
+            query, output, layer_name=layer.layer_name, attn_metadata=attn_metadata, key=key, value=value
+        )
         if attn_metadata is None:
             return output.fill_(0)
 
@@ -1909,7 +1928,9 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError("fused output quantization is not yet supported for AscendC8AttentionBackendImpl")
 
-        query, num_tokens = _fit_fia_query_to_output(query, output)
+        query, num_tokens = _fit_fia_query_to_output(
+            query, output, layer_name=layer.layer_name, attn_metadata=attn_metadata, key=key, value=value
+        )
         if attn_metadata is None:
             return output.fill_(0)
 

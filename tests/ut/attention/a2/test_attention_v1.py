@@ -40,21 +40,16 @@ class TestAttentionGraphHelpers(TestBase):
         assert kv == [32]
         assert blocks.shape == (1, 4)
 
-    def test_normalize_fia_query_metadata_repairs_stale_single_boundary(self):
-        q, kv, blocks = _normalize_fia_query_metadata(1, [4094], [4094], None)
+    def test_normalize_fia_query_metadata_rejects_unknown_request_boundary(self):
+        for boundaries in ([4094], [4080, 4094]):
+            with self.assertRaisesRegex(RuntimeError, "Cannot infer request ownership"):
+                _normalize_fia_query_metadata(1, boundaries, [4094] * len(boundaries), None)
 
-        assert q == [1]
-        assert kv == [4094]
-        assert blocks is None
-
-    def test_fit_fia_query_to_output_uses_output_extent(self):
+    def test_fit_fia_query_to_output_does_not_discard_tokens(self):
         query = torch.empty(4094, 32, 128)
         output = torch.empty(1, 32, 128)
-
-        fitted_query, num_tokens = _fit_fia_query_to_output(query, output)
-
-        assert num_tokens == 1
-        assert fitted_query.shape == output.shape
+        with self.assertRaisesRegex(RuntimeError, "refusing to discard query tokens"):
+            _fit_fia_query_to_output(query, output)
 
     def test_cache_graph_workspace_keeps_first_workspace_by_default(self):
         graph_params = SimpleNamespace(workspaces={1: torch.empty(4)})

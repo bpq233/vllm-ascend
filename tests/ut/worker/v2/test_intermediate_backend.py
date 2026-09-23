@@ -30,6 +30,8 @@ def backend():
             "layer": NS(
                 actual_seq_lengths_q=kw["query_start_loc_cpu"][1:].tolist(),
                 seq_lens_list=kw["seq_lens_np"].tolist(),
+                seq_lens=kw["seq_lens"],
+                seq_lens_cpu=torch.from_numpy(kw["seq_lens_np"]),
                 block_tables=kw["block_tables"][0],
             )
         }
@@ -460,6 +462,8 @@ def test_intermediate_graph_padding_keeps_real_kv_and_logits(backend):
     assert obj.executed_tokens == 8
     assert obj.model_state.attn_metadata["layer"].actual_seq_lengths_q == [5, 8]
     assert obj.model_state.attn_metadata["layer"].seq_lens_list == [5, 3]
+    assert obj.model_state.attn_metadata["layer"].seq_lens.tolist() == [5, 3]
+    assert obj.model_state.attn_metadata["layer"].seq_lens_cpu.tolist() == [5, 3]
     assert obj.model_state.attn_metadata["layer"].block_tables[-1].tolist() == [0, 0]
     obj.cudagraph_manager.run_fullgraph.assert_called_once()
 
