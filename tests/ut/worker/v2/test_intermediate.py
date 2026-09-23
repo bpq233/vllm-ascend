@@ -330,11 +330,12 @@ def test_packed_decisions_match_individual_requests(modules):
 def test_sparse_capture_sizes_cover_verifier_and_secondary(modules):
     config, _ = modules
     sizes = config.intermediate_capture_sizes(4096, 4, 15)
-    assert sizes == [1, 16, 64, 256, 1024, 4096]
+    assert sizes == [1, 16, 32, 48, 64, 256, 1024, 4096]
     # Reported NPU failure used max_model_len=40960 and 44 legacy gears.
-    assert config.intermediate_capture_sizes(40960, 4, 15) == [1, 16, 64, 256, 1024, 4096, 16384, 40960]
+    assert config.intermediate_capture_sizes(40960, 4, 15) == [1, 16, 32, 48, 64, 256, 1024, 4096, 16384, 40960]
     assert config.intermediate_capture_sizes(40960, 4, 15, [64, 256]) == [64, 256, 40960]
     assert config.intermediate_capture_sizes(4096, 4, 15, [256, 64, 256]) == [64, 256, 4096]
+    assert config.intermediate_capture_sizes(128, 4, 4) == [1, 5, 10, 15, 16, 20, 64, 128]
     for requests in range(1, 5):
         assert any(requests * 16 <= size <= 4 * 16 and size % 16 == 0 for size in sizes)
     with pytest.raises(ValueError, match="token buffer"):

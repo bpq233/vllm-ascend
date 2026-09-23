@@ -12,7 +12,11 @@ def intermediate_capture_sizes(max_tokens, max_reqs, draft_width, requested=None
             raise ValueError("intermediate.cudagraph_capture_sizes must fit the intermediate token buffer.")
         sizes = set(requested)
     else:
-        sizes = {1}
+        # Capture full-width batches exactly for each supported request count.
+        # Partial acceptances then pad by at most one per-request draft width,
+        # instead of jumping from a small query directly to the next x4 gear.
+        stride = draft_width + 1
+        sizes = {1, *(stride * requests for requests in range(1, max_reqs + 1) if stride * requests <= max_tokens)}
         size = 16
         while size < max_tokens:
             sizes.add(size)
