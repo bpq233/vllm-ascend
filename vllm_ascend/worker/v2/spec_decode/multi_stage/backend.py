@@ -201,7 +201,10 @@ class IntermediateBackend:
         self.vllm_config.additional_config = deepcopy(parent_config.additional_config or {})
         self.vllm_config.additional_config.pop("multi_stage_speculative", None)
         self.vllm_config.compilation_config = CompilationConfig(
-            mode=CompilationMode.VLLM_COMPILE if self.graph_enabled else CompilationMode.NONE,
+            # Intermediate FULL ACL graphs capture the eager model directly.
+            # AOT/npugraph_ex compilation currently crashes in PyTorch shape
+            # guard creation for this multi-size verifier graph.
+            mode=CompilationMode.NONE,
             cudagraph_mode=parent_config.compilation_config.cudagraph_mode
             if self.graph_enabled
             else CUDAGraphMode.NONE,
