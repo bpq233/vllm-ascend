@@ -247,11 +247,11 @@ def test_full_decode_only_has_sparse_target_gears_for_long_verification():
     assert fn(cfg) == [(1, 56), (2, 112), (3, 168), (4, 216)]
 
     cfg.scheduler_config.max_num_batched_tokens = 200
-    assert fn(cfg) == [(1, 56), (2, 112), (3, 168)]
+    assert fn(cfg) == [(1, 56), (2, 112), (3, 168), (4, 200)]
 
     cfg.scheduler_config.max_num_batched_tokens = 512
     cfg.compilation_config.max_cudagraph_capture_size = 128
-    assert fn(cfg) == [(1, 56), (2, 112)]
+    assert fn(cfg) == [(1, 56), (2, 112), (3, 128), (4, 128)]
 
     cfg.compilation_config.max_cudagraph_capture_size = 0
     cfg.compilation_config.cudagraph_capture_sizes = []
@@ -297,6 +297,16 @@ def test_long_target_graph_dispatch_is_opt_in_and_uses_compatible_bucket():
     graph = manager.dispatch(1, 20, None, 0, max_query_len=20)
     assert graph.num_tokens == 32
     assert not hasattr(graph, "num_ubatches")
+
+
+def test_long_target_graph_reuses_capped_bucket_for_dynamic_query_width():
+    select = function(
+        "worker/v2/aclgraph_utils.py",
+        "select_long_verification_graph",
+        {},
+    )
+    graph = NS(num_reqs=4, num_tokens=128, num_active_loras=0)
+    assert select([graph], 4, 96, 0) is graph
 
 
 def test_long_graph_descriptors_pin_query_shape_when_supported():
@@ -346,7 +356,7 @@ def test_long_graph_descriptors_pin_query_shape_when_supported():
     manager = namespace["Manager"]()
     manager._add_long_verification_graphs(NS(speculative_config=NS(num_speculative_tokens=55)))
     desc = manager._capture_descs["full"][0]
-    assert desc.uniform_token_count == 56
+    assert desc.uniform_token_count is None
     assert desc.max_query_len == 56
 
 

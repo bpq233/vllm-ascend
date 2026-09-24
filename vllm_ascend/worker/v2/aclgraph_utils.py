@@ -68,8 +68,8 @@ def long_verification_capture_shapes(vllm_config):
     Long verification is cached-prefill rather than ordinary decode, so the
     regular ``cudagraph_capture_sizes`` do not cover it when the query is
     wider than ``MAX_DECODE_QUERY_LEN``. Keep this list sparse: one graph per
-    resident request count is enough because runtime queries are padded to the
-    exact candidate width.
+    resident request count is enough because runtime queries are padded to a
+    compatible token bucket.
     """
     compilation = vllm_config.compilation_config
     if (
@@ -88,15 +88,19 @@ def long_verification_capture_shapes(vllm_config):
         capture_limit = max(capture_sizes, default=0)
     if not capture_limit:
         return []
-    max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-    if capture_limit:
-        max_tokens = min(max_tokens, capture_limit)
+    # Preserve every request-count bucket, even when its nominal width is
+    # larger than the capture limit; runtime FIA padding can use the capped
+    # token bucket as long as the descriptor keeps the true max query width.
+    max_tokens = min(vllm_config.scheduler_config.max_num_batched_tokens, capture_limit)
     tp_size = vllm_config.parallel_config.tensor_parallel_size
+    max_tokens = max_tokens // tp_size * tp_size
+    if max_tokens <= MAX_DECODE_QUERY_LEN:
+        return []
+
     shapes = []
     for num_reqs in range(1, vllm_config.scheduler_config.max_num_seqs + 1):
-        num_tokens = (num_reqs * query_width + tp_size - 1) // tp_size * tp_size
-        if num_tokens > max_tokens:
-            break
+        requested_tokens = (num_reqs * query_width + tp_size - 1) // tp_size * tp_size
+        num_tokens = min(requested_tokens, max_tokens)
         shapes.append((num_reqs, num_tokens))
     return shapes
 
@@ -189,16 +193,12 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         descriptor_parameters = signature(BatchExecutionDescriptor).parameters
         descs = []
         for num_reqs, num_tokens in shapes:
-            # TP alignment can add tokens to the final request. The capture
-            # path must describe that real shape; otherwise InputBatch rejects
-            # the descriptor before the graph is created.
-            captured_query_len = (num_tokens + num_reqs - 1) // num_reqs
             values = {
                 "cg_mode": CUDAGraphMode.FULL,
                 "num_tokens": num_tokens,
                 "num_reqs": num_reqs,
-                "uniform_token_count": captured_query_len,
-                "max_query_len": captured_query_len,
+                "uniform_token_count": None,
+                "max_query_len": vllm_config.speculative_config.num_speculative_tokens + 1,
             }
             descs.append(
                 BatchExecutionDescriptor(
