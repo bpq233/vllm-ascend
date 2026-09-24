@@ -3,27 +3,35 @@
 from dataclasses import dataclass, field
 
 MAX_DFLASH_DRAFT_TOKENS = 15
+MAX_AUTO_INTERMEDIATE_CAPTURE_TOKENS = 256
 
 
 def intermediate_capture_sizes(max_tokens, max_reqs, draft_width, requested=None):
-    """Sparse gears: four resident models share the device's stream budget."""
+    """Return sparse verifier/DFlash graph buckets without capturing long prefixes."""
     if requested is not None:
         if any(size > max_tokens for size in requested):
             raise ValueError("intermediate.cudagraph_capture_sizes must fit the intermediate token buffer.")
         sizes = set(requested)
     else:
+        capture_limit = min(max_tokens, MAX_AUTO_INTERMEDIATE_CAPTURE_TOKENS)
         # Capture full-width batches exactly for each supported request count.
         # Partial acceptances then pad by at most one per-request draft width,
         # instead of jumping from a small query directly to the next x4 gear.
         stride = draft_width + 1
-        sizes = {1, *(stride * requests for requests in range(1, max_reqs + 1) if stride * requests <= max_tokens)}
+        sizes = {
+            1,
+            *(stride * requests for requests in range(1, max_reqs + 1) if stride * requests <= capture_limit),
+        }
         size = 16
-        while size < max_tokens:
+        while size < capture_limit:
             sizes.add(size)
             size *= 4
-    # Cover the largest secondary batch even if the verifier gears are sparse.
-    # Smaller DFlash batches pad to a captured request count.
-    sizes.update((max_reqs * (draft_width + 1), max_tokens))
+        sizes.add(capture_limit)
+    # Cover the largest secondary batch when it fits the intermediate buffer.
+    # Do not append max_tokens: it is a context buffer size, not a graph need.
+    secondary_max = max_reqs * (draft_width + 1)
+    if secondary_max <= max_tokens:
+        sizes.add(secondary_max)
     return sorted(sizes)
 
 

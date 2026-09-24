@@ -317,7 +317,10 @@ class IntermediateBackend:
                 self.decode_query_len - 1,
                 self.config.cudagraph_capture_sizes,
             )
-            cfg.compilation_config.max_cudagraph_capture_size = self.max_num_tokens
+            cfg.compilation_config.max_cudagraph_capture_size = max(
+                cfg.compilation_config.cudagraph_capture_sizes,
+                default=0,
+            )
         with self._context():
             self.model = get_model_loader(cfg.load_config).load_model(vllm_config=cfg, model_config=cfg.model_config)
             self.decision_runner = IntermediateDecisionRunner(

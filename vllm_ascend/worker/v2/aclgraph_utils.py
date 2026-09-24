@@ -73,7 +73,8 @@ def long_verification_capture_shapes(vllm_config):
     """
     compilation = vllm_config.compilation_config
     if (
-        compilation.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
+        getattr(vllm_config.model_config, "enforce_eager", False)
+        or compilation.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
         or not uses_long_speculative_queries(vllm_config)
     ):
         return []
@@ -88,12 +89,22 @@ def long_verification_capture_shapes(vllm_config):
         capture_limit = max(capture_sizes, default=0)
     if not capture_limit:
         return []
-    # Preserve every request-count bucket, even when its nominal width is
-    # larger than the capture limit; runtime FIA padding can use the capped
-    # token bucket as long as the descriptor keeps the true max query width.
-    max_tokens = min(vllm_config.scheduler_config.max_num_batched_tokens, capture_limit)
+    scheduler_limit = vllm_config.scheduler_config.max_num_batched_tokens
+    # A configured capture limit may come from ordinary decode gears and be
+    # smaller than one complete long-verification batch. Such a limit cannot
+    # cover the batch (e.g. 4 * 36 = 144 with a 128-token gear), so add only
+    # the minimum capacity needed by the long query. Keep the scheduler limit
+    # as the hard bound; it is the actual maximum batch that can be scheduled.
+    capture_limit = min(capture_limit, scheduler_limit)
+    required_limit = min(
+        vllm_config.scheduler_config.max_num_seqs * query_width,
+        scheduler_limit,
+    )
     tp_size = vllm_config.parallel_config.tensor_parallel_size
-    max_tokens = max_tokens // tp_size * tp_size
+    scheduler_limit = scheduler_limit // tp_size * tp_size
+    capture_limit = min(capture_limit // tp_size * tp_size, scheduler_limit)
+    required_limit = min((required_limit + tp_size - 1) // tp_size * tp_size, scheduler_limit)
+    max_tokens = max(capture_limit, required_limit)
     if max_tokens <= MAX_DECODE_QUERY_LEN:
         return []
 
@@ -236,6 +247,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             getattr(self, "long_verification_active", False)
             and max_query_len is not None
             and max_query_len > MAX_DECODE_QUERY_LEN
+            and bool(self.long_verification_graphs)
         )
         if not long_verification:
             return desc

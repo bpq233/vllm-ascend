@@ -232,6 +232,7 @@ def test_full_decode_only_has_sparse_target_gears_for_long_verification():
         ),
     )
     cfg = NS(
+        model_config=NS(enforce_eager=False),
         compilation_config=NS(
             cudagraph_mode="full_decode_only",
             max_cudagraph_capture_size=512,
@@ -251,10 +252,17 @@ def test_full_decode_only_has_sparse_target_gears_for_long_verification():
 
     cfg.scheduler_config.max_num_batched_tokens = 512
     cfg.compilation_config.max_cudagraph_capture_size = 128
-    assert fn(cfg) == [(1, 56), (2, 112), (3, 128), (4, 128)]
+    # The ordinary 128-token gear is too small for four 36-token queries;
+    # long verification adds the minimum 216-token capacity it needs.
+    assert fn(cfg) == [(1, 56), (2, 112), (3, 168), (4, 216)]
 
     cfg.compilation_config.max_cudagraph_capture_size = 0
     cfg.compilation_config.cudagraph_capture_sizes = []
+    assert fn(cfg) == []
+
+    cfg.compilation_config.max_cudagraph_capture_size = 512
+    cfg.compilation_config.cudagraph_capture_sizes = [16, 32, 64, 128]
+    cfg.model_config.enforce_eager = True
     assert fn(cfg) == []
 
 
@@ -298,6 +306,12 @@ def test_long_target_graph_dispatch_is_opt_in_and_uses_compatible_bucket():
     assert graph.num_tokens == 32
     assert not hasattr(graph, "num_ubatches")
 
+    # Eager mode has no long-verification graph descriptors and must not enter
+    # the graph-only protection path.
+    manager.long_verification_graphs = []
+    eager = manager.dispatch(1, 20, None, 0, max_query_len=20)
+    assert eager.num_tokens == 64
+
 
 def test_long_target_graph_reuses_capped_bucket_for_dynamic_query_width():
     select = function(
@@ -307,6 +321,16 @@ def test_long_target_graph_reuses_capped_bucket_for_dynamic_query_width():
     )
     graph = NS(num_reqs=4, num_tokens=128, num_active_loras=0)
     assert select([graph], 4, 96, 0) is graph
+
+
+def test_long_target_graph_covers_actual_ragged_token_count():
+    select = function(
+        "worker/v2/aclgraph_utils.py",
+        "select_long_verification_graph",
+        {},
+    )
+    graph = NS(num_reqs=4, num_tokens=144, num_active_loras=0)
+    assert select([graph], 4, 131, 0) is graph
 
 
 def test_long_graph_descriptors_pin_query_shape_when_supported():
