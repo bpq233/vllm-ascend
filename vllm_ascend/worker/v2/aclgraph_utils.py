@@ -169,11 +169,21 @@ class ModelAclGraphManager(ModelCudaGraphManager):
 
     def _add_long_verification_graphs(self, vllm_config):
         shapes = long_verification_capture_shapes(vllm_config)
+        descriptor_parameters = signature(BatchExecutionDescriptor).parameters
+        query_width = vllm_config.speculative_config.num_speculative_tokens + 1
         descs = [
             BatchExecutionDescriptor(
-                cg_mode=CUDAGraphMode.FULL,
-                num_tokens=num_tokens,
-                num_reqs=num_reqs,
+                **{
+                    key: value
+                    for key, value in {
+                        "cg_mode": CUDAGraphMode.FULL,
+                        "num_tokens": num_tokens,
+                        "num_reqs": num_reqs,
+                        "uniform_token_count": query_width,
+                        "max_query_len": query_width,
+                    }.items()
+                    if key in descriptor_parameters
+                }
             )
             for num_reqs, num_tokens in shapes
         ]

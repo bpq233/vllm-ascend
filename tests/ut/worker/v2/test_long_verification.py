@@ -295,6 +295,57 @@ def test_long_target_graph_dispatch_is_opt_in_and_uses_compatible_bucket():
     assert not hasattr(graph, "num_ubatches")
 
 
+def test_long_graph_descriptors_pin_query_shape_when_supported():
+    tree = ast.parse((ROOT / "worker/v2/aclgraph_utils.py").read_text(encoding="utf-8"))
+    cls = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ModelAclGraphManager"
+    )
+    method = next(
+        node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_add_long_verification_graphs"
+    )
+
+    class Descriptor:
+        def __init__(self, cg_mode, num_tokens, num_reqs, uniform_token_count=None, max_query_len=None):
+            self.cg_mode = cg_mode
+            self.num_tokens = num_tokens
+            self.num_reqs = num_reqs
+            self.uniform_token_count = uniform_token_count
+            self.max_query_len = max_query_len
+
+        def __hash__(self):
+            return id(self)
+
+    class Base:
+        def __init__(self):
+            self.max_num_reqs = 4
+            self._capture_descs = {}
+
+    manager_cls = ast.ClassDef(
+        name="Manager",
+        bases=[ast.Name(id="Base", ctx=ast.Load())],
+        keywords=[],
+        body=[method],
+        decorator_list=[],
+    )
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), manager_cls],
+        type_ignores=[],
+    )
+    namespace = dict(
+        Base=Base,
+        BatchExecutionDescriptor=Descriptor,
+        CUDAGraphMode=NS(FULL="full"),
+        signature=__import__("inspect").signature,
+        long_verification_capture_shapes=lambda _: [(2, 112)],
+    )
+    exec(compile(ast.fix_missing_locations(module), "long_descriptor", "exec"), namespace)
+    manager = namespace["Manager"]()
+    manager._add_long_verification_graphs(NS(speculative_config=NS(num_speculative_tokens=55)))
+    desc = manager._capture_descs["full"][0]
+    assert desc.uniform_token_count == 56
+    assert desc.max_query_len == 56
+
+
 def test_long_full_replay_uses_full_mode_fia_query_boundaries():
     method = next(
         node
