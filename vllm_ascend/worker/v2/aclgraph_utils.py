@@ -238,8 +238,10 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         logger.info_once("run_fullgraph with num_tokens=%s", num_tokens)
         assert self.update_stream is not None
         current_stream = torch.npu.current_stream()
-        logger.debug("Target FULL graph %d: waiting for parameter-update stream", num_tokens)
         self.update_stream.wait_stream(current_stream)
+        logger.debug("Target FULL graph %d: replay begin", num_tokens)
+        ret = super().run_fullgraph(desc)
+        logger.debug("Target FULL graph %d: replay complete; updating attention parameters", num_tokens)
 
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
         # calculate num_tokens_across_dp.
@@ -273,10 +275,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 self.vllm_config,
                 self.model_runner.speculative_config,
             )
-        current_stream.wait_stream(self.update_stream)
-        logger.debug("Target FULL graph %d: attention parameters updated; replay begin", num_tokens)
-        ret = super().run_fullgraph(desc)
-        logger.debug("Target FULL graph %d: replay complete", num_tokens)
+        logger.debug("Target FULL graph %d: attention parameter update enqueued", num_tokens)
         return ret
 
     def capture(

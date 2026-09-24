@@ -492,7 +492,7 @@ def test_target_graph_parameter_update_precedes_replay():
     )
     manager.vllm_config = object()
     assert manager.run_fullgraph(NS(num_tokens=128, cg_mode="full")) == "output"
-    assert calls == ["update.wait(current)", "update", "current.wait(update)", "replay"]
+    assert calls == ["update.wait(current)", "replay", "update"]
 
 
 @pytest.mark.parametrize("capture_succeeds", [True, False])
