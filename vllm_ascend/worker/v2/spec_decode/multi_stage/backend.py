@@ -537,11 +537,11 @@ class IntermediateBackend:
             and uniform_token_count == self.decode_query_len
         )
         if desc is not None and requires_decode_graph and desc.cg_mode != CUDAGraphMode.FULL:
-            raise RuntimeError(
-                "Intermediate decode query has no captured FULL graph; "
-                f"mode={mode}, num_tokens={total}, num_reqs={n}, uniform_token_count={uniform_token_count}, "
-                f"captured_sizes={manager.captured_token_counts()}."
-            )
+            # FULL graph capture is opportunistic.  A long or ragged prefix can
+            # exceed the intentionally sparse capture buckets; running that
+            # shape eagerly is safer than forcing a giant ACL graph or treating
+            # the missing bucket as a correctness failure.
+            desc = None
         padded_total = desc.num_tokens if desc is not None else total
         # Pack CPU-produced inputs/metadata into one pinned H2D transfer. Views
         # stay alive through the queued work; no reusable host buffer can race

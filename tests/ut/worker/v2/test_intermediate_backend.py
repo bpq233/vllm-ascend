@@ -522,15 +522,15 @@ def test_proposal_scratch_addresses_stay_stable_across_batch_sizes(backend):
     assert second[10].tolist() == [0, 0]
 
 
-def test_missing_intermediate_graph_fails_instead_of_silent_eager(backend):
+def test_missing_intermediate_graph_falls_back_to_eager(backend):
     obj, _, _ = backend
     obj.cudagraph_manager = NS(
         dispatch=Mock(return_value=NS(cg_mode=None)),
         captured_token_counts=Mock(return_value=[]),
     )
-    with pytest.raises(RuntimeError, match="Intermediate decode query has no captured FULL graph"):
-        list(obj.verify([[1]], [[2]], req_ids=["a"]))
-    obj.model.assert_not_called()
+    result = list(obj.verify([[1]], [[2]], req_ids=["a"]))
+    assert result[0].tolist() == [[1.0, 0.0], [2.0, 1.0]]
+    obj.model.assert_called_once()
 
 
 @pytest.mark.parametrize("mode", ["none", "piecewise"])
