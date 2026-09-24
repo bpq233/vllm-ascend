@@ -209,6 +209,8 @@ def test_both_graph_manager_versions_capture_long_target_piecewise():
             signature=__import__("inspect").signature,
             uses_long_speculative_queries=routing.uses_long_speculative_queries,
             collect_sorted_captured_token_sizes=lambda desc: [],
+            _normalize_capture_config=lambda config: None,
+            _scalar_int=lambda value, name: value[0] if isinstance(value, list) else value,
         )
         ns["target_graph_mode"] = function("worker/v2/aclgraph_utils.py", "target_graph_mode", ns)
         exec(compile(ast.fix_missing_locations(module), "graph_manager", "exec"), ns)
@@ -228,8 +230,10 @@ def test_full_decode_only_has_sparse_target_gears_for_long_verification():
         dict(
         CUDAGraphMode=NS(FULL_DECODE_ONLY="full_decode_only"),
         MAX_DECODE_QUERY_LEN=16,
-        MAX_LONG_VERIFICATION_CAPTURE_TOKENS=128,
+        MAX_LONG_VERIFICATION_CAPTURE_TOKENS=256,
         uses_long_speculative_queries=lambda cfg: True,
+        _normalize_capture_config=lambda config: None,
+        _scalar_int=lambda value, name: value[0] if isinstance(value, list) else value,
         ),
     )
     cfg = NS(
@@ -243,13 +247,13 @@ def test_full_decode_only_has_sparse_target_gears_for_long_verification():
         speculative_config=NS(num_speculative_tokens=53),
         parallel_config=NS(tensor_parallel_size=1),
     )
-    assert fn(cfg) == [(1, 54), (2, 108)]
+    assert fn(cfg) == [(1, 54), (2, 108), (3, 162), (4, 216)]
 
     cfg.parallel_config.tensor_parallel_size = 8
-    assert fn(cfg) == [(1, 56), (2, 112)]
+    assert fn(cfg) == [(1, 56), (2, 112), (3, 168), (4, 216)]
 
     cfg.scheduler_config.max_num_batched_tokens = 200
-    assert fn(cfg) == [(1, 56), (2, 112)]
+    assert fn(cfg) == [(1, 56), (2, 112), (3, 168)]
 
     cfg.scheduler_config.max_num_batched_tokens = 512
     cfg.compilation_config.max_cudagraph_capture_size = 128
@@ -265,6 +269,35 @@ def test_full_decode_only_has_sparse_target_gears_for_long_verification():
     cfg.compilation_config.cudagraph_capture_sizes = [16, 32, 64, 128]
     cfg.model_config.enforce_eager = True
     assert fn(cfg) == []
+
+
+def test_long_verification_shape_inputs_must_be_scalar():
+    fn = function(
+        "worker/v2/aclgraph_utils.py",
+        "long_verification_capture_shapes",
+        dict(
+            CUDAGraphMode=NS(FULL_DECODE_ONLY="full_decode_only"),
+            MAX_DECODE_QUERY_LEN=16,
+            MAX_LONG_VERIFICATION_CAPTURE_TOKENS=256,
+            uses_long_speculative_queries=lambda cfg: True,
+            _normalize_capture_config=lambda config: setattr(
+                config.compilation_config, "max_cudagraph_capture_size", 256
+            ),
+            _scalar_int=lambda value, name: value[0] if isinstance(value, list) else value,
+        ),
+    )
+    cfg = NS(
+        model_config=NS(enforce_eager=False),
+        compilation_config=NS(
+            cudagraph_mode="full_decode_only",
+            max_cudagraph_capture_size=[256],
+            cudagraph_capture_sizes=[16, 32, 64, 128],
+        ),
+        scheduler_config=NS(max_num_batched_tokens=512, max_num_seqs=4),
+        speculative_config=NS(num_speculative_tokens=53),
+        parallel_config=NS(tensor_parallel_size=1),
+    )
+    assert fn(cfg) == [(1, 54), (2, 108), (3, 162), (4, 216)]
 
 
 def test_long_target_graph_dispatch_is_opt_in_and_uses_compatible_bucket():

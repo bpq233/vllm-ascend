@@ -108,9 +108,9 @@ logits 仍通过原 `combine_sampled_and_draft_tokens` / `logits_indices` 选取
 
 原 Target 的 `postprocess_sampled` 提交结果后，适配层才读取请求历史并处理原 draft。适配层只替换返回的 draft tensor 和交给 scheduler 的候选列表；Target 最终拒绝时仍使用原计数和 KV 回退流程。
 
-支持文本、full-attention、未量化的中间 verifier，复用 TP；不支持中间流水线的 PP/DP/CP、LoRA、异步调度或 adaptive verification。显式选择 FULL 时，四个模型的正式 forward 使用完整图，缺少匹配图即报错；其他模式遵循用户配置。中间 verifier 预捕获稀疏 token 桶；稳定输入缓冲区填入实际 query，padding 槽置为 -1，通过只读 block 0 的虚拟请求补齐 FIA 的 TND 边界，真实 KV 长度不变。中间图参数、更新流及 RoPE 与主模型隔离。图捕获、预热和内存 profile 是初始化过程，不属于正式重放。按缓存容量分组完成多轮，避免轮间反复淘汰；microbatch 预算按新增 query 计算。
+支持文本、full-attention、未量化的中间 verifier，复用 TP；不支持中间流水线的 PP/DP/CP、LoRA、异步调度或 adaptive verification。FULL 模式下，捕获桶内的 forward 使用完整图，超出稀疏桶的长前缀自动回退 eager，不强行捕获巨型图；其他模式遵循用户配置。中间 verifier 预捕获稀疏 token 桶；稳定输入缓冲区填入实际 query，padding 槽置为 -1，通过只读 block 0 的虚拟请求补齐 FIA 的 TND 边界，真实 KV 长度不变。中间图参数、更新流及 RoPE 与主模型隔离。图捕获、预热和内存 profile 是初始化过程，不属于正式重放。按缓存容量分组完成多轮，避免轮间反复淘汰；microbatch 预算按新增 query 计算。
 
-FULL 的范围是四个模型的 forward（包含 attention），不是把整个多级周期封装成一张图：logits/验收、候选列表、必要回传、FIA 参数更新和 CPU 轮次控制仍在模型图外。选择 FULL 时不使用 PIECEWISE；首次捕获会增加加载时间和常驻内存。仍需在目标 CANN/torch_npu 版本上验证长 query 的 FIA task update、图资源占用及吞吐。冷启动混合批次直接拼接设备端预测片段，避免额外上传预测行索引；关闭 DEBUG 时跳过逐 token 接受率统计和计时。长 Target 校验图最多捕获 128 token；超过现有 Target 捕获桶的长校验批次不额外生成大图，直接沿普通 dispatch 走 eager，避免长 FIA ACL 图重放卡住 Worker。
+FULL 的范围是四个模型的 forward（包含 attention），不是把整个多级周期封装成一张图：logits/验收、候选列表、必要回传、FIA 参数更新和 CPU 轮次控制仍在模型图外。选择 FULL 时不使用 PIECEWISE；首次捕获会增加加载时间和常驻内存。仍需在目标 CANN/torch_npu 版本上验证长 query 的 FIA task update、图资源占用及吞吐。冷启动混合批次直接拼接设备端预测片段，避免额外上传预测行索引；关闭 DEBUG 时跳过逐 token 接受率统计和计时。长 Target 校验图最多捕获 256 token；超过现有 Target 捕获桶的长校验批次不额外生成大图，直接沿普通 dispatch 走 eager，避免长 FIA ACL 图重放卡住 Worker。
 
 遇到 `EE1023 / Alloc Stream resource failed / Too many streams are created` 或 Worker 被系统 `Killed` 时，需要降低总捕获桶数量，而不是增加候选 token 限额。中间层默认采用稀疏小桶（例如 token buffer 为 4096、4 请求、DFlash 宽度 15 时为 `[1,16,32,48,64,256]`），自动图捕获上限为 256 token；长前缀继续使用已有 eager/FIA 路径，不会因为上下文长度自动捕获 1024/4096 图。可在 `intermediate` 中设置 `"cudagraph_capture_sizes": [64,256]`，显式配置只捕获指定桶，不再隐式追加最大上下文桶。更少桶会增加 padding 计算量，需要真机测量权衡。主模型的 `compilation_config.cudagraph_capture_sizes` 单独控制 Target/Primary，不能替代此中间层选项。捕获资源耗尽后应退出并重新启动该任务，不能在已报异步错误的进程内继续捕获。不要同时开启 `ASCEND_LAUNCH_BLOCKING=1` 与 ACL 图。
 

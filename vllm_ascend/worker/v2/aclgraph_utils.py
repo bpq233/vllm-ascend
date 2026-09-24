@@ -19,6 +19,7 @@
 from collections.abc import Callable
 from contextlib import contextmanager
 from inspect import signature
+from operator import index
 from typing import Any
 
 import torch
@@ -43,7 +44,43 @@ from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.utils import communicator_switch
 
-MAX_LONG_VERIFICATION_CAPTURE_TOKENS = 128
+MAX_LONG_VERIFICATION_CAPTURE_TOKENS = 256
+
+
+def _scalar_int(value, name):
+    """Return a scalar integer for values used as graph/cache keys."""
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            raise TypeError(f"{name} must be a scalar integer, got {value!r}")
+        value = value[0]
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a scalar integer, got {value!r}")
+    try:
+        return index(value)
+    except TypeError as exc:
+        raise TypeError(f"{name} must be a scalar integer, got {value!r}") from exc
+
+
+def _flatten_ints(value, name):
+    """Normalize flat or accidentally nested capture-size config to integers."""
+    if isinstance(value, (list, tuple)):
+        result = []
+        for item in value:
+            result.extend(_flatten_ints(item, name))
+        return result
+    return [_scalar_int(value, name)]
+
+
+def _normalize_capture_config(vllm_config):
+    """Keep graph capture sizes scalar before vLLM uses descriptors as dict keys."""
+    compilation = vllm_config.compilation_config
+    sizes = getattr(compilation, "cudagraph_capture_sizes", None)
+    if sizes is not None:
+        compilation.cudagraph_capture_sizes = sorted(set(_flatten_ints(sizes, "cudagraph_capture_sizes")))
+    max_size = getattr(compilation, "max_cudagraph_capture_size", None)
+    if isinstance(max_size, (list, tuple)):
+        values = _flatten_ints(max_size, "max_cudagraph_capture_size")
+        compilation.max_cudagraph_capture_size = max(values)
 
 
 def collect_sorted_captured_token_sizes(capture_descs: dict) -> list[int]:
@@ -57,7 +94,13 @@ def collect_sorted_captured_token_sizes(capture_descs: dict) -> list[int]:
     by these rounded token counts, so they must be derived from the actual
     capture descriptors, not the raw config sizes.
     """
-    return sorted({desc.num_tokens for descs in capture_descs.values() for desc in descs})
+    return sorted(
+        {
+            _scalar_int(desc.num_tokens, "graph num_tokens")
+            for descs in capture_descs.values()
+            for desc in descs
+        }
+    )
 
 
 def target_graph_mode(vllm_config, cudagraph_mode):
@@ -74,6 +117,7 @@ def long_verification_capture_shapes(vllm_config):
     compatible token bucket.
     """
     compilation = vllm_config.compilation_config
+    _normalize_capture_config(vllm_config)
     if (
         getattr(vllm_config.model_config, "enforce_eager", False)
         or compilation.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
@@ -91,12 +135,19 @@ def long_verification_capture_shapes(vllm_config):
         capture_limit = max(capture_sizes, default=0)
     if not capture_limit:
         return []
-    scheduler_limit = vllm_config.scheduler_config.max_num_batched_tokens
+    scheduler_limit = _scalar_int(
+        vllm_config.scheduler_config.max_num_batched_tokens,
+        "max_num_batched_tokens",
+    )
     # Long verification uses only the target's existing capture budget. Do not
     # synthesize a larger graph for a ragged batch: unsupported long batches
     # must follow the normal eager fallback path.
-    capture_limit = min(capture_limit, scheduler_limit, MAX_LONG_VERIFICATION_CAPTURE_TOKENS)
-    tp_size = vllm_config.parallel_config.tensor_parallel_size
+    capture_limit = min(
+        _scalar_int(capture_limit, "max_cudagraph_capture_size"),
+        scheduler_limit,
+        MAX_LONG_VERIFICATION_CAPTURE_TOKENS,
+    )
+    tp_size = _scalar_int(vllm_config.parallel_config.tensor_parallel_size, "tensor_parallel_size")
     scheduler_limit = scheduler_limit // tp_size * tp_size
     capture_limit = min(capture_limit // tp_size * tp_size, scheduler_limit)
     max_tokens = capture_limit
@@ -165,6 +216,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             model_runner: Any,
             lora_capture_cases: list[int] | None = None,
         ):
+            _normalize_capture_config(vllm_config)
             super().__init__(
                 vllm_config,
                 device,
@@ -192,6 +244,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             lora_capture_cases: list[int] | None = None,
             varlen_decode: bool = False,
         ):
+            _normalize_capture_config(vllm_config)
             super().__init__(
                 vllm_config,
                 device,
