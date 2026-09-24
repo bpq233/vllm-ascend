@@ -63,22 +63,39 @@ def target_graph_mode(vllm_config, cudagraph_mode):
 
 
 def long_verification_capture_shapes(vllm_config):
-    """Capture exact TP-aligned query shapes for long verification batches."""
+    """Return TP-aligned FULL graph shapes for long Target verification.
+
+    Long verification is cached-prefill rather than ordinary decode, so the
+    regular ``cudagraph_capture_sizes`` do not cover it when the query is
+    wider than ``MAX_DECODE_QUERY_LEN``. Keep this list sparse: one graph per
+    resident request count is enough because runtime queries are padded to the
+    exact candidate width.
+    """
     compilation = vllm_config.compilation_config
     if (
         compilation.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
         or not uses_long_speculative_queries(vllm_config)
     ):
         return []
-    max_size = vllm_config.scheduler_config.max_num_batched_tokens
-    tp_size = vllm_config.parallel_config.tensor_parallel_size
+
     query_width = vllm_config.speculative_config.num_speculative_tokens + 1
     if query_width <= MAX_DECODE_QUERY_LEN:
         return []
+
+    capture_sizes = compilation.cudagraph_capture_sizes or ()
+    capture_limit = compilation.max_cudagraph_capture_size
+    if not capture_limit:
+        capture_limit = max(capture_sizes, default=0)
+    if not capture_limit:
+        return []
+    max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    if capture_limit:
+        max_tokens = min(max_tokens, capture_limit)
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
     shapes = []
     for num_reqs in range(1, vllm_config.scheduler_config.max_num_seqs + 1):
         num_tokens = (num_reqs * query_width + tp_size - 1) // tp_size * tp_size
-        if num_tokens > max_size:
+        if num_tokens > max_tokens:
             break
         shapes.append((num_reqs, num_tokens))
     return shapes
@@ -170,23 +187,24 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     def _add_long_verification_graphs(self, vllm_config):
         shapes = long_verification_capture_shapes(vllm_config)
         descriptor_parameters = signature(BatchExecutionDescriptor).parameters
-        query_width = vllm_config.speculative_config.num_speculative_tokens + 1
-        descs = [
-            BatchExecutionDescriptor(
-                **{
-                    key: value
-                    for key, value in {
-                        "cg_mode": CUDAGraphMode.FULL,
-                        "num_tokens": num_tokens,
-                        "num_reqs": num_reqs,
-                        "uniform_token_count": query_width,
-                        "max_query_len": query_width,
-                    }.items()
-                    if key in descriptor_parameters
-                }
+        descs = []
+        for num_reqs, num_tokens in shapes:
+            # TP alignment can add tokens to the final request. The capture
+            # path must describe that real shape; otherwise InputBatch rejects
+            # the descriptor before the graph is created.
+            captured_query_len = (num_tokens + num_reqs - 1) // num_reqs
+            values = {
+                "cg_mode": CUDAGraphMode.FULL,
+                "num_tokens": num_tokens,
+                "num_reqs": num_reqs,
+                "uniform_token_count": captured_query_len,
+                "max_query_len": captured_query_len,
+            }
+            descs.append(
+                BatchExecutionDescriptor(
+                    **{key: value for key, value in values.items() if key in descriptor_parameters}
+                )
             )
-            for num_reqs, num_tokens in shapes
-        ]
         if descs:
             full_descs = self._capture_descs.setdefault(CUDAGraphMode.FULL, [])
             full_descs.extend(descs)
@@ -221,6 +239,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         )
         if not long_verification:
             return desc
+
         effective_loras = self._resolve_effective_loras(num_active_loras)
         graph_desc = select_long_verification_graph(
             self.long_verification_graphs,
@@ -233,7 +252,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 "No captured FULL graph matches long Target verification: "
                 f"num_reqs={num_reqs}, num_tokens={num_tokens}, uniform_token_count={uniform_token_count}, "
                 f"max_query_len={max_query_len}, ordinary_dispatch_mode={desc.cg_mode}, "
-                f"captured_shapes={[(desc.num_reqs, desc.num_tokens) for desc in self.long_verification_graphs]}. "
+                f"captured_shapes={[(item.num_reqs, item.num_tokens) for item in self.long_verification_graphs]}. "
                 "Refusing an unexpected eager fallback."
             )
         return graph_desc

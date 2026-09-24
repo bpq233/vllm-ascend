@@ -102,7 +102,6 @@ class IntermediatePipeline:
                 executed_before = getattr(self.backend, "executed_tokens", 0)
                 reused_before = getattr(self.backend, "reused_tokens", 0)
                 graph_replays_before = getattr(self.backend, "graph_replays", 0)
-                decision_replays_before = getattr(decision_runner, "replays", 0)
                 started = perf_counter()
             decisions = []
             decision_tensors = []
@@ -114,10 +113,9 @@ class IntermediatePipeline:
                 **({"decision": decision_runner} if decision_runner is not None else {}),
             ):
                 if decision_runner is not None:
-                    # Keep graph output alive until all microbatches finish;
-                    # perform one compact D2H copy instead of synchronizing
-                    # once per microbatch.
-                    decision_tensors.append(logits.clone() if decision_runner.graph_enabled else logits)
+                    # Keep compact decisions on device until all microbatches
+                    # finish, then perform one D2H copy.
+                    decision_tensors.append(logits)
                     continue
                 offset = len(decisions)
                 decisions.extend(
@@ -169,7 +167,7 @@ class IntermediatePipeline:
                     "multi_stage_intermediate round=%d proposed=%d accepted=%d accepted_by_request=%s "
                     "intermediate_model_ms=%.3f secondary_model_ms=%.3f timing=host_wall_with_acceptance "
                     "request_ids=%s forward_tokens=%d kv_reused_tokens=%d executed_tokens=%d padding_tokens=%d "
-                    "verifier_graph_replays=%d decision_graph_replays=%d",
+                    "verifier_graph_replays=%d",
                     round_id,
                     sum(map(len, round_drafts)),
                     sum(accepted_by_request),
@@ -187,6 +185,5 @@ class IntermediatePipeline:
                         - (getattr(self.backend, "forward_tokens", 0) - forward_before),
                     ),
                     getattr(self.backend, "graph_replays", 0) - graph_replays_before,
-                    getattr(decision_runner, "replays", 0) - decision_replays_before,
                 )
         return accepted

@@ -234,7 +234,7 @@ def test_full_decode_only_has_sparse_target_gears_for_long_verification():
     cfg = NS(
         compilation_config=NS(
             cudagraph_mode="full_decode_only",
-            max_cudagraph_capture_size=128,
+            max_cudagraph_capture_size=512,
             cudagraph_capture_sizes=[16, 32, 64, 128],
         ),
         scheduler_config=NS(max_num_batched_tokens=512, max_num_seqs=4),
@@ -251,7 +251,11 @@ def test_full_decode_only_has_sparse_target_gears_for_long_verification():
 
     cfg.scheduler_config.max_num_batched_tokens = 512
     cfg.compilation_config.max_cudagraph_capture_size = 128
-    assert fn(cfg) == [(1, 56), (2, 112), (3, 168), (4, 216)]
+    assert fn(cfg) == [(1, 56), (2, 112)]
+
+    cfg.compilation_config.max_cudagraph_capture_size = 0
+    cfg.compilation_config.cudagraph_capture_sizes = []
+    assert fn(cfg) == []
 
 
 def test_long_target_graph_dispatch_is_opt_in_and_uses_compatible_bucket():

@@ -28,21 +28,12 @@ class AcceptancePolicy:
 
 
 class IntermediateDecisionRunner:
-    """Capture the vocabulary projection and acceptance, not a logits copy.
+    """Run the small vocabulary/acceptance control path outside ACL graphs."""
 
-    One graph per power-of-two request bucket; variable draft lengths are
-    tensor inputs. Output storage is reused and must be consumed before replay.
-    """
-
-    def __init__(self, compute_logits, policy, query_width, graph_enabled=False):
+    def __init__(self, compute_logits, policy, query_width):
         self.compute_logits = compute_logits
         self.policy = policy
         self.query_width = query_width
-        self.graph_enabled = graph_enabled
-        self.entries = {}
-        self.stream = None
-        self.pool = None
-        self.replays = 0
 
     def _run(self, hidden, tokens, sizes, steps):
         starts = sizes.cumsum(0) - sizes
@@ -62,55 +53,9 @@ class IntermediateDecisionRunner:
     def __call__(self, hidden, tokens, lengths):
         if not lengths or max(lengths) > self.query_width or sum(lengths) != hidden.shape[0]:
             raise ValueError("Decision inputs must contain packed anchor/draft rows within the configured width.")
-        if not self.graph_enabled:
-            sizes = torch.tensor(lengths, device=hidden.device)
-            steps = torch.arange(self.query_width, device=hidden.device)
-            return self._run(hidden, tokens, sizes, steps)
-
-        from vllm.distributed.parallel_state import GraphCaptureContext, get_tp_group
-
-        from vllm_ascend.worker.v2.utils import communicator_switch
-
-        n = len(lengths)
-        bucket = 1 << (n - 1).bit_length()
-        if bucket not in self.entries:
-            self.entries[bucket] = (
-                hidden.new_zeros((bucket * self.query_width, hidden.shape[-1])),
-                torch.zeros(bucket * self.query_width, dtype=torch.int64, device=hidden.device),
-                torch.ones(bucket, dtype=torch.int64, device=hidden.device),
-                torch.arange(self.query_width, device=hidden.device),
-                None,
-                None,
-            )
-        static_hidden, static_tokens, sizes, steps, graph, output = self.entries[bucket]
-        static_hidden[: hidden.shape[0]].copy_(hidden)
-        if tokens is not None:
-            static_tokens[: tokens.numel()].copy_(tokens)
-        # Do not reuse this source: the H2D copy is asynchronous.
-        host_sizes = torch.tensor(lengths + [1] * (bucket - n), dtype=torch.int64, pin_memory=True)
-        sizes.copy_(host_sizes, non_blocking=True)
-        if graph is None:
-            if self.stream is None:
-                self.stream = torch.npu.Stream(device=hidden.device)
-                self.pool = torch.npu.graph_pool_handle()
-            current = torch.npu.current_stream()
-            self.stream.wait_stream(current)
-            with (
-                communicator_switch(),
-                get_tp_group().graph_capture(GraphCaptureContext(self.stream)),
-                torch.npu.stream(self.stream),
-            ):
-                # Warm allocation and TP communication paths before capture.
-                for _ in range(2):
-                    self._run(static_hidden, static_tokens, sizes, steps)
-                graph = torch.npu.NPUGraph()
-                with torch.npu.graph(graph, pool=self.pool, stream=self.stream):
-                    output = self._run(static_hidden, static_tokens, sizes, steps)
-            current.wait_stream(self.stream)
-            self.entries[bucket] = static_hidden, static_tokens, sizes, steps, graph, output
-        graph.replay()
-        self.replays += 1
-        return output[:n]
+        sizes = torch.tensor(lengths, device=hidden.device)
+        steps = torch.arange(self.query_width, device=hidden.device)
+        return self._run(hidden, tokens, sizes, steps)
 
 
 def assemble_verified_tokens(

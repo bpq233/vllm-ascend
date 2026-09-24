@@ -331,7 +331,6 @@ class IntermediateBackend:
                     ),
                 )
                 + 1,
-                graph_enabled=self.graph_enabled,
             )
             set_eagle3_aux_hidden_state_layers(self.model, cfg.speculative_config)
             self.drafter = AscendDFlashSpeculator(cfg, self.device)
@@ -396,21 +395,6 @@ class IntermediateBackend:
             captured_sizes,
         )
         capture_secondary_graphs(self.drafter)
-        # Capture in the same deterministic order on every TP rank. Keep
-        # first-request latency and graph allocation out of the decode loop.
-        requests = 1
-        while True:
-            width = self.decision_runner.query_width
-            hidden = torch.zeros(
-                (requests * width, self.vllm_config.model_config.get_hidden_size()),
-                dtype=self.vllm_config.model_config.dtype,
-                device=self.device,
-            )
-            tokens = torch.zeros(requests * width, dtype=torch.int64, device=self.device)
-            self.decision_runner(hidden, tokens, [width] * requests)
-            if requests == self.max_num_reqs:
-                break
-            requests = min(requests * 2, self.max_num_reqs)
         # Dummy capture inputs must not publish a valid token prefix.
         self.cache.retain(())
 
