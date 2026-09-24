@@ -43,6 +43,8 @@ from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.utils import communicator_switch
 
+MAX_LONG_VERIFICATION_CAPTURE_TOKENS = 128
+
 
 def collect_sorted_captured_token_sizes(capture_descs: dict) -> list[int]:
     """Collect the actual per-graph token counts that will be captured.
@@ -90,29 +92,23 @@ def long_verification_capture_shapes(vllm_config):
     if not capture_limit:
         return []
     scheduler_limit = vllm_config.scheduler_config.max_num_batched_tokens
-    # A configured capture limit may come from ordinary decode gears and be
-    # smaller than one complete long-verification batch. Such a limit cannot
-    # cover the batch (e.g. 4 * 36 = 144 with a 128-token gear), so add only
-    # the minimum capacity needed by the long query. Keep the scheduler limit
-    # as the hard bound; it is the actual maximum batch that can be scheduled.
-    capture_limit = min(capture_limit, scheduler_limit)
-    required_limit = min(
-        vllm_config.scheduler_config.max_num_seqs * query_width,
-        scheduler_limit,
-    )
+    # Long verification uses only the target's existing capture budget. Do not
+    # synthesize a larger graph for a ragged batch: unsupported long batches
+    # must follow the normal eager fallback path.
+    capture_limit = min(capture_limit, scheduler_limit, MAX_LONG_VERIFICATION_CAPTURE_TOKENS)
     tp_size = vllm_config.parallel_config.tensor_parallel_size
     scheduler_limit = scheduler_limit // tp_size * tp_size
     capture_limit = min(capture_limit // tp_size * tp_size, scheduler_limit)
-    required_limit = min((required_limit + tp_size - 1) // tp_size * tp_size, scheduler_limit)
-    max_tokens = max(capture_limit, required_limit)
+    max_tokens = capture_limit
     if max_tokens <= MAX_DECODE_QUERY_LEN:
         return []
 
     shapes = []
     for num_reqs in range(1, vllm_config.scheduler_config.max_num_seqs + 1):
         requested_tokens = (num_reqs * query_width + tp_size - 1) // tp_size * tp_size
-        num_tokens = min(requested_tokens, max_tokens)
-        shapes.append((num_reqs, num_tokens))
+        if requested_tokens > max_tokens:
+            break
+        shapes.append((num_reqs, requested_tokens))
     return shapes
 
 
@@ -125,6 +121,20 @@ def select_long_verification_graph(candidates, num_reqs, num_tokens, num_active_
         ):
             return desc
     return None
+
+
+def eager_execution_descriptor(desc, num_reqs, num_tokens, uniform_token_count, max_query_len):
+    """Clone a dispatch descriptor while disabling graph execution."""
+    parameters = signature(BatchExecutionDescriptor).parameters
+    values = {name: getattr(desc, name) for name in parameters if hasattr(desc, name)}
+    values.update(
+        cg_mode=CUDAGraphMode.NONE,
+        num_reqs=num_reqs,
+        num_tokens=num_tokens,
+        uniform_token_count=uniform_token_count,
+        max_query_len=max_query_len,
+    )
+    return BatchExecutionDescriptor(**values)
 
 
 def _get_graph_update_backend(
@@ -260,13 +270,17 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             effective_loras,
         )
         if graph_desc is None:
-            raise RuntimeError(
-                "No captured FULL graph matches long Target verification: "
-                f"num_reqs={num_reqs}, num_tokens={num_tokens}, uniform_token_count={uniform_token_count}, "
-                f"max_query_len={max_query_len}, ordinary_dispatch_mode={desc.cg_mode}, "
-                f"captured_shapes={[(item.num_reqs, item.num_tokens) for item in self.long_verification_graphs]}. "
-                "Refusing an unexpected eager fallback."
+            logger.warning_once(
+                "Long Target verification shape is outside captured ACL graph buckets; "
+                "falling back to eager: num_reqs=%s num_tokens=%s max_query_len=%s captured_shapes=%s",
+                num_reqs,
+                num_tokens,
+                max_query_len,
+                [(getattr(item, "num_reqs", None), item.num_tokens) for item in self.long_verification_graphs],
             )
+            if desc.cg_mode == CUDAGraphMode.NONE:
+                return desc
+            return eager_execution_descriptor(desc, num_reqs, num_tokens, uniform_token_count, max_query_len)
         return graph_desc
 
     def init_breakable_cg_runner(self, model: nn.Module) -> None:

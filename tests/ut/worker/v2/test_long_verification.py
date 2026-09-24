@@ -226,9 +226,10 @@ def test_full_decode_only_has_sparse_target_gears_for_long_verification():
         "worker/v2/aclgraph_utils.py",
         "long_verification_capture_shapes",
         dict(
-            CUDAGraphMode=NS(FULL_DECODE_ONLY="full_decode_only"),
-            MAX_DECODE_QUERY_LEN=16,
-            uses_long_speculative_queries=lambda cfg: True,
+        CUDAGraphMode=NS(FULL_DECODE_ONLY="full_decode_only"),
+        MAX_DECODE_QUERY_LEN=16,
+        MAX_LONG_VERIFICATION_CAPTURE_TOKENS=128,
+        uses_long_speculative_queries=lambda cfg: True,
         ),
     )
     cfg = NS(
@@ -242,19 +243,19 @@ def test_full_decode_only_has_sparse_target_gears_for_long_verification():
         speculative_config=NS(num_speculative_tokens=53),
         parallel_config=NS(tensor_parallel_size=1),
     )
-    assert fn(cfg) == [(1, 54), (2, 108), (3, 162), (4, 216)]
+    assert fn(cfg) == [(1, 54), (2, 108)]
 
     cfg.parallel_config.tensor_parallel_size = 8
-    assert fn(cfg) == [(1, 56), (2, 112), (3, 168), (4, 216)]
+    assert fn(cfg) == [(1, 56), (2, 112)]
 
     cfg.scheduler_config.max_num_batched_tokens = 200
-    assert fn(cfg) == [(1, 56), (2, 112), (3, 168), (4, 200)]
+    assert fn(cfg) == [(1, 56), (2, 112)]
 
     cfg.scheduler_config.max_num_batched_tokens = 512
     cfg.compilation_config.max_cudagraph_capture_size = 128
-    # The ordinary 128-token gear is too small for four 36-token queries;
-    # long verification adds the minimum 216-token capacity it needs.
-    assert fn(cfg) == [(1, 56), (2, 112), (3, 168), (4, 216)]
+    # The ordinary 128-token gear cannot cover four 54-token queries; the
+    # unsupported long batch must use eager execution instead of adding 216.
+    assert fn(cfg) == [(1, 56), (2, 112)]
 
     cfg.compilation_config.max_cudagraph_capture_size = 0
     cfg.compilation_config.cudagraph_capture_sizes = []
@@ -282,9 +283,38 @@ def test_long_target_graph_dispatch_is_opt_in_and_uses_compatible_bucket():
         Base=Base,
         CUDAGraphMode=NS(NONE="none", FULL="full"),
         MAX_DECODE_QUERY_LEN=16,
+        logger=NS(warning_once=lambda *args: None),
         select_long_verification_graph=lambda *args: next(
-            desc for desc in args[0] if desc.num_tokens >= args[2]
+            (desc for desc in args[0] if desc.num_tokens >= args[2]), None
         ),
+    )
+
+    class Descriptor:
+        def __init__(
+            self,
+            cg_mode,
+            num_tokens,
+            num_reqs=None,
+            uniform_token_count=None,
+            max_query_len=None,
+        ):
+            self.cg_mode = cg_mode
+            self.num_tokens = num_tokens
+            self.num_reqs = num_reqs
+            self.uniform_token_count = uniform_token_count
+            self.max_query_len = max_query_len
+
+    namespace["BatchExecutionDescriptor"] = Descriptor
+    namespace["signature"] = __import__("inspect").signature
+    helper_namespace = {
+        "BatchExecutionDescriptor": Descriptor,
+        "CUDAGraphMode": namespace["CUDAGraphMode"],
+        "signature": namespace["signature"],
+    }
+    namespace["eager_execution_descriptor"] = function(
+        "worker/v2/aclgraph_utils.py",
+        "eager_execution_descriptor",
+        helper_namespace,
     )
     cls_copy = ast.ClassDef(
         name="Manager",
@@ -296,7 +326,7 @@ def test_long_target_graph_dispatch_is_opt_in_and_uses_compatible_bucket():
     module = ast.Module(body=[cls_copy], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "dispatch", "exec"), namespace)
     manager = namespace["Manager"]()
-    manager.long_verification_graphs = [NS(num_tokens=32), NS(num_tokens=64)]
+    manager.long_verification_graphs = [NS(num_reqs=1, num_tokens=32), NS(num_reqs=1, num_tokens=64)]
     manager._dispatch_parameters = {"num_reqs": None, "num_tokens": None}
     manager.long_verification_active = False
     eager = manager.dispatch(1, 20, None, 0, max_query_len=20)
@@ -311,6 +341,13 @@ def test_long_target_graph_dispatch_is_opt_in_and_uses_compatible_bucket():
     manager.long_verification_graphs = []
     eager = manager.dispatch(1, 20, None, 0, max_query_len=20)
     assert eager.num_tokens == 64
+
+    # A long batch that exceeds the captured buckets must also use the normal
+    # dispatch result instead of stalling or raising from the graph manager.
+    manager.long_verification_graphs = [NS(num_reqs=1, num_tokens=32), NS(num_reqs=1, num_tokens=64)]
+    eager = manager.dispatch(2, 80, None, 0, max_query_len=36)
+    assert eager.cg_mode == "none"
+    assert eager.num_tokens == 80
 
 
 def test_long_target_graph_reuses_capped_bucket_for_dynamic_query_width():
