@@ -6,6 +6,7 @@ import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
+from operator import index
 from typing import Any
 from unittest.mock import patch
 
@@ -34,6 +35,42 @@ _STREAM_RESOURCE_ERROR_MARKERS = (
     "too many streams are captured",
 )
 _OLD_HDK_CAPTURE_ERROR_MARKERS = ("alloc sq cq fail",)
+
+
+def _scalar_graph_key(value, name):
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            raise TypeError(f"{name} must be a scalar integer, got {value!r}")
+        value = value[0]
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a scalar integer, got {value!r}")
+    try:
+        return index(value)
+    except TypeError as exc:
+        raise TypeError(f"{name} must be a scalar integer, got {value!r}") from exc
+
+
+def _flatten_graph_keys(value, name):
+    if isinstance(value, (list, tuple)):
+        result = []
+        for item in value:
+            result.extend(_flatten_graph_keys(item, name))
+        return result
+    return [_scalar_graph_key(value, name)]
+
+
+def _normalize_batch_descriptor(batch_descriptor):
+    if batch_descriptor is None:
+        return None
+    values = {field.name: getattr(batch_descriptor, field.name) for field in dataclasses.fields(batch_descriptor)}
+    changed = False
+    for name in ("num_tokens", "num_reqs", "num_active_loras"):
+        if name not in values or values[name] is None:
+            continue
+        normalized = _scalar_graph_key(values[name], f"batch descriptor {name}")
+        changed |= normalized != values[name] or isinstance(values[name], (list, tuple))
+        values[name] = normalized
+    return type(batch_descriptor)(**values) if changed else batch_descriptor
 
 
 def _is_stream_resource_capture_error(exc: RuntimeError) -> bool:
@@ -135,7 +172,9 @@ class ACLGraphWrapper:
 
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
-        batch_descriptor = forward_context.batch_descriptor
+        batch_descriptor = _normalize_batch_descriptor(forward_context.batch_descriptor)
+        if batch_descriptor is not forward_context.batch_descriptor:
+            forward_context.batch_descriptor = batch_descriptor
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
         if aclgraph_runtime_mode == CUDAGraphMode.NONE or aclgraph_runtime_mode != self.runtime_mode:
@@ -288,6 +327,7 @@ def update_full_graph_params(
     speculative_config=None,
     draft_attn_metadatas=None,
 ):
+    num_tokens = _scalar_graph_key(num_tokens, "graph num_tokens")
     if vllm_version_is("0.27.1"):
         impl_cls = attn_backend.get_impl_cls()
         impl_cls.update_graph_params(
@@ -331,6 +371,7 @@ def set_graph_params(aclgraph_capture_sizes: list[int]):
     global _graph_params
     if _graph_params is not None:
         raise ValueError("Graph parameters have already been set!")
+    aclgraph_capture_sizes = sorted(set(_flatten_graph_keys(aclgraph_capture_sizes, "ACL graph capture size")))
     _graph_params = GraphParams(
         {size: [] for size in aclgraph_capture_sizes},
         {size: None for size in aclgraph_capture_sizes},
@@ -342,6 +383,7 @@ def set_graph_params(aclgraph_capture_sizes: list[int]):
 def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor):
     global _graph_params
     if _graph_params is not None:
+        num_tokens = _scalar_graph_key(num_tokens, "graph num_tokens")
         _graph_params.workspaces[num_tokens] = workspace
 
 
@@ -356,6 +398,7 @@ def set_draft_graph_params(aclgraph_capture_sizes: list[int]):
     global _draft_graph_params
     if _draft_graph_params is not None:
         raise ValueError("DraftGraph parameters have already been set!")
+    aclgraph_capture_sizes = sorted(set(_flatten_graph_keys(aclgraph_capture_sizes, "draft ACL graph capture size")))
     _draft_graph_params = GraphParams(
         {size: [] for size in aclgraph_capture_sizes},
         {size: None for size in aclgraph_capture_sizes},
@@ -367,6 +410,7 @@ def set_draft_graph_params(aclgraph_capture_sizes: list[int]):
 def update_draft_graph_params_workspaces(num_tokens: int, workspace: Any):
     global _draft_graph_params
     if _draft_graph_params is not None:
+        num_tokens = _scalar_graph_key(num_tokens, "draft graph num_tokens")
         _draft_graph_params.workspaces[num_tokens] = workspace
 
 
@@ -381,6 +425,9 @@ def set_draft_graph_prefill_params(aclgraph_capture_sizes: list[int]):
     global _draft_graph_prefill_params
     if _draft_graph_prefill_params is not None:
         raise ValueError("DraftGraph preill parameters have already been set!")
+    aclgraph_capture_sizes = sorted(
+        set(_flatten_graph_keys(aclgraph_capture_sizes, "draft prefill ACL graph capture size"))
+    )
     _draft_graph_prefill_params = GraphParams(
         {size: [] for size in aclgraph_capture_sizes},
         {size: None for size in aclgraph_capture_sizes},
@@ -392,6 +439,7 @@ def set_draft_graph_prefill_params(aclgraph_capture_sizes: list[int]):
 def update_draft_graph_prefill_params_workspaces(num_tokens: int, workspace: Any):
     global _draft_graph_prefill_params
     if _draft_graph_prefill_params is not None:
+        num_tokens = _scalar_graph_key(num_tokens, "draft prefill graph num_tokens")
         _draft_graph_prefill_params.workspaces[num_tokens] = workspace
 
 

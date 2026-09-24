@@ -5,6 +5,7 @@
 import ast
 import importlib.util
 from contextlib import nullcontext
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -381,6 +382,85 @@ def test_long_target_graph_dispatch_is_opt_in_and_uses_compatible_bucket():
     eager = manager.dispatch(2, 80, None, 0, max_query_len=36)
     assert eager.cg_mode == "none"
     assert eager.num_tokens == 80
+
+
+def test_graph_dispatch_normalizes_list_values_before_upstream_hash_lookup():
+    tree = ast.parse((ROOT / "worker/v2/aclgraph_utils.py").read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ModelAclGraphManager")
+    dispatch = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "dispatch")
+
+    @dataclass(frozen=True)
+    class Descriptor:
+        cg_mode: str
+        num_tokens: int
+        num_reqs: int
+        uniform_token_count: int | None = None
+        max_query_len: int | None = None
+        num_active_loras: int = 0
+
+    class Base:
+        def dispatch(self, num_reqs, num_tokens, uniform_token_count, num_active_loras, max_query_len=None):
+            # Mirror upstream's tuple/dict cache lookup to fail if normalization
+            # happens after the base dispatch call.
+            self.lookup[(num_tokens, num_active_loras)] = True
+            return Descriptor("none", num_tokens, num_reqs, uniform_token_count, max_query_len, num_active_loras)
+
+        def _resolve_effective_loras(self, count):
+            return count
+
+    namespace = dict(
+        Base=Base,
+        BatchExecutionDescriptor=Descriptor,
+        CUDAGraphMode=NS(NONE="none", FULL="full"),
+        MAX_DECODE_QUERY_LEN=16,
+        logger=NS(warning_once=lambda *args: None),
+        select_long_verification_graph=lambda *_args: None,
+        _scalar_int=lambda value, name: int(value[0]) if isinstance(value, list) and len(value) == 1 else int(value),
+        _optional_scalar_int=lambda value, name: None
+        if value is None
+        else int(value[0] if isinstance(value, list) else value),
+        _normalize_descriptor=lambda desc: desc,
+        signature=__import__("inspect").signature,
+        eager_execution_descriptor=lambda desc, *args: desc,
+    )
+    manager_copy = ast.ClassDef(
+        name="Manager",
+        bases=[ast.Name(id="Base", ctx=ast.Load())],
+        keywords=[],
+        body=[dispatch],
+        decorator_list=[],
+    )
+    module = ast.Module(body=[manager_copy], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), "dispatch_scalar_keys", "exec"), namespace)
+
+    manager = namespace["Manager"]()
+    manager.lookup = {}
+    manager._dispatch_parameters = {"max_query_len": None}
+    manager.long_verification_active = False
+    manager.long_verification_graphs = []
+    desc = manager.dispatch([2], [8], [4], [0], max_query_len=[4], num_ubatches=[1])
+    assert manager.lookup == {(8, 0): True}
+    assert (desc.num_reqs, desc.num_tokens, desc.uniform_token_count, desc.max_query_len) == (2, 8, 4, 4)
+
+
+def test_acl_graph_batch_descriptor_list_fields_are_normalized_before_hashing():
+    helper = function(
+        "compilation/acl_graph.py",
+        "_normalize_batch_descriptor",
+        {"dataclasses": __import__("dataclasses")},
+    )
+
+    @dataclass(frozen=True)
+    class Descriptor:
+        num_tokens: int
+        num_reqs: int | None = None
+        uniform: bool = False
+        has_lora: bool = False
+        num_active_loras: int = 0
+
+    desc = helper(Descriptor([8], [2], num_active_loras=[0]))
+    assert desc == Descriptor(8, 2, num_active_loras=0)
+    assert {desc: "cached"}[desc] == "cached"
 
 
 def test_long_target_graph_reuses_capped_bucket_for_dynamic_query_width():

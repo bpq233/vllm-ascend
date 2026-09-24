@@ -27,6 +27,8 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.worker.v2.aclgraph_utils import (
+    _normalize_capture_config,
+    _normalize_lora_capture_cases,
     collect_sorted_captured_token_sizes,
     model_capture_wrapper,
 )
@@ -44,6 +46,8 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
     ):
+        _normalize_capture_config(vllm_config)
+        lora_capture_cases = _normalize_lora_capture_cases(lora_capture_cases)
         super().__init__(
             vllm_config,
             device,

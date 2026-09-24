@@ -71,6 +71,38 @@ def _flatten_ints(value, name):
     return [_scalar_int(value, name)]
 
 
+def _optional_scalar_int(value, name):
+    return None if value is None else _scalar_int(value, name)
+
+
+def _normalize_lora_capture_cases(cases):
+    if cases is None:
+        return None
+    return sorted(set(_flatten_ints(cases, "lora_capture_cases")))
+
+
+def _normalize_descriptor(desc):
+    """Ensure every integer field is scalar before the descriptor is hashed."""
+    fields = (
+        "num_tokens",
+        "num_reqs",
+        "uniform_token_count",
+        "max_query_len",
+        "num_active_loras",
+        "num_ubatches",
+    )
+    parameters = signature(type(desc)).parameters
+    values = {name: getattr(desc, name) for name in parameters if hasattr(desc, name)}
+    changed = False
+    for name in fields:
+        if name not in values or values[name] is None:
+            continue
+        normalized = _scalar_int(values[name], f"graph descriptor {name}")
+        changed |= normalized != values[name] or isinstance(values[name], (list, tuple))
+        values[name] = normalized
+    return type(desc)(**values) if changed else desc
+
+
 def _normalize_capture_config(vllm_config):
     """Keep graph capture sizes scalar before vLLM uses descriptors as dict keys."""
     compilation = vllm_config.compilation_config
@@ -217,6 +249,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             lora_capture_cases: list[int] | None = None,
         ):
             _normalize_capture_config(vllm_config)
+            lora_capture_cases = _normalize_lora_capture_cases(lora_capture_cases)
             super().__init__(
                 vllm_config,
                 device,
@@ -245,6 +278,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             varlen_decode: bool = False,
         ):
             _normalize_capture_config(vllm_config)
+            lora_capture_cases = _normalize_lora_capture_cases(lora_capture_cases)
             super().__init__(
                 vllm_config,
                 device,
@@ -294,6 +328,15 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         max_query_len=None,
         num_ubatches=1,
     ):
+        # CudaGraphManager uses these values in tuple/dataclass dictionary keys.
+        # Normalize before calling upstream dispatch; normalizing the returned
+        # descriptor is too late because the key lookup already happened there.
+        num_reqs = _scalar_int(num_reqs, "num_reqs")
+        num_tokens = _scalar_int(num_tokens, "num_tokens")
+        uniform_token_count = _optional_scalar_int(uniform_token_count, "uniform_token_count")
+        num_active_loras = _scalar_int(num_active_loras, "num_active_loras")
+        max_query_len = _optional_scalar_int(max_query_len, "max_query_len")
+        num_ubatches = _scalar_int(num_ubatches, "num_ubatches")
         dispatch_kwargs = {}
         if "max_query_len" in self._dispatch_parameters:
             dispatch_kwargs["max_query_len"] = max_query_len
@@ -306,6 +349,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             num_active_loras,
             **dispatch_kwargs,
         )
+        desc = _normalize_descriptor(desc)
         long_verification = (
             getattr(self, "long_verification_active", False)
             and max_query_len is not None

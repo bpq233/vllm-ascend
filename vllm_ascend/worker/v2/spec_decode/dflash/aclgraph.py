@@ -19,7 +19,11 @@ from vllm_ascend.compilation.acl_graph import (
     set_draft_graph_params,
     update_full_graph_params,
 )
-from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
+from vllm_ascend.worker.v2.aclgraph_utils import (
+    _normalize_capture_config,
+    collect_sorted_captured_token_sizes,
+    model_capture_wrapper,
+)
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -32,6 +36,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         decode_query_len: int,
         speculator: Any = None,
     ):
+        _normalize_capture_config(vllm_config)
         super().__init__(
             vllm_config,
             device,
