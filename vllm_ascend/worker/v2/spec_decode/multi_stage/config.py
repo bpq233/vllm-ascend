@@ -6,9 +6,26 @@ MAX_DFLASH_DRAFT_TOKENS = 15
 MAX_AUTO_INTERMEDIATE_CAPTURE_TOKENS = 256
 
 
+def _flatten_capture_sizes(value):
+    """Normalize a scalar/nested capture-size value to positive integers."""
+    if isinstance(value, (list, tuple)):
+        result = []
+        for item in value:
+            result.extend(_flatten_capture_sizes(item))
+        return result
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("intermediate.cudagraph_capture_sizes must contain positive integers.")
+    return [value]
+
+
 def intermediate_capture_sizes(max_tokens, max_reqs, draft_width, requested=None):
     """Return sparse verifier/DFlash graph buckets without capturing long prefixes."""
     if requested is not None:
+        # This function runs before ModelAclGraphManager normalizes the copied
+        # vLLM config. Keep the user-provided value scalar before set() is used.
+        requested = _flatten_capture_sizes(requested)
+        if not requested:
+            raise ValueError("intermediate.cudagraph_capture_sizes must be nonempty.")
         if any(size > max_tokens for size in requested):
             raise ValueError("intermediate.cudagraph_capture_sizes must fit the intermediate token buffer.")
         sizes = set(requested)
@@ -62,10 +79,18 @@ class IntermediateConfig:
         if not result.verifier_model or not result.drafter_model:
             raise ValueError("Both intermediate model paths are required.")
         sizes = result.cudagraph_capture_sizes
-        if sizes is not None and (
-            not isinstance(sizes, list) or not sizes or any(type(size) is not int or size <= 0 for size in sizes)
-        ):
-            raise ValueError("intermediate.cudagraph_capture_sizes must be a nonempty list of positive integers.")
+        if sizes is not None:
+            if not isinstance(sizes, list):
+                raise ValueError("intermediate.cudagraph_capture_sizes must be a nonempty list of positive integers.")
+            try:
+                sizes = _flatten_capture_sizes(sizes)
+            except ValueError as exc:
+                raise ValueError(
+                    "intermediate.cudagraph_capture_sizes must be a nonempty list of positive integers."
+                ) from exc
+            if not sizes:
+                raise ValueError("intermediate.cudagraph_capture_sizes must be a nonempty list of positive integers.")
+            result.cudagraph_capture_sizes = sorted(set(sizes))
         for name in ("num_rounds", "num_speculative_tokens", "max_num_seqs", "max_model_len"):
             value = getattr(result, name)
             minimum = 0 if name == "num_rounds" else 1

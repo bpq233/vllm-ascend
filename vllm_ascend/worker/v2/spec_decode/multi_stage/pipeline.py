@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 import logging
 from collections import OrderedDict
+from operator import index
 from time import perf_counter
 
 import torch
@@ -9,6 +10,38 @@ import torch
 from vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance import AcceptancePolicy
 
 logger = logging.getLogger(__name__)
+
+
+def _scalar_shape_value(value, name):
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            raise TypeError(f"{name} must be a scalar integer, got {value!r}")
+        value = value[0]
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a scalar integer, got {value!r}")
+    try:
+        return index(value)
+    except TypeError as exc:
+        raise TypeError(f"{name} must be a scalar integer, got {value!r}") from exc
+
+
+def _flatten_token_ids(value):
+    if isinstance(value, (list, tuple)):
+        result = []
+        for item in value:
+            result.extend(_flatten_token_ids(item))
+        return result
+    return [value]
+
+
+def _hashable_request_id(value):
+    if isinstance(value, list):
+        return tuple(_hashable_request_id(item) for item in value)
+    try:
+        hash(value)
+    except TypeError as exc:
+        raise TypeError(f"Intermediate request id must be hashable, got {value!r}") from exc
+    return value
 
 
 class IntermediatePipeline:
@@ -19,13 +52,16 @@ class IntermediatePipeline:
         self.config = config
         self.capacity = capacity
         self.policy = AcceptancePolicy(**config.verification)
-        self.eos_ids = set(eos_token_id if isinstance(eos_token_id, list) else [eos_token_id])
+        self.eos_ids = set(_flatten_token_ids(eos_token_id))
         self._decision_shapes = OrderedDict()
 
     def _decision_shape(self, logits, lengths):
         # Accepted contexts change every round, but the small query shapes
         # usually repeat. Bound retention for heterogeneous request traffic.
-        key = (logits.device, tuple(lengths))
+        lengths = tuple(_scalar_shape_value(length, "decision length") for length in lengths)
+        if not lengths:
+            raise ValueError("Decision shapes must contain at least one request.")
+        key = (logits.device, lengths)
         if key not in self._decision_shapes:
             sizes = torch.tensor(lengths, device=logits.device)
             starts = sizes.cumsum(0) - sizes
@@ -66,6 +102,7 @@ class IntermediatePipeline:
     @torch.inference_mode()
     def refine(self, prefixes, primary_tokens, limits, req_ids=None):
         req_ids = req_ids if req_ids is not None else [str(i) for i in range(len(prefixes))]
+        req_ids = [_hashable_request_id(req_id) for req_id in req_ids]
         results = [[] for _ in prefixes]
         # Keep a group resident throughout its rounds. Round-major execution
         # across more requests than cache slots would evict every useful prefix.

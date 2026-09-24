@@ -344,6 +344,7 @@ def test_long_target_graph_dispatch_is_opt_in_and_uses_compatible_bucket():
         "BatchExecutionDescriptor": Descriptor,
         "CUDAGraphMode": namespace["CUDAGraphMode"],
         "signature": namespace["signature"],
+        "_normalize_descriptor": lambda desc: desc,
     }
     namespace["eager_execution_descriptor"] = function(
         "worker/v2/aclgraph_utils.py",

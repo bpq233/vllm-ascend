@@ -217,7 +217,7 @@ def eager_execution_descriptor(desc, num_reqs, num_tokens, uniform_token_count, 
         uniform_token_count=uniform_token_count,
         max_query_len=max_query_len,
     )
-    return BatchExecutionDescriptor(**values)
+    return _normalize_descriptor(BatchExecutionDescriptor(**values))
 
 
 def _get_graph_update_backend(

@@ -277,6 +277,22 @@ def test_sparse_capture_sizes_cover_verifier_and_secondary(modules):
         config.intermediate_capture_sizes(4096, 4, 15, [8192])
 
 
+def test_nested_capture_sizes_are_normalized_before_hashing(modules):
+    config, _ = modules
+    assert config.intermediate_capture_sizes(4096, 4, 15, [[64, 256], [64]]) == [64, 256]
+
+
+def test_nested_shape_and_request_keys_are_hashable(modules):
+    config, Pipeline = modules
+    pipe = Pipeline(None, config.IntermediateConfig("v", "d"), 8, eos_token_id=[[2], [3]])
+    logits = torch.zeros(3, 8)
+    first = pipe._decision_shape(logits, [[3]])
+    second = pipe._decision_shape(logits, [3])
+    assert all(a is b for a, b in zip(first, second))
+    assert pipe.eos_ids == {2, 3}
+    assert pipe.refine([[1]], [[2]], [0], req_ids=[["request", 1]]) == [[]]
+
+
 @pytest.mark.parametrize("sizes", [[], [0], [-1], [True], [2.5], "64"])
 def test_invalid_intermediate_capture_sizes(modules, sizes):
     config, _ = modules
