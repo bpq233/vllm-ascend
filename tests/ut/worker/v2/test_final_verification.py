@@ -3,8 +3,10 @@
 """CPU tests: python -m unittest discover -s tests/ut/worker/v2 -p test_final_verification.py."""
 
 import importlib.util
+import math
 import sys
 import unittest
+from itertools import product
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -29,6 +31,64 @@ assemble = acceptance.assemble_verified_tokens
 
 
 class TestAcceptancePolicy(unittest.TestCase):
+    def test_probability_ratio_matches_softmax(self):
+        generator = torch.Generator().manual_seed(19)
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            logits = torch.randn(64, 47, generator=generator).to(dtype)
+            tokens = torch.randint(47, (64,), generator=generator, dtype=torch.int32)
+            probabilities = logits.double().softmax(-1)
+            ratios = probabilities.gather(1, tokens.long()[:, None]).squeeze(1) / probabilities.amax(-1)
+            for threshold in (0, 0.1, 0.5, 0.9, 1):
+                with self.subTest(dtype=dtype, threshold=threshold):
+                    policy = AcceptancePolicy("prob_ratio", threshold=threshold)
+                    torch.testing.assert_close(policy.accept(logits, tokens), ratios > threshold)
+
+    def test_probability_ratio_strict_boundary_ties_and_masks(self):
+        logits = torch.tensor([[0.0, -0.5], [0.0, -1.0], [0.0, -2.0], [0.0, 0.0], [0.0, -torch.inf]])
+        tokens = torch.ones(5, dtype=torch.long)
+        policy = AcceptancePolicy("prob_ratio", threshold=math.exp(-1))
+        self.assertEqual(policy.accept(logits, tokens).tolist(), [True, False, False, True, False])
+        self.assertEqual(AcceptancePolicy("prob_ratio", threshold=1).accept(logits, tokens).tolist(), [False] * 5)
+        invalid = torch.tensor([[-torch.inf, -torch.inf], [torch.nan, 0], [torch.inf, 0], [0, -torch.inf]])
+        self.assertEqual(
+            AcceptancePolicy("prob_ratio", threshold=0).accept(invalid, torch.ones(4, dtype=torch.long)).tolist(),
+            [False] * 4,
+        )
+        # A zero threshold accepts even very small positive ratios without exp underflow.
+        self.assertTrue(AcceptancePolicy("prob_ratio", threshold=0).accept(torch.tensor([[0.0, -1000]]), tokens[:1]))
+
+    def test_probability_ratio_rejects_invalid_thresholds(self):
+        for threshold in (-0.1, 1.1, math.nan, math.inf, -math.inf, True, "0.5", None):
+            with self.subTest(threshold=threshold), self.assertRaisesRegex(ValueError, "threshold"):
+                AcceptancePolicy("prob_ratio", threshold=threshold)
+
+    def test_probability_ratio_long_ragged_prefix_and_target_bonus(self):
+        widths = [0, 3, 17, 32]
+        boundaries = torch.tensor([0, *np.cumsum([width + 1 for width in widths])])
+        size = int(boundaries[-1])
+        drafts = torch.arange(size) % 47
+        logits = torch.full((size, 49), -10.0)
+        logits[:, 48] = 0.0
+        logits[torch.arange(size), drafts.roll(-1)] = -0.25
+        # Ratios exp(-0.25) pass 0.5. The selected failure exp(-1) does not;
+        # later passing tokens must not be returned after the first failure.
+        target = torch.full((size,), 47)
+        for failure in (0, 15, 16, 31, 32):
+            scores = logits.clone()
+            last_start = int(boundaries[-2])
+            if failure < 32:
+                row = last_start + failure
+                scores[row, drafts[row + 1]] = -1.0
+            sampled, counts = assemble(
+                scores, drafts, target, boundaries, 32, AcceptancePolicy("prob_ratio", threshold=0.5)
+            )
+            self.assertEqual(counts.tolist(), [1, 4, 18, failure + 1])
+            for req, accepted in enumerate([0, 3, 17, failure]):
+                start = int(boundaries[req])
+                self.assertEqual(sampled[req, :accepted].tolist(), drafts[start + 1 : start + accepted + 1].tolist())
+                self.assertEqual(sampled[req, accepted], 47)
+                self.assertTrue((sampled[req, accepted + 1 :] == -1).all())
+
     def test_topk_membership_and_mask(self):
         logits = torch.tensor([[3.0, 2.0, 1.0], [1.0, 2.0, 3.0], [1.0, -torch.inf, -torch.inf]])
         tokens = torch.tensor([1, 0, 1])
@@ -61,9 +121,7 @@ class TestAcceptancePolicy(unittest.TestCase):
         drafts = torch.tensor([0, 0, 1, 2, 0, 2], dtype=torch.int32)
         targets = torch.tensor([2, 1, 0, 1, 0, 1], dtype=torch.int32)
         with patch.object(AcceptancePolicy, "accept", side_effect=AssertionError("unnecessary acceptance")):
-            sampled, counts = assemble(
-                logits, drafts, targets, torch.tensor([0, 1, 4, 6]), 3, AcceptancePolicy("all")
-            )
+            sampled, counts = assemble(logits, drafts, targets, torch.tensor([0, 1, 4, 6]), 3, AcceptancePolicy("all"))
         self.assertEqual(sampled.tolist(), [[2, -1, -1, -1], [1, 2, 1, -1], [2, 1, -1, -1]])
         self.assertEqual(counts.tolist(), [1, 3, 2])
         self.assertEqual(sampled.dtype, torch.int64)
@@ -71,8 +129,12 @@ class TestAcceptancePolicy(unittest.TestCase):
 
     def test_all_zero_capacity_returns_each_target_bonus(self):
         sampled, counts = assemble(
-            torch.zeros(2, 4), torch.tensor([1, 3]), torch.tensor([2, 0]),
-            torch.tensor([0, 1, 2]), 0, AcceptancePolicy("all")
+            torch.zeros(2, 4),
+            torch.tensor([1, 3]),
+            torch.tensor([2, 0]),
+            torch.tensor([0, 1, 2]),
+            0,
+            AcceptancePolicy("all"),
         )
         self.assertEqual(sampled.tolist(), [[2], [0]])
         self.assertEqual(counts.tolist(), [1, 1])
@@ -155,7 +217,11 @@ class TestFinalVerificationSampler(unittest.TestCase):
         draft = torch.tensor([0, 1])
         pos, cumulative, mapping = torch.tensor([5, 6]), torch.tensor([0, 2]), torch.tensor([3])
         mapping_np, expanded, local = np.array([3]), torch.tensor([3, 3]), torch.tensor([0, 1])
-        for legacy, draft_logits in ((False, None), (False, torch.randn(4, 1, 3)), (True, None)):
+        for (legacy, draft_logits), policy in product(
+            ((False, None), (False, torch.randn(4, 1, 3)), (True, None)),
+            (AcceptancePolicy(top_k=1), AcceptancePolicy("prob_ratio", threshold=0.5)),
+        ):
+            verifier.policy = policy
             utils.vllm_version_is.return_value = legacy
             result, sampled, counts = verifier._verify(
                 logits, draft_logits, draft, pos, cumulative, mapping, mapping_np, expanded, local

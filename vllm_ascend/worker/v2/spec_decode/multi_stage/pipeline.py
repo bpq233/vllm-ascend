@@ -40,7 +40,7 @@ class IntermediatePipeline:
 
     def _decide(self, logits, drafts, lengths, tokens=None):
         # Keep vocabulary-sized logits packed; only the small acceptance mask
-        # is padded. One top-k and one decision D2H per model microbatch.
+        # is padded. One acceptance pass and one decision D2H per microbatch.
         sizes, starts, steps, rows, is_draft = self._decision_shape(logits, lengths)
         if self.policy.method == "all":
             replacement = logits.index_select(0, starts + sizes - 1).argmax(-1)
@@ -51,14 +51,17 @@ class IntermediatePipeline:
                 dtype=torch.int64,
                 pin_memory=logits.device.type != "cpu",
             ).to(logits.device, non_blocking=True)
-        values, indices = logits.topk(min(self.policy.top_k, logits.shape[-1]), dim=-1)
-        # Use the values already returned by topk instead of launching a
-        # second gather of the vocabulary logits. Keep topk's tie ordering;
-        # argmax is deliberately reserved for the replacement token.
-        if indices.shape[-1] == 1:
-            flags = (indices[:, 0] == tokens) & torch.isfinite(values[:, 0])
+        if self.policy.method == "prob_ratio":
+            flags = self.policy.accept(logits, tokens)
         else:
-            flags = ((indices == tokens[:, None]) & torch.isfinite(values)).any(dim=-1)
+            values, indices = logits.topk(min(self.policy.top_k, logits.shape[-1]), dim=-1)
+            # Use the values already returned by topk instead of launching a
+            # second gather of the vocabulary logits. Keep topk's tie ordering;
+            # argmax is deliberately reserved for the replacement token.
+            if indices.shape[-1] == 1:
+                flags = (indices[:, 0] == tokens) & torch.isfinite(values[:, 0])
+            else:
+                flags = ((indices == tokens[:, None]) & torch.isfinite(values)).any(dim=-1)
         stop = torch.where(is_draft & flags[rows], max(lengths), steps).amin(dim=1)
         replacement = logits.index_select(0, starts + stop).argmax(-1)
         return torch.stack((stop, replacement), dim=-1).cpu().tolist()

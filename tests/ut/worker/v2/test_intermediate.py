@@ -95,7 +95,7 @@ def test_empty_active_batch_does_not_run_backend(modules):
     assert backend.calls == []
 
 
-@pytest.mark.parametrize("method,top_k", [("all", 1), ("topk", 1), ("topk", 5)])
+@pytest.mark.parametrize("method,top_k", [("all", 1), ("topk", 1), ("topk", 5), ("prob_ratio", 1)])
 def test_fused_head_decision_matches_packed_reference(modules, method, top_k):
     config, Pipeline = modules
     acceptance = sys.modules["vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance"]
@@ -129,7 +129,7 @@ def test_all_policy_projects_only_bonus_rows(modules):
     torch.testing.assert_close(projected[0], hidden[[15, 31]])
 
 
-@pytest.mark.parametrize("method", ["topk", "all"])
+@pytest.mark.parametrize("method", ["topk", "all", "prob_ratio"])
 def test_decision_graph_reuses_buffers_for_changing_lengths(modules, monkeypatch, method):
     acceptance = sys.modules["vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance"]
     policy = acceptance.AcceptancePolicy(method, 2)
@@ -252,6 +252,17 @@ def test_config_disabled_and_zero_rounds(modules):
     invalid["primary_num_speculative_tokens"] = 4
     with pytest.raises(ValueError, match="zero intermediate rounds"):
         config.validate_multi_stage(cfg, invalid)
+
+
+def test_final_probability_ratio_config(modules):
+    config, _ = modules
+    options = settings()
+    options["final_verification"] = {"method": "prob_ratio", "threshold": 0.7}
+    config.validate_multi_stage(vllm_config(), options)
+    config.validate_multi_stage(vllm_config(), {"final_verification": options["final_verification"]})
+    options["final_verification"]["threshold"] = 1.01
+    with pytest.raises(ValueError, match="threshold"):
+        config.validate_multi_stage(vllm_config(), options)
 
 
 @pytest.mark.parametrize(

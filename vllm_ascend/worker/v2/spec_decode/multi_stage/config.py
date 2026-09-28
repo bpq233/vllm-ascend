@@ -116,7 +116,7 @@ def validate_multi_stage(vllm_config, config):
     if not spec.use_dflash():
         raise ValueError("The intermediate pipeline currently requires a DFlash primary drafter.")
     if "final_verification" not in config:
-        raise ValueError("Intermediate candidates require explicit final_verification: topk or all.")
+        raise ValueError("Intermediate candidates require explicit final_verification: topk, all, or prob_ratio.")
     parallel = vllm_config.parallel_config
     if any(
         getattr(parallel, name, 1) != 1

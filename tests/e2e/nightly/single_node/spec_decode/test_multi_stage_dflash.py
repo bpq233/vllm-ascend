@@ -161,7 +161,7 @@ def test_long_cached_prefill_attention_matches_causal_reference():
     torch.testing.assert_close(output.cpu().float(), torch.cat(expected), atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("method", ["topk", "all"])
+@pytest.mark.parametrize("method", ["topk", "all", "prob_ratio"])
 @pytest.mark.parametrize(
     "long_candidates,graph_mode",
     [(False, None), (False, "FULL"), (True, None), (True, "FULL"), (True, "FULL_DECODE_ONLY")],
@@ -194,7 +194,9 @@ def test_multi_stage_dflash(method, long_candidates, graph_mode, monkeypatch):
             # Ensure >15 candidates regardless of the draft model's accuracy.
             "verification": {"method": "all" if long_candidates else "topk", "top_k": 1},
         },
-        "final_verification": {"method": method, "top_k": 1},
+        "final_verification": {"method": method, "threshold": 0.5}
+        if method == "prob_ratio"
+        else {"method": method, "top_k": 1},
     }
     with VllmRunner(
         models["main"],

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -12,16 +13,31 @@ class AcceptancePolicy:
 
     method: str = "topk"
     top_k: int = 5
+    threshold: float = 0.5
 
     def __post_init__(self):
-        if self.method not in ("topk", "all"):
-            raise ValueError("verification method must be 'topk' or 'all'")
+        if self.method not in ("topk", "all", "prob_ratio"):
+            raise ValueError("verification method must be 'topk', 'all', or 'prob_ratio'")
         if type(self.top_k) is not int or self.top_k < 1:
             raise ValueError("verification top_k must be a positive integer")
+        if type(self.threshold) not in (int, float) or not 0 <= self.threshold <= 1:
+            raise ValueError("verification threshold must be a finite number in [0, 1]")
 
     def accept(self, logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
         if self.method == "all":
             return torch.ones_like(token_ids, dtype=torch.bool)
+        if self.method == "prob_ratio":
+            draft_logits = logits.gather(-1, token_ids.long().unsqueeze(-1)).squeeze(-1)
+            max_logits = logits.amax(dim=-1)
+            # p(draft) / max(p) = exp(z_draft - z_max). Compare in log space
+            # without softmax or device-to-host synchronization. Promote only
+            # the gathered/reduced rows, not the full vocabulary tensor.
+            log_threshold = math.log(self.threshold) if self.threshold > 0 else -math.inf
+            return (
+                torch.isfinite(draft_logits)
+                & torch.isfinite(max_logits)
+                & (draft_logits.float() - max_logits.float() > log_threshold)
+            )
         values, top_ids = logits.topk(min(self.top_k, logits.shape[-1]), dim=-1)
         # Masked logits must never pass just because k exceeds the allowed set.
         return ((top_ids == token_ids.unsqueeze(-1)) & torch.isfinite(values)).any(dim=-1)

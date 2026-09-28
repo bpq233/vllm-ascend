@@ -105,8 +105,18 @@ logits 仍通过原 `combine_sampled_and_draft_tokens` / `logits_indices` 选取
 
 - `{"method": "topk", "top_k": 5}`：遇到第一个不在 Top-k 的 token 时截断。
 - `{"method": "all"}`：全部接受；最终 Target 仍生成 bonus。
+- `{"method": "prob_ratio", "threshold": 0.5}`：当该位置的 `P(草稿 token) / max_token P(token) > threshold` 时接受；相等时拒绝。阈值为 `[0,1]` 内的有限数，默认 `0.5`；`0` 接受所有具有有限 logit 的候选，`1` 拒绝所有候选，被屏蔽或非有限的 logit 不接受。
 
-最终 Target 的修正/bonus 复用原 sampler，包括请求采样参数；Top-k 使用经过采样约束处理的 logits。中间修正/bonus 和中间 DFlash 使用 greedy。Top-k 和全接受均属于近似策略，不保证严格投机解码的分布等价性。
+仅更换 Target 策略时，修改这一项即可，中间校验配置保持原值：
+
+```python
+additional_config["multi_stage_speculative"]["final_verification"] = {
+    "method": "prob_ratio",
+    "threshold": 0.5,
+}
+```
+
+最终 Target 的修正/bonus 复用原 sampler，包括请求采样参数；Top-k 和概率比均使用 sampler 返回的、经过采样参数处理的 logits，因此温度、惩罚和采样过滤等可能影响接受结果。概率比使用等价的 `草稿 logit - 最大 logit > log(threshold)` 判定，避免整张词表 softmax 和概率下溢；它不使用 Drafter 概率。首次拒绝后截断，随后追加 Target 修正 token；全部接受则追加 Target bonus。中间修正/bonus 和中间 DFlash 使用 greedy。三种策略均属于近似策略，不保证严格投机解码的分布等价性。
 
 仅设置 `final_verification` 可以单独替换最终接受策略。完全移除 `multi_stage_speculative` 即恢复原流程。`num_rounds=0` 不加载中间模型，此时 primary 长度必须与原 speculative 长度一致。
 
