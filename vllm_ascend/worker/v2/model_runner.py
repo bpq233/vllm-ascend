@@ -808,11 +808,16 @@ class NPUModelRunner(GPUModelRunner):
         """
         # TODO: need refactor later, related to vllm PR #34043 this pr delete func
         # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
-        if (
-            cudagraph_runtime_mode == CUDAGraphMode.FULL
-            and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
-        ):
+        if cudagraph_runtime_mode == CUDAGraphMode.FULL and self.cudagraph_manager.cudagraph_mode == CUDAGraphMode.FULL:
+            # Mixed FULL graphs pad tokens, not each request to a fixed width.
+            # A bucket can equal num_reqs * decode_query_len even when the
+            # real queries are shorter or ragged. Preserve their boundaries
+            # and put only the padding in a separate dummy request.
             num_reqs_padded = num_reqs
+            if num_tokens_padded > query_start_loc_np[num_reqs]:
+                query_start_loc_np[num_reqs + 1] = num_tokens_padded
+                num_reqs_padded += 1
+            return query_start_loc_np, num_reqs_padded
         else:
             num_reqs_padded = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs
 

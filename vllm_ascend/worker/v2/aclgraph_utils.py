@@ -36,6 +36,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.attention.spec_decode import uses_long_speculative_queries
 from vllm_ascend.compilation.acl_graph import set_graph_params, update_full_graph_params
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.utils import vllm_version_is
@@ -56,7 +57,21 @@ def collect_sorted_captured_token_sizes(capture_descs: dict) -> list[int]:
     return sorted({desc.num_tokens for descs in capture_descs.values() for desc in descs})
 
 
+def verification_graph_mode(cudagraph_mode):
+    # Verification includes prefix catch-up and variable accepted lengths.
+    # Decode-only descriptors require exactly decode_query_len tokens per
+    # request; mixed FULL descriptors replay the same FIA task-update path
+    # without that uniform-width constraint.
+    if cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+        return CUDAGraphMode.FULL
+    return cudagraph_mode
+
+
 def target_graph_mode(vllm_config, cudagraph_mode):
+    # Long multi-stage targets are validated as unquantized full attention,
+    # without CP. Do not broaden graph support for ordinary MLA/hybrid models.
+    if uses_long_speculative_queries(vllm_config) and not vllm_config.model_config.enforce_eager:
+        return verification_graph_mode(cudagraph_mode)
     return cudagraph_mode
 
 

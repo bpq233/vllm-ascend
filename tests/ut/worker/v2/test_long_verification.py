@@ -35,6 +35,7 @@ class GraphMode(Enum):
     FULL = 1
     FULL_AND_PIECEWISE = 2
     PIECEWISE = 3
+    FULL_DECODE_ONLY = 4
 
     def requires_piecewise_compilation(self):
         return self in (self.FULL_AND_PIECEWISE, self.PIECEWISE)
@@ -171,7 +172,7 @@ def test_cached_prefill_reads_existing_blocks_and_only_visible_lengths():
     assert ns["_get_fia_params"](impl, None, None, metadata)[-1] == [57, 80]
 
 
-def test_both_graph_manager_versions_capture_long_target_piecewise():
+def test_both_graph_manager_versions_capture_variable_target_full():
     tree = ast.parse((ROOT / "worker/v2/aclgraph_utils.py").read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ModelAclGraphManager")
     constructors = [n for n in ast.walk(cls) if isinstance(n, ast.FunctionDef) and n.name == "__init__"]
@@ -202,15 +203,19 @@ def test_both_graph_manager_versions_capture_long_target_piecewise():
             uses_long_speculative_queries=routing.uses_long_speculative_queries,
             collect_sorted_captured_token_sizes=lambda desc: [],
         )
+        ns["verification_graph_mode"] = function("worker/v2/aclgraph_utils.py", "verification_graph_mode", ns)
         ns["target_graph_mode"] = function("worker/v2/aclgraph_utils.py", "target_graph_mode", ns)
         exec(compile(ast.fix_missing_locations(module), "graph_manager", "exec"), ns)
         assert ns["Manager"](config(), "cpu", GraphMode.FULL, 33, NS(update_stream=None)).mode == GraphMode.FULL
+        manager = ns["Manager"](config(), "cpu", GraphMode.FULL_DECODE_ONLY, 33, NS(update_stream=None))
+        assert manager.mode == GraphMode.FULL
         assert ns["Manager"](config(4), "cpu", GraphMode.FULL, 5, NS(update_stream=None)).mode == GraphMode.FULL
         assert ns["Manager"](config(), "cpu", GraphMode.NONE, 33, NS(update_stream=None)).mode == GraphMode.NONE
         cfg = config()
         cfg.compilation_config.cudagraph_mode = GraphMode.PIECEWISE
         for mode in GraphMode:
-            assert ns["Manager"](cfg, "cpu", mode, 33, NS(update_stream=None)).mode == mode
+            expected = GraphMode.FULL if mode == GraphMode.FULL_DECODE_ONLY else mode
+            assert ns["Manager"](cfg, "cpu", mode, 33, NS(update_stream=None)).mode == expected
 
 
 def test_both_runner_versions_sort_short_queries_before_long_candidates():
@@ -243,3 +248,72 @@ def test_both_runner_versions_sort_short_queries_before_long_candidates():
         if len(method.args.args) == 4:
             args.append(NS())
         assert ns["prepare_inputs"](*args, desc) == ["decode", "short", "long", "extend"]
+
+
+@pytest.fixture
+def pad_target_query_boundaries():
+    tree = ast.parse((ROOT / "worker/v2/model_runner.py").read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "NPUModelRunner")
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_pad_query_start_loc_for_fia")
+    namespace = dict(np=np, CUDAGraphMode=GraphMode)
+    exec(compile(ast.Module(body=[method], type_ignores=[]), "target_query_padding", "exec"), namespace)
+    return namespace["_pad_query_start_loc_for_fia"]
+
+
+@pytest.mark.parametrize(
+    "lengths,padded_tokens,descriptor_reqs,expected",
+    [
+        ([18], 21, 1, [0, 18, 21]),
+        ([10, 12], 42, 2, [0, 10, 22, 42]),
+        ([18], 32, 4, [0, 18, 32]),
+        ([18], 18, 4, [0, 18]),
+        ([10, 12], 22, 4, [0, 10, 22]),
+        ([21], 21, 1, [0, 21]),
+    ],
+)
+def test_target_mixed_full_padding_uses_actual_queries(
+    pad_target_query_boundaries, lengths, padded_tokens, descriptor_reqs, expected
+):
+    # The verifier manager may use mixed FULL while the primary drafter keeps
+    # the configured decode-only mode. FIA must follow the executing manager.
+    runner = NS(
+        compilation_config=NS(cudagraph_mode=GraphMode.FULL_DECODE_ONLY),
+        cudagraph_manager=NS(cudagraph_mode=GraphMode.FULL),
+        decode_query_len=21,
+    )
+    boundaries = np.full(8, -1, dtype=np.int32)
+    boundaries[: len(lengths) + 1] = np.concatenate(([0], np.cumsum(lengths)))
+    result, padded_reqs = pad_target_query_boundaries(
+        runner,
+        padded_tokens,
+        descriptor_reqs,
+        len(lengths),
+        boundaries,
+        cudagraph_runtime_mode=GraphMode.FULL,
+        batch_desc_num_reqs=descriptor_reqs,
+    )
+    assert padded_reqs == len(expected) - 1
+    assert result[: padded_reqs + 1].tolist() == expected
+    assert result[padded_reqs] == padded_tokens
+    # Preserve each real query; only a padding request may be appended.
+    assert np.diff(result[: len(lengths) + 1]).tolist() == lengths
+
+
+def test_target_decode_only_padding_retains_fixed_width_requests(pad_target_query_boundaries):
+    runner = NS(
+        compilation_config=NS(cudagraph_mode=GraphMode.FULL_DECODE_ONLY),
+        cudagraph_manager=NS(cudagraph_mode=GraphMode.FULL_DECODE_ONLY),
+        decode_query_len=5,
+    )
+    boundaries = np.array([0, 5, -1, -1, -1], dtype=np.int32)
+    result, padded_reqs = pad_target_query_boundaries(
+        runner,
+        15,
+        3,
+        1,
+        boundaries,
+        cudagraph_runtime_mode=GraphMode.FULL,
+        batch_desc_num_reqs=3,
+    )
+    assert padded_reqs == 3
+    assert result[: padded_reqs + 1].tolist() == [0, 5, 10, 15]

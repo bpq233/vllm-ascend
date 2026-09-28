@@ -87,7 +87,15 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /models/Qwen-8B \
 
 cached-prefill 复用 `attention_v1` 的 paged FIA：Q 长度为累计 query 长度，KV 长度为各请求的有效总长度，`block_table` 指向已有前缀，右下因果遮罩使用 `sparse_mode=3`。同一 FIA 接口由实际 query 形状执行多 token prefill，未提高 Decode kernel 的上限，也不重新计算正式前缀。该路径限制为 full-attention Target 和未量化 Target KV；MLA、混合状态模型不在首版范围内。参数语义参见 [TorchNPU FIA 文档](https://www.hiascend.com/document/detail/en/Pytorch/2610/apiref/customapi/docs/en/custom_APIs/torch_npu/torch_npu-npu_fused_infer_attention_score.md)。
 
-图执行遵循 `enforce_eager`、`cudagraph_mode` 和显式 Target 捕获桶配置，允许 eager 和 NONE。设置 `compilation_config={"cudagraph_mode": "FULL"}` 可捕获四个模型的 forward（包含 attention）。只有未指定 FULL 捕获范围时才补充稀疏默认桶。NPU 集成测试覆盖 eager 和 FULL；尚未在本地执行真机验证。
+图执行遵循 `enforce_eager` 和显式 Target 捕获桶配置，允许 eager 和 NONE。设置 `compilation_config={"cudagraph_mode": "FULL"}` 可捕获四个模型的 forward（包含 attention）。对于 `FULL_DECODE_ONLY`，独立 intermediate verifier 和长候选 Target 的 graph manager 使用 mixed FULL；两套 DFlash 仍使用原有图模式，`PIECEWISE` 和 `FULL_AND_PIECEWISE` 保持原配置。
+
+`fix[12]` 的漏图原因是固定 query 宽度与实际验证输入不匹配。例如 primary/secondary 宽度为 15、最终容量为 55 时，原 intermediate 图只接受每请求 16 个 query token，原 Target 图只接受每请求 56 个 query token。首轮补齐 KV 前缀、末轮截短以及 Top-k 接受数量不同都会改变 query 长度；即使总 token 数落在捕获范围内，也会分派到 NONE。mixed FULL 用总 token 桶覆盖这些变长输入，attention 仍走原有 FIA 参数更新和 causal cached-prefill 路径，未放宽 16-token Decode 分类边界。
+
+Target padding 依据实际 manager 模式处理：保留真实 query 边界，只有额外 padding 才新增 dummy request。例如真实 query 为 18、图桶为 21 时边界必须为 `[0,18,21]`，不能因桶大小恰好等于固定 decode 宽度而漏掉 padding。显式 Target 桶仍限制可入图的总 token 数；`8,16,...,232` 覆盖最多 4 个请求、每请求 56 个 query token，但不覆盖超过 232 token 的初始 prompt prefill。图档增多会增加捕获时间和资源占用，需在目标 NPU 上测量。
+
+NPU 集成测试覆盖 eager、FULL 和长候选 FULL_DECODE_ONLY，检查每次 intermediate 分派及实际长 query Target 分派，而非仅检查累计 replay 次数大于零。本地 CPU 测试不代表 NPU 捕获、精度或性能验证。
+
+图能力核对参考：[Graph Mode Guide](https://docs.vllm.ai/projects/ascend/en/latest/user_guide/feature_guide/graph_mode.html)，KG `id=vllmascend_docs_source_userguide_featureguide_graphmode_vllm_ascend`，`source_file=inference-serving/vllm-ascend/docs/source/user_guide/feature_guide/graph_mode.md`，`score=0.941769`。其中 `attention_v1` 支持 mixed batch；本次修复保留长候选对 full-attention、KV 类型及并行方式的已有约束。
 
 logits 仍通过原 `combine_sampled_and_draft_tokens` / `logits_indices` 选取：context 行预测 candidate 第一个 token，最后一个 candidate 行预测 bonus。拒绝后复用原 `num_rejected` 和 `postprocess_sampled` 更新有效 computed length；多算的尾部 KV 留在预分配 slot 中，但下一轮的长度和位置不会读取它，并在新 token forward 时覆盖。修正/bonus token 在下一轮 forward 才获得自己的 KV，不能把 sampled token 数直接当成已计算 KV 长度。
 
@@ -145,7 +153,9 @@ python -m pytest --confcutdir=tests/ut/worker/v2 \
   tests/ut/worker/v2/test_intermediate.py \
   tests/ut/worker/v2/test_intermediate_backend.py \
   tests/ut/worker/v2/test_intermediate_graph.py \
-  tests/ut/worker/v2/test_long_verification.py
+  tests/ut/worker/v2/test_long_verification.py \
+  tests/ut/worker/v2/test_verification_graph_mode.py \
+  tests/ut/worker/v2/test_dummy_fia_metadata.py
 ```
 
 NPU 集成测试使用仓库已有的 Qwen3-8B/DFlash 配对作为主、中间两套独立实例，覆盖短/长候选、Top-1 对照、全接受、不同请求长度和请求结束后复用。长候选用中间全接受生成 20-token candidate，再以最终 Top-1 对照普通 greedy 输出。图用例断言四模型都有实际重放、中间 KV 命中、请求复用后没有新增图捕获。实际 8B/4B 配对仍需使用对应权重执行验证：

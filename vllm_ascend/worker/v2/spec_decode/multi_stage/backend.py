@@ -24,7 +24,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.compilation import acl_graph
 from vllm_ascend.ops import rotary_embedding as rope
 from vllm_ascend.utils import vllm_version_is
-from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
+from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager, verification_graph_mode
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata, get_kv_cache_spec
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_states import init_asecnd_model_state
@@ -201,10 +201,13 @@ class IntermediateBackend:
         self.reused_hidden_tokens = 0
         self._context_rows = [None] * self.max_num_reqs
         options = (parent_config.additional_config or {}).get("multi_stage_speculative", {})
-        self.decode_query_len = max(
-            config.num_speculative_tokens,
-            primary_draft_width(options, parent_config.speculative_config.num_speculative_tokens),
-        ) + 1
+        self.decode_query_len = (
+            max(
+                config.num_speculative_tokens,
+                primary_draft_width(options, parent_config.speculative_config.num_speculative_tokens),
+            )
+            + 1
+        )
         self.max_model_len = config.max_model_len or parent_config.model_config.max_model_len
         # Full prefixes may exceed the main runner's chunked-prefill budget.
         self.max_num_tokens = min(
@@ -344,7 +347,7 @@ class IntermediateBackend:
         self.cudagraph_manager = ModelAclGraphManager(
             self.vllm_config,
             self.device,
-            self.vllm_config.compilation_config.cudagraph_mode,
+            verification_graph_mode(self.vllm_config.compilation_config.cudagraph_mode),
             self.decode_query_len,
             self,
         )
@@ -352,7 +355,7 @@ class IntermediateBackend:
             "multi_stage_graph_plan verifier=%s verifier_mode=%s verifier_sizes=%s "
             "secondary_sizes=%s max_model_len=%d max_num_tokens=%d",
             self.config.verifier_model,
-            self.vllm_config.compilation_config.cudagraph_mode,
+            self.cudagraph_manager.cudagraph_mode,
             self.cudagraph_manager.capture_sizes,
             sorted(
                 {
@@ -380,14 +383,14 @@ class IntermediateBackend:
             {desc.num_tokens for desc in self.cudagraph_manager._capture_descs.get(CUDAGraphMode.FULL, ())}
         )
         _validate_full_graph_capture(
-            self.vllm_config.compilation_config.cudagraph_mode,
+            self.cudagraph_manager.cudagraph_mode,
             planned_full_sizes,
             captured_sizes,
         )
         logger.info(
             "multi_stage_graph_capture_complete verifier=%s mode=%s graph_count=%d captured_sizes=%s",
             self.config.verifier_model,
-            self.vllm_config.compilation_config.cudagraph_mode,
+            self.cudagraph_manager.cudagraph_mode,
             len(self.cudagraph_manager.graphs),
             captured_sizes,
         )
@@ -539,7 +542,7 @@ class IntermediateBackend:
             if manager is not None
             else None
         )
-        mode = self.vllm_config.compilation_config.cudagraph_mode
+        mode = manager.cudagraph_mode if manager is not None else self.vllm_config.compilation_config.cudagraph_mode
         requires_decode_graph = mode == CUDAGraphMode.FULL or (
             mode.decode_mode() == CUDAGraphMode.FULL
             and np.all(computed > 0)
@@ -878,16 +881,17 @@ class IntermediateBackend:
         for logits in self.verify([row[: max(1, len(row) - width)] for row in rows], [[0] * width for _ in rows]):
             logits.topk(min(self.config.verification.get("top_k", 5), logits.shape[-1]), dim=-1)
         graph_replays = self.graph_replays - graph_replays_before
-        if (
-            self.vllm_config.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
-            and rows
-            and not graph_replays
-        ):
+        mode = (
+            self.cudagraph_manager.cudagraph_mode
+            if self.cudagraph_manager is not None
+            else self.vllm_config.compilation_config.cudagraph_mode
+        )
+        if mode.decode_mode() == CUDAGraphMode.FULL and rows and not graph_replays:
             raise RuntimeError("Intermediate FULL ACL graphs were captured but profiling replayed none.")
         logger.info(
             "multi_stage_graph_profile verifier=%s mode=%s replay_count=%d captured_sizes=%s",
             self.config.verifier_model,
-            self.vllm_config.compilation_config.cudagraph_mode,
+            mode,
             graph_replays,
             self.cudagraph_manager.captured_token_counts() if self.cudagraph_manager else [],
         )

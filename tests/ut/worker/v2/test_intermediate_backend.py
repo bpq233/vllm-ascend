@@ -302,6 +302,7 @@ def test_sparse_graph_gap_warms_context_without_large_padding(backend):
     )
     obj.cudagraph_manager = NS(
         capture_sizes=[8, 128],
+        cudagraph_mode=obj.CUDAGraphMode.FULL,
         dispatch=lambda n, total, *a, **kw: NS(
             cg_mode=obj.CUDAGraphMode.FULL,
             num_tokens=8 if total <= 8 else 128,
@@ -458,6 +459,7 @@ def test_intermediate_graph_padding_keeps_real_kv_and_logits(backend):
     # A captured 8-token gear serves a real 5-token query.
     obj.cudagraph_manager = NS(
         dispatch=Mock(return_value=NS(cg_mode=obj.CUDAGraphMode.FULL, num_tokens=8)),
+        cudagraph_mode=obj.CUDAGraphMode.FULL,
         captured_token_counts=Mock(return_value=[8]),
         run_fullgraph=Mock(
             side_effect=lambda desc: obj.model(
@@ -526,6 +528,7 @@ def test_missing_intermediate_graph_fails_instead_of_silent_eager(backend):
     obj, _, _ = backend
     obj.cudagraph_manager = NS(
         dispatch=Mock(return_value=NS(cg_mode=None)),
+        cudagraph_mode=obj.CUDAGraphMode.FULL,
         captured_token_counts=Mock(return_value=[]),
     )
     with pytest.raises(RuntimeError, match="Intermediate decode query has no captured FULL graph"):
@@ -540,6 +543,7 @@ def test_configured_non_full_path_preserves_predictions(backend, mode):
     obj.vllm_config.compilation_config.cudagraph_mode = graph_mode
     obj.cudagraph_manager = NS(
         dispatch=Mock(return_value=NS(cg_mode=None if mode == "none" else graph_mode, num_tokens=5)),
+        cudagraph_mode=graph_mode,
         run_fullgraph=Mock(side_effect=AssertionError("Unexpected FULL replay")),
         run_pw_graph=Mock(side_effect=lambda model, inputs: model(**inputs)),
     )

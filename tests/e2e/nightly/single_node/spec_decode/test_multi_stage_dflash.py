@@ -33,17 +33,51 @@ def _target_graph_probe(worker, install=False):
     from vllm.compilation.counter import compilation_counter
     from vllm.config.compilation import CUDAGraphMode
 
+    from vllm_ascend.attention.attention_v1 import AscendAttentionState
+
     manager = worker.model_runner.cudagraph_manager
     backend = worker.model_runner.speculator.pipeline.backend
     if install:
         worker._long_target_full_calls = 0
+        worker._long_target_cached_full_calls = 0
         original = manager.run_fullgraph
 
         def record_replay(*args, **kwargs):
             worker._long_target_full_calls += 1
+            metadata = next(iter(worker.model_runner.model_state.attn_metadata.values()))
+            if metadata.attn_state == AscendAttentionState.ChunkedPrefill and metadata.max_query_len > 16:
+                worker._long_target_cached_full_calls += 1
             return original(*args, **kwargs)
 
         manager.run_fullgraph = record_replay
+        worker._verification_dispatches = {"target": {}, "intermediate": {}}
+        worker._long_target_dispatches = {"full": 0, "miss": 0}
+        for label, verifier_manager in (("target", manager), ("intermediate", backend.cudagraph_manager)):
+            original_dispatch = verifier_manager.dispatch
+
+            def record_dispatch(
+                num_reqs,
+                num_tokens,
+                uniform_token_count,
+                num_active_loras,
+                *args,
+                _label=label,
+                _original=original_dispatch,
+                **kwargs,
+            ):
+                desc = _original(num_reqs, num_tokens, uniform_token_count, num_active_loras, *args, **kwargs)
+                counts = worker._verification_dispatches[_label]
+                counts[desc.cg_mode.name] = counts.get(desc.cg_mode.name, 0) + 1
+                max_query_len = kwargs.get("max_query_len", args[0] if args else None)
+                # Older dispatch signatures expose only uniform length. A
+                # larger average also proves at least one query exceeds 16.
+                long_query = (max_query_len or uniform_token_count or 0) > 16 or num_tokens > 16 * num_reqs
+                if _label == "target" and long_query:
+                    key = "full" if desc.cg_mode == CUDAGraphMode.FULL else "miss"
+                    worker._long_target_dispatches[key] += 1
+                return desc
+
+            verifier_manager.dispatch = record_dispatch
         for label, draft_manager in (
             ("primary", worker.model_runner.speculator.query_cudagraph_manager),
             ("secondary", backend.drafter.query_cudagraph_manager),
@@ -62,6 +96,7 @@ def _target_graph_probe(worker, install=False):
         "full_sizes": [desc.num_tokens for desc in manager._capture_descs.get(CUDAGraphMode.FULL, [])],
         "captures": compilation_counter.num_cudagraph_captured,
         "calls": worker._long_target_full_calls,
+        "cached_long_calls": worker._long_target_cached_full_calls,
         "forward_tokens": backend.forward_tokens,
         "reused_tokens": backend.reused_tokens,
         "reused_hidden_tokens": backend.reused_hidden_tokens,
@@ -72,6 +107,8 @@ def _target_graph_probe(worker, install=False):
         "secondary_graphs": len(backend.drafter.query_cudagraph_manager.graphs),
         "primary_calls": worker._primary_graph_calls,
         "secondary_calls": worker._secondary_graph_calls,
+        "verification_dispatches": {label: counts.copy() for label, counts in worker._verification_dispatches.items()},
+        "long_target_dispatches": worker._long_target_dispatches.copy(),
         "non_full_capture_count": sum(
             len(descs)
             for graph_manager in (
@@ -125,8 +162,11 @@ def test_long_cached_prefill_attention_matches_causal_reference():
 
 
 @pytest.mark.parametrize("method", ["topk", "all"])
-@pytest.mark.parametrize("long_candidates,graph", [(False, False), (False, True), (True, False), (True, True)])
-def test_multi_stage_dflash(method, long_candidates, graph, monkeypatch):
+@pytest.mark.parametrize(
+    "long_candidates,graph_mode",
+    [(False, None), (False, "FULL"), (True, None), (True, "FULL"), (True, "FULL_DECODE_ONLY")],
+)
+def test_multi_stage_dflash(method, long_candidates, graph_mode, monkeypatch):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     models = DFLASH["dflash"]
     prompts = ["The capital of France is", "List three prime numbers:"]
@@ -148,7 +188,7 @@ def test_multi_stage_dflash(method, long_candidates, graph, monkeypatch):
         "intermediate": {
             "verifier": {"model": models["main"]},
             "drafter": {"model": models["spec"]},
-            "num_rounds": 4 if long_candidates else 2,
+            "num_rounds": 5 if long_candidates else 2,
             "num_speculative_tokens": 4 if long_candidates else 2,
             "max_num_seqs": 2,
             # Ensure >15 candidates regardless of the draft model's accuracy.
@@ -158,16 +198,21 @@ def test_multi_stage_dflash(method, long_candidates, graph, monkeypatch):
     }
     with VllmRunner(
         models["main"],
-        **{**common, "enforce_eager": not graph},
-        compilation_config={"cudagraph_mode": "FULL" if graph else "NONE"},
+        **{**common, "enforce_eager": graph_mode is None},
+        compilation_config={
+            "cudagraph_mode": graph_mode or "NONE",
+            "cudagraph_capture_sizes": [1, 5, 10, 16, 21, 32, 64, 128, 256],
+        },
         speculative_config={
             "method": "dflash",
             "model": models["spec"],
-            "num_speculative_tokens": 20 if long_candidates else 6,
+            # Five all-accepted rounds produce 25 tokens without this cap;
+            # capacity 23 forces the fifth verifier query to be shorter.
+            "num_speculative_tokens": 23 if long_candidates else 6,
         },
         additional_config={"multi_stage_speculative": options},
     ) as runner:
-        if graph:
+        if graph_mode:
             before = runner.model.llm_engine.collective_rpc(_target_graph_probe, kwargs={"install": True})
             assert all(
                 not row["piecewise_sizes"]
@@ -187,12 +232,21 @@ def test_multi_stage_dflash(method, long_candidates, graph, monkeypatch):
             ["One plus one equals"], SamplingParams(temperature=0, max_tokens=9, ignore_eos=True)
         )
         assert len(output[0].outputs[0].token_ids) == 9
-        if graph:
+        if graph_mode:
             after = runner.model.llm_engine.collective_rpc(_target_graph_probe)
             assert all(row["calls"] > 0 for row in after)
             assert all(row["primary_calls"] > 0 and row["secondary_calls"] > 0 for row in after)
             assert all(end["intermediate_calls"] > begin["intermediate_calls"] for begin, end in zip(before, after))
             assert all(end["reused_tokens"] > begin["reused_tokens"] for begin, end in zip(before, after))
             assert all(end["reused_hidden_tokens"] > begin["reused_hidden_tokens"] for begin, end in zip(before, after))
+            for row in after:
+                for label in ("target", "intermediate"):
+                    dispatches = row["verification_dispatches"][label]
+                    assert dispatches.get("FULL", 0) > 0, (label, dispatches)
+                    assert set(dispatches) == {"FULL"}, (label, dispatches)
+                if long_candidates:
+                    assert row["cached_long_calls"] > 0
+                    assert row["long_target_dispatches"]["full"] > 0
+                    assert row["long_target_dispatches"]["miss"] == 0
             # Changed request shapes and slot reuse replay warmed graphs.
             assert [row["captures"] for row in before] == [row["captures"] for row in after]
