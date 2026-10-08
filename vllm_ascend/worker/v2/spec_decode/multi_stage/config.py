@@ -44,6 +44,9 @@ class IntermediateConfig:
     max_model_len: int | None = None
     cudagraph_capture_sizes: list[int] | None = None
     verification: dict = field(default_factory=lambda: {"method": "topk", "top_k": 5})
+    # Resident KV slots can exceed the compute microbatch without enlarging
+    # graph inputs. None preserves the existing KV memory allocation.
+    cache_max_num_seqs: int | None = None
 
     @classmethod
     def from_dict(cls, values):
@@ -58,13 +61,15 @@ class IntermediateConfig:
             not isinstance(sizes, list) or not sizes or any(type(size) is not int or size <= 0 for size in sizes)
         ):
             raise ValueError("intermediate.cudagraph_capture_sizes must be a nonempty list of positive integers.")
-        for name in ("num_rounds", "num_speculative_tokens", "max_num_seqs", "max_model_len"):
+        for name in ("num_rounds", "num_speculative_tokens", "max_num_seqs", "cache_max_num_seqs", "max_model_len"):
             value = getattr(result, name)
             minimum = 0 if name == "num_rounds" else 1
-            if value is None and name == "max_model_len":
+            if value is None and name in ("max_model_len", "cache_max_num_seqs"):
                 continue
             if type(value) is not int or value < minimum:
                 raise ValueError(f"intermediate.{name} must be an integer >= {minimum}.")
+        if result.cache_max_num_seqs is not None and result.cache_max_num_seqs < result.max_num_seqs:
+            raise ValueError("intermediate.cache_max_num_seqs must be >= intermediate.max_num_seqs.")
         return result
 
 

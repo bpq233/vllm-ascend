@@ -11,7 +11,7 @@
 | 优先级 | 位置及频率 | 成本与处理 |
 |---|---|---|
 | P0 | `adapter._read_step`，每个外层 decode step | 长度、Primary 和历史尾部一次 D2H；冷请求原来逐请求读完整历史，现在额外合并一次 D2H。热请求仍保留一次同步。 |
-| P0 | `pipeline._decide` / `backend.propose`，每个中间 microbatch | 决策和 Secondary token 仍需 D2H，供 CPU 活跃请求控制及 KV 前缀记录使用；尚未实现全设备控制循环。 |
+| P0 | 中间轮次决策 | Secondary 候选保留在设备上进入下一轮 verifier，随后与决策合并为每组每轮一次 D2H，供 CPU 活跃请求控制及 KV 前缀记录使用；尚未实现全设备控制循环。 |
 | P0 | `FinalVerificationSampler._verify`，仅 DEBUG | 原来 event 显式同步加两次统计 D2H；现在统计合并一次阻塞 D2H，该传输也等待此前 forward 完成。普通路径没有这项回传。 |
 | P1 | `pipeline._decide`，每轮 top-k 验收 | 删除从 Python draft 再构造 pinned tensor 并 H2D；直接使用当前 verifier 输入在设备上移位得到的 token。bonus 行被 mask，异长请求不会串入验收。 |
 | P1 | `backend._forward`，每个中间 forward | pinned CPU buffer 中批量生成位置和 request row，不再逐 token 构造多层 Python 整数列表；整个输入仍一次异步 H2D。CPU `.numpy()` 是 pinned 内存视图。 |
@@ -75,6 +75,7 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /models/Qwen-8B \
 - `intermediate.num_rounds`：中间校验次数。3 表示“校验原 draft → 中间 draft → 校验 → 中间 draft → 校验”，不会把最后一批未经中间校验的 draft 追加进候选。
 - `intermediate.num_speculative_tokens`：每次中间 DFlash 的生成长度。
 - `intermediate.max_num_seqs`：中间模型每个小批次的请求数，默认 4；同时受 token 预算限制。
+- `intermediate.cache_max_num_seqs`：中间 KV 可同时驻留的请求数，必须不小于 `max_num_seqs`；省略时沿用 `max_num_seqs`。例如计算 batch 为 4、希望保留 12 个活跃请求的 KV，可设置为 12。该值只扩大 KV 页、缓存页表和按请求保存的短 hidden，不扩大计算 batch、图输入和捕获桶。当前每个槽位仍按 `max_model_len` 预分配独立 KV，增大前需要核算设备内存。
 - `intermediate.max_model_len`：独立 KV 的上下文容量，默认继承 Target；超过该容量的请求直接回到 Target 解码。
 
 每轮保留连续接受前缀，并追加中间 verifier 的 greedy 修正或 bonus token。完全接受时，最大候选长度为 `primary_length + (num_rounds - 1) * secondary_length + num_rounds`；示例为 20。容量更小时会截断，遇到 EOS 或请求长度上限也会停止扩展。
@@ -134,7 +135,7 @@ FULL 的范围是四个模型的 forward（包含 attention），不是把整个
 
 资源诊断依据：KG `runtime_docs_zh_faq_ee1023资源不足问题_too_many_streams_are_captured_to_the_acl_graph`，`source_file=cann-runtime/runtime/docs/zh/FAQ/EE1023资源不足问题.md`，score `0.943825`。该文档要求检查 stream 创建/销毁、设备上其他进程和共享资源占用；减少捕获桶是针对本实现的修正，不保证覆盖所有 EE1023 原因。
 
-数据传输：正式历史在 CPU 按请求 ID 缓存，稳定 decode 每轮只将长度、Primary 草稿及最多 final_capacity+1 个尾部 token 合并为一次 D2H；首次请求、长度缩短或大步 prefill 才读取完整历史。中间输入 IDs、位置、页槽、长度和 query 边界合并为一次 pinned H2D，设备上生成派生 metadata；最终候选也使用 pinned H2D。接受决策保持每个 microbatch 一次小结果 D2H，仍需同步以驱动 CPU 迭代控制，尚不是全设备端流水线。
+数据传输：正式历史在 CPU 按请求 ID 缓存，稳定 decode 每轮只将长度、Primary 草稿及最多 final_capacity+1 个尾部 token 合并为一次 D2H；首次请求、长度缩短或大步 prefill 才读取完整历史。中间 CPU 已知输入 IDs、位置、页槽、长度和 query 边界合并为一次 pinned H2D，Secondary 候选直接在设备上复制，设备上生成派生 metadata；最终候选也使用 pinned H2D。同组同轮的接受决策与 Secondary 候选 ID 合并为一次 D2H，仍需同步以驱动 CPU 迭代控制，尚不是全设备端流水线。
 
 稳态热路径优化：CPU 正式历史和 KV token 记录只追加新增 token；KV 前缀按 1024-token 块比较，仅在分歧块逐 token 定位。中间验证全部 hidden 行都用于预测时直接计算 logits，省去索引 H2D 和 hidden gather；Secondary 使用常驻 anchor、计数、温度和 seed 缓冲区。中间接受判断缓存最多 16 种小形状 metadata，直接利用 top-k 返回值检查有效性，避免再次 gather 词表 logits；最终全接受路径跳过接受 mask 和首拒绝位置归约。先执行仍驻留缓存的请求，再将结果还原为原批次顺序，降低跨 Target 步的缓存淘汰。
 
@@ -142,7 +143,11 @@ FULL 的范围是四个模型的 forward（包含 attention），不是把整个
 
 Verifier 仅保存预测短后缀的、已投影的 context hidden，复制到独立存储以防下一次图重放覆盖；不保存整段 prompt 激活。Secondary 所需的末尾行仍在缓存、且对应 KV 前缀完全一致时，直接复用该行，跳过额外 Verifier forward 和重复辅助层投影；缓存缺失、前缀变化或槽位回收时沿用正常模型计算。后端的 `reused_hidden_tokens` 记录跳过的 predictor 行数，NPU 集成测试检查其增长。以上优化保持现有接受策略；真实 NPU 精度、吞吐和图资源占用仍须验证。
 
-每个中间小批次保持 packed logits，只进行一次 Top-k 和一次决策 D2H；slot mapping 按整个小批次向量化。模型依赖链上的 verifier → drafter 必须顺序执行，各阶段内部按 batch 计算。首版不跨轮复用中间 KV，因此实际收益需要结合上下文长度和接受率测量。
+中间 KV 跨轮、跨 Target 周期复用；驻留容量不足时仍按 LRU 淘汰。模型依赖链上的 verifier → drafter 顺序执行，各阶段内部按 batch 计算。
+
+Secondary 候选通过独立设备 tensor 保存，避免下一次 DFlash 图重放覆盖。下一轮 verifier 仅上传 CPU 已知的前缀/anchor token，候选后缀直接写入固定设备输入；长度、位置等 metadata 仍上传。验证后把小决策与候选 ID 合并回传一次，CPU 再更新中间缓存 token 记录和接受前缀。设备候选尚未回传时，不把用于组装长度的占位 ID 标记成有效 KV；中断或异常只留下已确认的缓存前缀。兼容的普通 `propose` 接口仍返回 CPU 列表，正式多级路径使用 `propose_device`。这减少 Secondary 单独的 D2H 同步及候选再次 H2D，没有取消 CPU 轮次控制或最终候选上传。
+
+稀疏图的冷前缀预热仍只在 padding 超过实际 query 的 8 倍时触发，使用已有较小图桶。多个请求的前缀块现在共同占用该桶的 token 预算，并受计算 batch 大小约束；不会为此新增捕获桶。预热不含最终 predictor 行，正式预测继续合批。CPU 回归中的两个短前缀用例由 3 次执行降为 2 次，含 padding 的 token 由 24 降为 16；该数字是该用例的调度工作量，不是硬件耗时或通用加速比。
 
 ## 调试与性能
 
@@ -162,6 +167,9 @@ python -m pytest --confcutdir=tests/ut/worker/v2 \
   tests/ut/worker/v2/test_final_verification.py \
   tests/ut/worker/v2/test_intermediate.py \
   tests/ut/worker/v2/test_intermediate_backend.py \
+  tests/ut/worker/v2/test_intermediate_capacity.py \
+  tests/ut/worker/v2/test_intermediate_device_drafts.py \
+  tests/ut/worker/v2/test_intermediate_warmup.py \
   tests/ut/worker/v2/test_intermediate_graph.py \
   tests/ut/worker/v2/test_long_verification.py \
   tests/ut/worker/v2/test_verification_graph_mode.py \

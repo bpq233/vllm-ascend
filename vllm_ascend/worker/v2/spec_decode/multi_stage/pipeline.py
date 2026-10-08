@@ -99,6 +99,7 @@ class IntermediatePipeline:
                 break
             contexts = [contexts_by_request[i] for i in active]
             round_drafts = [drafts[i] for i in active]
+            device_drafts = isinstance(round_drafts[0], torch.Tensor)
             decision_runner = getattr(self.backend, "decision_runner", None)
             if trace:
                 forward_before = getattr(self.backend, "forward_tokens", 0)
@@ -135,7 +136,21 @@ class IntermediatePipeline:
                 decision_output = (
                     decision_tensors[0] if len(decision_tensors) == 1 else torch.cat(decision_tensors, dim=0)
                 )
-                decisions.extend(decision_output.cpu().tolist())
+                if device_drafts:
+                    # One round transfer supplies both the acceptance decision
+                    # and token identities needed for CPU cache/sequence state.
+                    # There is no Secondary D2H followed by candidate H2D.
+                    packed = torch.cat((decision_output.reshape(-1), *round_drafts)).cpu().tolist()
+                    decisions.extend([packed[i : i + 2] for i in range(0, 2 * len(active), 2)])
+                    offset = 2 * len(active)
+                    for row, i in enumerate(active):
+                        size = len(round_drafts[row])
+                        drafts[i] = packed[offset : offset + size]
+                        round_drafts[row] = drafts[i]
+                        offset += size
+                    self.backend.commit_verified_drafts(contexts, round_drafts, [req_ids[i] for i in active])
+                else:
+                    decisions.extend(decision_output.cpu().tolist())
             intermediate_ms = (perf_counter() - started) * 1000 if trace else 0.0
             continuing = []
             accepted_by_request = [0] * len(prefixes)
@@ -159,9 +174,12 @@ class IntermediatePipeline:
                 for i in active:
                     contexts_by_request[i] = prefixes[i] + accepted[i]
                 started = perf_counter() if trace else 0.0
-                proposals = self.backend.propose(
-                    [contexts_by_request[i] for i in active], req_ids=[req_ids[i] for i in active]
+                propose = (
+                    getattr(self.backend, "propose_device", self.backend.propose)
+                    if decision_runner is not None
+                    else self.backend.propose
                 )
+                proposals = propose([contexts_by_request[i] for i in active], req_ids=[req_ids[i] for i in active])
                 secondary_ms = (perf_counter() - started) * 1000 if trace else 0.0
                 for i, tokens in zip(active, proposals):
                     drafts[i] = tokens[: limits[i] - len(accepted[i])]

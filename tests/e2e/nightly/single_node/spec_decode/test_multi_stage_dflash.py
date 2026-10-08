@@ -169,11 +169,11 @@ def test_long_cached_prefill_attention_matches_causal_reference():
 def test_multi_stage_dflash(method, long_candidates, graph_mode, monkeypatch):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     models = DFLASH["dflash"]
-    prompts = ["The capital of France is", "List three prime numbers:"]
-    params = [SamplingParams(temperature=0, max_tokens=n, ignore_eos=True) for n in (37, 61)]
+    prompts = ["The capital of France is", "List three prime numbers:", "Count from one to ten:", "A triangle has"]
+    params = [SamplingParams(temperature=0, max_tokens=n, ignore_eos=True) for n in (37, 61, 19, 45)]
     common = dict(
         max_model_len=256,
-        max_num_seqs=2,
+        max_num_seqs=4,
         max_num_batched_tokens=256,
         enforce_eager=True,
         async_scheduling=False,
@@ -191,6 +191,8 @@ def test_multi_stage_dflash(method, long_candidates, graph_mode, monkeypatch):
             "num_rounds": 5 if long_candidates else 2,
             "num_speculative_tokens": 4 if long_candidates else 2,
             "max_num_seqs": 2,
+            # Exercise resident slots beyond the two-row compute block table.
+            "cache_max_num_seqs": 4,
             # Ensure >15 candidates regardless of the draft model's accuracy.
             "verification": {"method": "all" if long_candidates else "topk", "top_k": 1},
         },
@@ -226,7 +228,7 @@ def test_multi_stage_dflash(method, long_candidates, graph_mode, monkeypatch):
                 for row in before
             )
         tokens = [out.outputs[0].token_ids for out in runner.model.generate(prompts, params)]
-        assert [len(row) for row in tokens] == [37, 61]
+        assert [len(row) for row in tokens] == [p.max_tokens for p in params]
         if reference is not None:
             assert tokens == reference
         # Recycle request slots and scratch KV with a different prefix.

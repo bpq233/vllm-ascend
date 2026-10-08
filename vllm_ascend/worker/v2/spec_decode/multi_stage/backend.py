@@ -194,12 +194,13 @@ class IntermediateBackend:
         self.cudagraph_manager = None
         self.graph_replays = 0
         self.max_num_reqs = config.max_num_seqs
-        self.cache = IntermediateKVCache(self.max_num_reqs)
+        self.cache_capacity = config.cache_max_num_seqs or self.max_num_reqs
+        self.cache = IntermediateKVCache(self.cache_capacity)
         self.forward_tokens = 0
         self.executed_tokens = 0
         self.reused_tokens = 0
         self.reused_hidden_tokens = 0
-        self._context_rows = [None] * self.max_num_reqs
+        self._context_rows = [None] * self.cache_capacity
         options = (parent_config.additional_config or {}).get("multi_stage_speculative", {})
         self.decode_query_len = (
             max(
@@ -428,7 +429,9 @@ class IntermediateBackend:
             group.layer_names.append(name)
         # Block zero stays reserved. Each persistent request slot owns disjoint
         # ranges in the verifier and drafter groups, including speculative KV.
-        num_blocks = 1 + self.max_num_reqs * max(ceil(self.max_model_len / g.kv_cache_spec.block_size) for g in groups)
+        num_blocks = 1 + self.cache_capacity * max(
+            ceil(self.max_model_len / g.kv_cache_spec.block_size) for g in groups
+        )
         self.kv_cache_config = KVCacheConfig(
             num_blocks=num_blocks,
             kv_cache_tensors=[KVCacheTensor(num_blocks * spec.page_size_bytes, [name]) for name, spec in specs.items()],
@@ -447,13 +450,20 @@ class IntermediateBackend:
             device=self.device,
             kernel_block_sizes=kernel_sizes,
         )
+        self.cache_block_tables = []
         for table, group, size in zip(self.block_tables.input_block_tables, groups, kernel_sizes):
             factor = group.kv_cache_spec.block_size // size
             # Account for backends splitting one allocator block into kernels.
-            table.copy_(
-                torch.arange(factor, factor + table.numel(), device=self.device, dtype=torch.int32).view_as(table)
-            )
-        self.cache_block_tables = [table.clone() for table in self.block_tables.input_block_tables]
+            # Persistent slot IDs index this larger table; graph input tables
+            # keep their microbatch shape and receive only the selected rows.
+            cached = torch.arange(
+                factor,
+                factor + self.cache_capacity * table.shape[1],
+                device=self.device,
+                dtype=torch.int32,
+            ).view(self.cache_capacity, table.shape[1])
+            self.cache_block_tables.append(cached)
+            table.copy_(cached[: self.max_num_reqs])
         self.model_state = init_asecnd_model_state(cfg, self.model, None, self.device)
         self.drafter.set_attn(
             self.model_state, self.kv_cache_config, self.block_tables, self.input_buffers, self.attn_groups
@@ -514,7 +524,9 @@ class IntermediateBackend:
             rows.append(saved[3][offset : offset + 1])
         return torch.cat(rows, dim=0) if rows else None
 
-    def _forward(self, sequences, req_ids=None, required_starts=None, reuse_context=False, retain_hidden=True):
+    def _forward(
+        self, sequences, req_ids=None, required_starts=None, reuse_context=False, retain_hidden=True, draft_tokens=None
+    ):
         n = len(sequences)
         if req_ids is None:
             req_ids = [str(i) for i in range(n)]
@@ -560,7 +572,14 @@ class IntermediateBackend:
         # with an asynchronous copy from a previous microbatch.
         # Put all 64-bit fields first to keep every dtype view aligned. Preserve
         # one H2D while sending lengths/boundaries/token IDs in their real dtype.
-        field_sizes = [n, total, total, n, n, n + 1, total]
+        # Secondary candidates already live on device. Upload only the known
+        # context/anchor IDs and copy the candidate suffix directly into the
+        # fixed graph input. Placeholder IDs in sequences are never forwarded.
+        host_counts, host_starts = query_lens, starts
+        if draft_tokens is not None:
+            host_counts = query_lens - np.array([len(t) for t in draft_tokens], dtype=np.int32)
+            host_starts = np.concatenate((np.zeros(1, dtype=np.int32), np.cumsum(host_counts, dtype=np.int32)))
+        field_sizes = [n, total, total, n, n, n + 1, int(host_starts[-1])]
         dtypes = [torch.int64] * 4 + [torch.int32] * 3
         byte_sizes = [size * (8 if dtype == torch.int64 else 4) for size, dtype in zip(field_sizes, dtypes)]
         host_inputs = torch.empty(sum(byte_sizes), dtype=torch.uint8, pin_memory=self.device.type != "cpu")
@@ -578,7 +597,7 @@ class IntermediateBackend:
         host_fields[4][:] = lengths
         host_fields[5][:] = starts
         for row, (sequence, count) in enumerate(zip(sequences, computed)):
-            host_fields[6][starts[row] : starts[row + 1]] = sequence[count:]
+            host_fields[6][host_starts[row] : host_starts[row + 1]] = sequence[count : count + host_counts[row]]
         device_fields = host_inputs.to(self.device, non_blocking=True).split(byte_sizes)
         cache_slots_gpu, token_rows, positions_gpu, logits_indices, seq_lens, starts_gpu, ids_gpu = (
             field.view(dtype) for field, dtype in zip(device_fields, dtypes)
@@ -588,7 +607,14 @@ class IntermediateBackend:
         positions = self.input_buffers.positions[:total]
         positions.copy_(positions_gpu)
         ids = self.input_buffers.input_ids[:total]
-        ids.copy_(ids_gpu)
+        if draft_tokens is None:
+            ids.copy_(ids_gpu)
+        else:
+            for row, tokens in enumerate(draft_tokens):
+                begin, end = int(starts[row]), int(starts[row + 1])
+                context_end = begin + int(host_counts[row])
+                ids[begin:context_end].copy_(ids_gpu[host_starts[row] : host_starts[row + 1]])
+                ids[context_end:end].copy_(tokens)
         self.input_buffers.input_ids[total:padded_total].zero_()
         self.input_buffers.positions[total:padded_total].zero_()
         mapping = self._request_offsets[:n]
@@ -723,7 +749,10 @@ class IntermediateBackend:
             else self.block_tables.slot_mappings[gids[0], :total]
         )
         self.drafter.model.precompute_and_store_context_kv(context_hidden, positions, context_slots)
-        self.cache.commit(cache_slots, sequences)
+        if draft_tokens is None:
+            self.cache.commit(cache_slots, sequences)
+        # Device drafts are committed only after the pipeline's decision D2H
+        # supplies their actual IDs. Failure leaves the old valid prefix only.
         for row, (req_id, slot, sequence, required) in enumerate(zip(req_ids, cache_slots, sequences, required_starts)):
             if not retain_hidden:
                 # The last verification round has no following secondary
@@ -754,28 +783,57 @@ class IntermediateBackend:
         smaller = [size for size in sizes if size < total]
         if padded <= 8 * total or not smaller or not any(c < p for c, p in zip(computed, required)):
             return
-        # Reserve the whole group first, so per-request warming cannot evict
+        # Reserve the whole group first, so warming a subset cannot evict
         # another member. Only context rows are split; prediction stays packed.
-        self.cache.plan(req_ids, sequences, required)
-        chunk = max(smaller)
-        for req_id, sequence, end, start in zip(req_ids, sequences, required, computed):
-            while start < end:
-                start = min(start + chunk, end)
-                self._forward([sequence[:start]], [req_id], [start - 1], retain_hidden=False)
+        _, computed = self.cache.plan(req_ids, sequences, required)
+        chunk = min(max(smaller), self.max_num_tokens)
+        while pending := [i for i, (start, end) in enumerate(zip(computed, required)) if start < end]:
+            rows = pending[: min(self.max_num_reqs, chunk)]
+            budget = chunk
+            ends = {}
+            # Share the existing small graph among requests. Allocate short
+            # tails first so their unused share goes to longer prefixes.
+            ordered = sorted(rows, key=lambda i: required[i] - computed[i])
+            for pos, i in enumerate(ordered):
+                count = min(required[i] - computed[i], budget // (len(ordered) - pos))
+                ends[i] = computed[i] + count
+                budget -= count
+            self._forward(
+                [sequences[i][: ends[i]] for i in rows],
+                [req_ids[i] for i in rows],
+                [ends[i] - 1 for i in rows],
+                retain_hidden=False,
+            )
+            # A failed forward leaves only previously committed KV reusable.
+            for i in rows:
+                computed[i] = ends[i]
 
     @torch.inference_mode()
     def verify_batches(self, prefixes, drafts, req_ids=None, retain_hidden=True, decision=None):
         if len(prefixes) != len(drafts) or any(not p for p in prefixes):
             raise ValueError("Intermediate verification requires one nonempty prefix per draft.")
-        sequences = [p + d for p, d in zip(prefixes, drafts)]
+        device_drafts = bool(drafts) and isinstance(drafts[0], torch.Tensor)
+        if device_drafts and decision is None:
+            raise ValueError("Device drafts require a packed decision runner.")
+        sequences = [p + ([0] * len(d) if device_drafts else d) for p, d in zip(prefixes, drafts)]
         req_ids = req_ids if req_ids is not None else [str(i) for i in range(len(sequences))]
+        if device_drafts and (
+            len(req_ids) != len(sequences) or len(set(req_ids)) != len(req_ids) or len(req_ids) > self.cache.capacity
+        ):
+            raise ValueError("Device draft verification requires distinct requests within the resident cache capacity.")
         required_starts = [len(p) - 1 for p in prefixes]
         with self._context():
             for offset, rows in self._batches(sequences, req_ids, required_starts):
                 required = required_starts[offset : offset + len(rows)]
                 batch_ids = req_ids[offset : offset + len(rows)]
                 self._warm_prefixes(rows, batch_ids, required)
-                batch, _, _, hidden, _ = self._forward(rows, batch_ids, required, retain_hidden=retain_hidden)
+                batch, _, _, hidden, _ = self._forward(
+                    rows,
+                    batch_ids,
+                    required,
+                    retain_hidden=retain_hidden,
+                    **({"draft_tokens": drafts[offset : offset + len(rows)]} if device_drafts else {}),
+                )
                 # On cache hits every forwarded row predicts a candidate/bonus.
                 # Avoid a CPU index list, H2D index copy and device gather there.
                 if np.array_equal(batch.num_computed_tokens_np, required):
@@ -818,13 +876,13 @@ class IntermediateBackend:
                     self.verification_tokens = None
 
     @torch.inference_mode()
-    def propose(self, prefixes, req_ids=None):
+    def propose(self, prefixes, req_ids=None, return_device=False):
         # DFlash has a fixed query shape. Near the model boundary use an empty
         # draft: the next verifier round can still provide one bonus token.
         active = [
             i for i, p in enumerate(prefixes) if 2 <= len(p) <= self.max_model_len - self.config.num_speculative_tokens
         ]
-        result = [[] for _ in prefixes]
+        result = [torch.empty(0, dtype=torch.int64, device=self.device) if return_device else [] for _ in prefixes]
         req_ids = req_ids if req_ids is not None else [str(i) for i in range(len(prefixes))]
         active_ids = [req_ids[i] for i in active]
         with self._context():
@@ -854,14 +912,25 @@ class IntermediateBackend:
                     self._proposal_temperature,
                     self._proposal_seeds,
                 )
-                for i, token_ids in zip(active[offset : offset + n], tokens.tolist()):
+                # DFlash may reuse its graph output at the next microbatch.
+                # Own the small candidate tensor until verification consumes it.
+                proposals = tokens.clone().unbind(0) if return_device else tokens.tolist()
+                for i, token_ids in zip(active[offset : offset + n], proposals):
                     result[i] = token_ids
         return result
+
+    def propose_device(self, prefixes, req_ids=None):
+        return self.propose(prefixes, req_ids=req_ids, return_device=True)
+
+    def commit_verified_drafts(self, prefixes, drafts, req_ids):
+        """Publish CPU token identities after the shared decision transfer."""
+        slots = [self.cache.slots[req_id] for req_id in req_ids]
+        self.cache.commit(slots, [p + d for p, d in zip(prefixes, drafts)])
 
     def profile(self):
         # Include full-prefix activations in the main worker's peak measurement.
         self.cache.retain(())
-        self._context_rows = [None] * self.max_num_reqs
+        self._context_rows = [None] * self.cache_capacity
         graph_replays_before = self.graph_replays
         length = self.max_model_len - self.config.num_speculative_tokens
         rows, remaining = [], self.max_num_tokens
@@ -896,4 +965,4 @@ class IntermediateBackend:
             self.cudagraph_manager.captured_token_counts() if self.cudagraph_manager else [],
         )
         self.cache.retain(())
-        self._context_rows = [None] * self.max_num_reqs
+        self._context_rows = [None] * self.cache_capacity
