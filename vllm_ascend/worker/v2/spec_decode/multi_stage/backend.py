@@ -28,9 +28,9 @@ from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager, verificat
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata, get_kv_cache_spec
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_states import init_asecnd_model_state
-from vllm_ascend.worker.v2.spec_decode.dflash.speculator import AscendDFlashSpeculator
 from vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance import AcceptancePolicy, IntermediateDecisionRunner
 from vllm_ascend.worker.v2.spec_decode.multi_stage.config import intermediate_capture_sizes, primary_draft_width
+from vllm_ascend.worker.v2.spec_decode.multi_stage.drafter import IntermediateDFlashSpeculator
 
 logger = logging.getLogger(__name__)
 
@@ -339,7 +339,7 @@ class IntermediateBackend:
                 graph_enabled=self.graph_enabled,
             )
             set_eagle3_aux_hidden_state_layers(self.model, cfg.speculative_config)
-            self.drafter = AscendDFlashSpeculator(cfg, self.device)
+            self.drafter = IntermediateDFlashSpeculator(cfg, self.device)
             self.drafter.load_model(self.model)
             rope.set_cos_and_sin(cfg, self.max_num_reqs, self.drafter.num_query_per_req, parent.dtype, self.device)
             self.input_buffers = AscendInputBuffers(self.max_num_reqs, self.max_num_tokens, self.device)
@@ -628,13 +628,6 @@ class IntermediateBackend:
         attn_state = (
             AscendAttentionState.PrefillNoCache if np.all(is_prefilling) else AscendAttentionState.ChunkedPrefill
         )
-        # Writes use absolute positions in each request's persistent pages.
-        for gid, (table, size) in enumerate(
-            zip(self.block_tables.input_block_tables, self.block_tables.kernel_block_sizes)
-        ):
-            slots = table[token_rows, positions // size].long() * size + positions % size
-            self.block_tables.slot_mappings[gid, :total] = slots
-        self.block_tables.slot_mappings[:, total:padded_total].fill_(-1)
         batch = AscendInputBatch(
             req_ids=req_ids,
             num_reqs=n,
@@ -670,6 +663,21 @@ class IntermediateBackend:
             attn_state=attn_state,
             **({} if vllm_version_is("0.27.1") else {"has_prefill": bool(np.any(is_prefilling))}),
         )
+        if cached_context is not None and hasattr(self.drafter, "propose_precomputed"):
+            # The secondary preparer only consumes positions, query boundaries
+            # and the block table. It builds its own query slots/metadata; no
+            # verifier attention or context-KV update will run on this path.
+            self.cache.commit(cache_slots, sequences)
+            self.reused_hidden_tokens += total
+            self.reused_tokens += int(lengths.sum())
+            return batch, None, None, cached_context, None
+        # Writes use absolute positions in each request's persistent pages.
+        for gid, (table, size) in enumerate(
+            zip(self.block_tables.input_block_tables, self.block_tables.kernel_block_sizes)
+        ):
+            slots = table[token_rows, positions // size].long() * size + positions % size
+            self.block_tables.slot_mappings[gid, :total] = slots
+        self.block_tables.slot_mappings[:, total:padded_total].fill_(-1)
         metadata = build_attn_metadata(
             attn_groups=self.attn_groups,
             num_reqs=n,
@@ -904,19 +912,29 @@ class IntermediateBackend:
                     pin_memory=self.device.type != "cpu",
                 )
                 anchors[:n].copy_(host_anchors, non_blocking=True)
-                tokens = self.drafter.propose(
-                    batch,
-                    metadata,
-                    slots,
-                    hidden,
-                    aux,
-                    self._proposal_ones[:n],
-                    self._proposal_zeros[:n],
-                    anchors,
-                    anchors,
-                    self._proposal_temperature,
-                    self._proposal_seeds,
-                )
+                if hasattr(self.drafter, "propose_precomputed"):
+                    tokens = self.drafter.propose_precomputed(
+                        batch,
+                        anchors,
+                        self._proposal_ones[:n],
+                        self._proposal_zeros[:n],
+                        self._proposal_temperature,
+                        self._proposal_seeds,
+                    )
+                else:
+                    tokens = self.drafter.propose(
+                        batch,
+                        metadata,
+                        slots,
+                        hidden,
+                        aux,
+                        self._proposal_ones[:n],
+                        self._proposal_zeros[:n],
+                        anchors,
+                        anchors,
+                        self._proposal_temperature,
+                        self._proposal_seeds,
+                    )
                 # DFlash may reuse its graph output at the next microbatch.
                 # Own the small candidate tensor until verification consumes it.
                 proposals = tokens.clone().unbind(0) if return_device else tokens.tolist()

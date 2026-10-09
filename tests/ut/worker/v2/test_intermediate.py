@@ -129,6 +129,31 @@ def test_all_policy_projects_only_bonus_rows(modules):
     torch.testing.assert_close(projected[0], hidden[[15, 31]])
 
 
+def test_eager_decision_reuses_only_shape_metadata(modules, monkeypatch):
+    acceptance = sys.modules["vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance"]
+    policy = acceptance.AcceptancePolicy("topk", 1)
+    runner = acceptance.IntermediateDecisionRunner(lambda h: h, policy, 5)
+    hidden = torch.eye(6)
+    tokens = torch.arange(6)
+    expected = runner(hidden, tokens, [3, 3]).clone()
+    tensor, arange = torch.tensor, torch.arange
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Repeated decision shape must not upload lengths or allocate steps")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "tensor", unexpected)
+        patch.setattr(torch, "arange", unexpected)
+        torch.testing.assert_close(runner(hidden, tokens, [3, 3]), expected)
+        # Values must still be recomputed, including a new first rejection.
+        changed = hidden.roll(1, 1)
+        assert runner(changed, tokens, [3, 3]).tolist() == [[0, 1], [0, 4]]
+    for count in range(1, 20):
+        runner(torch.eye(2).repeat(count, 1), tensor([0, 1] * count), [2] * count)
+    assert len(runner._eager_shapes) == 16
+    assert torch.tensor is tensor and torch.arange is arange
+
+
 @pytest.mark.parametrize("method", ["topk", "all", "prob_ratio"])
 def test_decision_graph_reuses_buffers_for_changing_lengths(modules, monkeypatch, method):
     acceptance = sys.modules["vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance"]
@@ -196,7 +221,16 @@ def test_decision_graph_reuses_buffers_for_changing_lengths(modules, monkeypatch
     )
     generator = torch.Generator().manual_seed(4)
     addresses = {}
-    for lengths in ([5, 5, 5], [1], [1, 4, 2, 3], [4, 1, 1], [3]):
+    uploads = []
+    copy = torch.Tensor.copy_
+
+    def record_copy(destination, source, *args, **kwargs):
+        if any(destination is entry[2] for entry in runner.entries.values()):
+            uploads.append(source.tolist())
+        return copy(destination, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", record_copy)
+    for lengths in ([5, 5, 5], [5, 5, 5], [1], [1, 4, 2, 3], [4, 1, 1], [3], [3]):
         hidden = torch.randn(sum(lengths), 11, generator=generator)
         tokens = torch.randint(11, (sum(lengths),), generator=generator)
         torch.testing.assert_close(runner(hidden, tokens, lengths), eager(hidden, tokens, lengths))
@@ -205,7 +239,8 @@ def test_decision_graph_reuses_buffers_for_changing_lengths(modules, monkeypatch
             assert addresses.setdefault(bucket, pointers) == pointers
     assert state.captures == 2  # request buckets 1 and 4, independent of lengths
     assert state.streams == state.pools == 1
-    assert runner.replays == 5
+    assert runner.replays == 7
+    assert uploads == [[5, 5, 5, 1], [1], [1, 4, 2, 3], [4, 1, 1, 1], [3]]
 
 
 def test_resident_requests_run_first_and_results_restore_original_order(modules):
@@ -372,7 +407,10 @@ def test_failed_validation_does_not_publish_capacity(modules):
     assert "primary_num_speculative_tokens" not in options
 
 
-@pytest.mark.parametrize("threshold,rounds,expected", [(2, 5, [1, 2, 3]), (3, 5, [1, 2, 3, 4, 5, 6]), (99, 2, [1, 2, 3, 4, 5, 6]), (0, 5, [1, 2, 3])])
+@pytest.mark.parametrize(
+    "threshold,rounds,expected",
+    [(2, 5, [1, 2, 3]), (3, 5, [1, 2, 3, 4, 5, 6]), (99, 2, [1, 2, 3, 4, 5, 6]), (0, 5, [1, 2, 3])],
+)
 def test_round_or_token_stop_keeps_whole_completed_round(modules, threshold, rounds, expected):
     config, Pipeline = modules
     backend = Backend([[[1, 2, 3]], [[4, 5, 6]]], proposals=[[[4, 5]]])
@@ -411,7 +449,10 @@ def test_capacity_bounds_every_acceptance_length(modules):
             for rounds in (1, 2, 4):
                 for threshold in (None, 0, 1, 5, 16, 100):
                     options = config.IntermediateConfig(
-                        "v", "d", num_rounds=rounds, num_speculative_tokens=secondary,
+                        "v",
+                        "d",
+                        num_rounds=rounds,
+                        num_speculative_tokens=secondary,
                         max_generated_tokens=threshold,
                     )
                     capacity = config.candidate_capacity(primary, options)

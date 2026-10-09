@@ -16,7 +16,23 @@ def _candidate_probe(worker, install=False):
     pipeline = runner.speculator.pipeline
     if install:
         worker._largest_candidate = 0
+        worker._context_kv_tokens = 0
+        worker._secondary_precomputed_calls = 0
+        worker._initial_verifier_tokens = pipeline.backend.forward_tokens
         refine = pipeline.refine
+        hydrate = pipeline.backend.drafter.model.precompute_and_store_context_kv
+        propose = pipeline.backend.drafter.propose_precomputed
+
+        def record_hydration(states, *args, **kwargs):
+            worker._context_kv_tokens += states.shape[0]
+            return hydrate(states, *args, **kwargs)
+
+        def record_proposal(*args, **kwargs):
+            worker._secondary_precomputed_calls += 1
+            return propose(*args, **kwargs)
+
+        pipeline.backend.drafter.model.precompute_and_store_context_kv = record_hydration
+        pipeline.backend.drafter.propose_precomputed = record_proposal
 
         def record(*args, **kwargs):
             candidates = refine(*args, **kwargs)
@@ -29,6 +45,9 @@ def _candidate_probe(worker, install=False):
         "largest_candidate": worker._largest_candidate,
         "unused_progress_stream": runner.num_computed_tokens_stream is None,
         "shared_update_stream": pipeline.backend.drafter.update_stream is runner.update_stream,
+        "context_kv_tokens": worker._context_kv_tokens,
+        "verifier_tokens": pipeline.backend.forward_tokens - worker._initial_verifier_tokens,
+        "secondary_precomputed_calls": worker._secondary_precomputed_calls,
     }
 
 
@@ -254,6 +273,10 @@ def test_multi_stage_dflash(method, long_candidates, graph_mode, monkeypatch):
             )
         tokens = [out.outputs[0].token_ids for out in runner.model.generate(prompts, params)]
         candidates = runner.model.llm_engine.collective_rpc(_candidate_probe)
+        # Each new verifier row hydrates context KV once. Secondary proposals
+        # must not repeat the projection/cache update, including in eager mode.
+        assert all(row["secondary_precomputed_calls"] > 0 for row in candidates)
+        assert all(row["context_kv_tokens"] == row["verifier_tokens"] > 0 for row in candidates)
         if long_candidates:
             assert all(row["largest_candidate"] == 20 for row in candidates)
         assert [len(row) for row in tokens] == [p.max_tokens for p in params]

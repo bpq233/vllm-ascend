@@ -112,6 +112,7 @@ class IntermediatePipeline:
                 started = perf_counter()
             decisions = []
             decision_tensors = []
+            decision_transfer_ms = 0.0
             for logits, lengths in self.backend.verify_batches(
                 contexts,
                 round_drafts,
@@ -126,7 +127,9 @@ class IntermediatePipeline:
                     # The last microbatch is consumed before any subsequent
                     # replay. Only earlier outputs need independent storage.
                     last_batch = sum(t.shape[0] for t in decision_tensors) + len(lengths) == len(active)
-                    decision_tensors.append(logits.clone() if decision_runner.graph_enabled and not last_batch else logits)
+                    decision_tensors.append(
+                        logits.clone() if decision_runner.graph_enabled and not last_batch else logits
+                    )
                     continue
                 offset = len(decisions)
                 decisions.extend(
@@ -141,11 +144,13 @@ class IntermediatePipeline:
                 decision_output = (
                     decision_tensors[0] if len(decision_tensors) == 1 else torch.cat(decision_tensors, dim=0)
                 )
+                transfer_started = perf_counter() if trace else 0.0
                 if device_drafts:
                     # One round transfer supplies both the acceptance decision
                     # and token identities needed for CPU cache/sequence state.
                     # There is no Secondary D2H followed by candidate H2D.
                     packed = torch.cat((decision_output.reshape(-1), *round_drafts)).cpu().tolist()
+                    decision_transfer_ms = (perf_counter() - transfer_started) * 1000 if trace else 0.0
                     decisions.extend([packed[i : i + 2] for i in range(0, 2 * len(active), 2)])
                     offset = 2 * len(active)
                     for row, i in enumerate(active):
@@ -156,7 +161,9 @@ class IntermediatePipeline:
                     self.backend.commit_verified_drafts(contexts, round_drafts, [req_ids[i] for i in active])
                 else:
                     decisions.extend(decision_output.cpu().tolist())
+                    decision_transfer_ms = (perf_counter() - transfer_started) * 1000 if trace else 0.0
             intermediate_ms = (perf_counter() - started) * 1000 if trace else 0.0
+            host_started = perf_counter() if trace else 0.0
             continuing = []
             accepted_by_request = [0] * len(prefixes) if trace else None
             for i, (length, replacement) in zip(active, decisions):
@@ -177,6 +184,7 @@ class IntermediatePipeline:
                     continuing.append(i)
             active = continuing
             secondary_ms = 0.0
+            host_update_ms = (perf_counter() - host_started) * 1000 if trace else 0.0
             if round_id + 1 < self.config.num_rounds and active:
                 # Share this immutable snapshot with the next verification.
                 # Never extend it in place: backends may retain references.
@@ -198,6 +206,7 @@ class IntermediatePipeline:
                 logger.debug(
                     "multi_stage_intermediate round=%d proposed=%d accepted=%d accepted_by_request=%s "
                     "intermediate_model_ms=%.3f secondary_model_ms=%.3f timing=host_wall_with_acceptance "
+                    "decision_transfer_ms=%.3f host_update_ms=%.3f "
                     "request_ids=%s forward_tokens=%d kv_reused_tokens=%d executed_tokens=%d padding_tokens=%d "
                     "verifier_graph_replays=%d decision_graph_replays=%d",
                     round_id,
@@ -206,6 +215,8 @@ class IntermediatePipeline:
                     accepted_by_request,
                     intermediate_ms,
                     secondary_ms,
+                    decision_transfer_ms,
+                    host_update_ms,
                     req_ids,
                     getattr(self.backend, "forward_tokens", 0) - forward_before,
                     getattr(self.backend, "reused_tokens", 0) - reused_before,

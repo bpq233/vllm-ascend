@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
@@ -59,6 +60,8 @@ class IntermediateDecisionRunner:
         self.stream = None
         self.pool = None
         self.replays = 0
+        self._eager_shapes = OrderedDict()
+        self._graph_lengths = {}
 
     def _run(self, hidden, tokens, sizes, steps):
         starts = sizes.cumsum(0) - sizes
@@ -79,8 +82,16 @@ class IntermediateDecisionRunner:
         if not lengths or max(lengths) > self.query_width or sum(lengths) != hidden.shape[0]:
             raise ValueError("Decision inputs must contain packed anchor/draft rows within the configured width.")
         if not self.graph_enabled:
-            sizes = torch.tensor(lengths, device=hidden.device)
-            steps = torch.arange(self.query_width, device=hidden.device)
+            key = (hidden.device, tuple(lengths))
+            if key not in self._eager_shapes:
+                self._eager_shapes[key] = (
+                    torch.tensor(lengths, device=hidden.device),
+                    torch.arange(self.query_width, device=hidden.device),
+                )
+                if len(self._eager_shapes) > 16:
+                    self._eager_shapes.popitem(last=False)
+            self._eager_shapes.move_to_end(key)
+            sizes, steps = self._eager_shapes[key]
             return self._run(hidden, tokens, sizes, steps)
 
         from vllm.distributed.parallel_state import GraphCaptureContext, get_tp_group
@@ -102,9 +113,14 @@ class IntermediateDecisionRunner:
         static_hidden[: hidden.shape[0]].copy_(hidden)
         if tokens is not None:
             static_tokens[: tokens.numel()].copy_(tokens)
-        # Do not reuse this source: the H2D copy is asynchronous.
-        host_sizes = torch.tensor(lengths + [1] * (bucket - n), dtype=torch.int64, pin_memory=True)
-        sizes.copy_(host_sizes, non_blocking=True)
+        # Sizes are graph inputs, never graph outputs. A repeated shape can
+        # reuse their values as well as their addresses. Changed shapes still
+        # need fresh pinned storage to avoid racing an in-flight H2D.
+        shape = tuple(lengths) + (1,) * (bucket - n)
+        if self._graph_lengths.get(bucket) != shape:
+            host_sizes = torch.tensor(shape, dtype=torch.int64, pin_memory=True)
+            sizes.copy_(host_sizes, non_blocking=True)
+            self._graph_lengths[bucket] = shape
         if graph is None:
             if self.stream is None:
                 self.stream = torch.npu.Stream(device=hidden.device)
