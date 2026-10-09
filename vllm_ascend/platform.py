@@ -289,7 +289,9 @@ class NPUPlatform(Platform):
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
         """Apply Ascend-specific defaults."""
+        from vllm_ascend.worker.v2.spec_decode.multi_stage.config import prepare_multi_stage_config
 
+        prepare_multi_stage_config(vllm_config)
         default_max_cg_capture_size = _get_default_max_cudagraph_capture_size(vllm_config)
         if default_max_cg_capture_size is not None:
             vllm_config.compilation_config.max_cudagraph_capture_size = default_max_cg_capture_size

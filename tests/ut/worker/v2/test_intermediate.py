@@ -228,7 +228,8 @@ def vllm_config():
         use_v2_model_runner=True,
         speculative_config=NS(num_speculative_tokens=8, use_dflash=lambda: True),
         parallel_config=NS(),
-        scheduler_config=NS(async_scheduling=False),
+        scheduler_config=NS(async_scheduling=False, max_num_batched_tokens=256),
+        cache_config=NS(cache_dtype="auto"),
         lora_config=None,
         model_config=NS(is_multimodal_model=False),
     )
@@ -273,6 +274,10 @@ def test_final_probability_ratio_config(modules):
         ("num_speculative_tokens", 0),
         ("max_num_seqs", 0),
         ("max_model_len", 0),
+        ("max_generated_tokens", -1),
+        ("max_generated_tokens", True),
+        ("max_generated_tokens", 2.5),
+        ("max_generated_tokens", "8"),
     ],
 )
 def test_invalid_intermediate_numbers(modules, field, value):
@@ -286,7 +291,7 @@ def test_invalid_intermediate_numbers(modules, field, value):
     [
         {"unexpected": True},
         {"primary_num_speculative_tokens": 4},
-        {**settings(), "primary_num_speculative_tokens": 9},
+        {**settings(), "primary_num_speculative_tokens": 16},
         {"intermediate": settings()["intermediate"]},
     ],
 )
@@ -311,8 +316,9 @@ def test_long_budget_validation(modules):
     cfg.speculative_config.num_speculative_tokens = 32
     cfg.scheduler_config.max_num_batched_tokens = 64
     cfg.cache_config = NS(cache_dtype="auto")
-    options = {**settings(), "primary_num_speculative_tokens": 4}
+    options = {**settings(num_rounds=8), "primary_num_speculative_tokens": 4}
     config.validate_multi_stage(cfg, options)
+    assert cfg.speculative_config.num_speculative_tokens == 40
     # Omitting primary width must not inherit the long final budget.
     config.validate_multi_stage(cfg, settings())
     assert config.primary_draft_width(settings(), 32) == 4
@@ -328,6 +334,93 @@ def test_long_budget_validation(modules):
     cfg.scheduler_config.max_num_batched_tokens = 32
     with pytest.raises(ValueError, match="max_num_batched_tokens"):
         config.validate_multi_stage(cfg, options)
+
+
+@pytest.mark.parametrize("threshold,expected", [(None, 40), (0, 5), (5, 10), (7, 12), (100, 40)])
+def test_capacity_is_derived_and_stable_across_initialization(modules, threshold, expected):
+    config, _ = modules
+    cfg = vllm_config()
+    cfg.speculative_config.num_speculative_tokens = 4
+    options = settings(num_rounds=8, max_generated_tokens=threshold)
+    config.validate_multi_stage(cfg, options)
+    assert options["primary_num_speculative_tokens"] == 4
+    assert cfg.speculative_config.num_speculative_tokens == expected
+    # Worker reinitialization must not mistake the derived capacity for a
+    # primary width, including derived capacities <= 15.
+    config.validate_multi_stage(cfg, options)
+    assert options["primary_num_speculative_tokens"] == 4
+    assert cfg.speculative_config.num_speculative_tokens == expected
+
+
+def test_explicit_primary_width_is_independent_of_old_final_limit(modules):
+    config, _ = modules
+    cfg = vllm_config()
+    cfg.speculative_config.num_speculative_tokens = 2
+    options = {**settings(num_rounds=2), "primary_num_speculative_tokens": 8}
+    config.validate_multi_stage(cfg, options)
+    assert cfg.speculative_config.num_speculative_tokens == 14
+
+
+def test_failed_validation_does_not_publish_capacity(modules):
+    config, _ = modules
+    cfg = vllm_config()
+    cfg.scheduler_config.max_num_batched_tokens = 10
+    options = settings(num_rounds=4)
+    with pytest.raises(ValueError, match="derived candidate capacity"):
+        config.validate_multi_stage(cfg, options)
+    assert cfg.speculative_config.num_speculative_tokens == 8
+    assert "primary_num_speculative_tokens" not in options
+
+
+@pytest.mark.parametrize("threshold,rounds,expected", [(2, 5, [1, 2, 3]), (3, 5, [1, 2, 3, 4, 5, 6]), (99, 2, [1, 2, 3, 4, 5, 6]), (0, 5, [1, 2, 3])])
+def test_round_or_token_stop_keeps_whole_completed_round(modules, threshold, rounds, expected):
+    config, Pipeline = modules
+    backend = Backend([[[1, 2, 3]], [[4, 5, 6]]], proposals=[[[4, 5]]])
+    options = config.IntermediateConfig(
+        "v", "d", num_rounds=rounds, max_generated_tokens=threshold, verification={"method": "all"}
+    )
+    # An old externally supplied capacity no longer truncates the output.
+    result = Pipeline(backend, options, capacity=2).refine([[20]], [[1, 2]], [20])
+    assert result == [expected]
+    assert sum(call[0] == "verify" for call in backend.calls) == len(expected) // 3
+    assert sum(call[0] == "propose" for call in backend.calls) == len(expected) // 3 - 1
+
+
+def test_token_stop_is_per_request_and_preserves_eos_and_context_limits(modules):
+    config, Pipeline = modules
+    backend = Backend(
+        [[[1, 2, 3], [9, 10, 11], [2, 4, 5], [6, 7]], [[4, 5, 6]]],
+        proposals=[[[4, 5]]],
+    )
+    options = config.IntermediateConfig(
+        "v", "d", num_rounds=5, max_generated_tokens=2, verification={"method": "topk", "top_k": 1}
+    )
+    result = Pipeline(backend, options, capacity=20, eos_token_id=2).refine(
+        [[20], [21], [22], [23]], [[1, 2], [1, 2], [2, 4], [6, 7]], [20, 20, 20, 1]
+    )
+    assert result == [[1, 2], [9, 4, 5, 6], [2], [6]]
+    assert backend.calls[1] == ("propose", [[21, 9]])
+
+
+def test_capacity_bounds_every_acceptance_length(modules):
+    config, _ = modules
+    # Enumerate all possible accepted-prefix lengths, including all rejection
+    # and threshold overshoot; the buffer bound must cover every outcome.
+    for primary in (1, 4, 15):
+        for secondary in (1, 4, 15):
+            for rounds in (1, 2, 4):
+                for threshold in (None, 0, 1, 5, 16, 100):
+                    options = config.IntermediateConfig(
+                        "v", "d", num_rounds=rounds, num_speculative_tokens=secondary,
+                        max_generated_tokens=threshold,
+                    )
+                    capacity = config.candidate_capacity(primary, options)
+                    active = {0}
+                    for round_id in range(rounds):
+                        width = primary if round_id == 0 else secondary
+                        outcomes = {length + accepted + 1 for length in active for accepted in range(width + 1)}
+                        assert all(length <= capacity for length in outcomes)
+                        active = {length for length in outcomes if threshold is None or length <= threshold}
 
 
 def test_packed_decisions_match_individual_requests(modules):

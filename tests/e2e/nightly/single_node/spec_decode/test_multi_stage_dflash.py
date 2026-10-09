@@ -11,6 +11,27 @@ from tests.e2e.pull_request.one_card.spec_decode.utils import DFLASH
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl, AscendAttentionState
 
 
+def _candidate_probe(worker, install=False):
+    runner = worker.model_runner
+    pipeline = runner.speculator.pipeline
+    if install:
+        worker._largest_candidate = 0
+        refine = pipeline.refine
+
+        def record(*args, **kwargs):
+            candidates = refine(*args, **kwargs)
+            worker._largest_candidate = max(worker._largest_candidate, max(map(len, candidates), default=0))
+            return candidates
+
+        pipeline.refine = record
+    return {
+        "capacity": runner.speculator.final_capacity,
+        "largest_candidate": worker._largest_candidate,
+        "unused_progress_stream": runner.num_computed_tokens_stream is None,
+        "shared_update_stream": pipeline.backend.drafter.update_stream is runner.update_stream,
+    }
+
+
 def test_packed_metadata_views_and_block_table_out_on_npu():
     """Check dtype reinterpretation and out= on the actual NPU backend."""
     host = torch.empty(36, dtype=torch.uint8, pin_memory=True)
@@ -189,6 +210,7 @@ def test_multi_stage_dflash(method, long_candidates, graph_mode, monkeypatch):
             "verifier": {"model": models["main"]},
             "drafter": {"model": models["spec"]},
             "num_rounds": 5 if long_candidates else 2,
+            "max_generated_tokens": 18 if long_candidates else None,
             "num_speculative_tokens": 4 if long_candidates else 2,
             "max_num_seqs": 2,
             # Exercise resident slots beyond the two-row compute block table.
@@ -210,12 +232,15 @@ def test_multi_stage_dflash(method, long_candidates, graph_mode, monkeypatch):
         speculative_config={
             "method": "dflash",
             "model": models["spec"],
-            # Five all-accepted rounds produce 25 tokens without this cap;
-            # capacity 23 forces the fifth verifier query to be shorter.
-            "num_speculative_tokens": 23 if long_candidates else 6,
+            # This is no longer a target cap: long candidates cross 18 after
+            # four rounds and preserve all 20 tokens. Storage is derived as 23.
+            "num_speculative_tokens": 4 if long_candidates else 2,
         },
         additional_config={"multi_stage_speculative": options},
     ) as runner:
+        initial = runner.model.llm_engine.collective_rpc(_candidate_probe, kwargs={"install": True})
+        assert all(row["capacity"] == (23 if long_candidates else 6) for row in initial)
+        assert all(row["unused_progress_stream"] and row["shared_update_stream"] for row in initial)
         if graph_mode:
             before = runner.model.llm_engine.collective_rpc(_target_graph_probe, kwargs={"install": True})
             assert all(
@@ -228,6 +253,9 @@ def test_multi_stage_dflash(method, long_candidates, graph_mode, monkeypatch):
                 for row in before
             )
         tokens = [out.outputs[0].token_ids for out in runner.model.generate(prompts, params)]
+        candidates = runner.model.llm_engine.collective_rpc(_candidate_probe)
+        if long_candidates:
+            assert all(row["largest_candidate"] == 20 for row in candidates)
         assert [len(row) for row in tokens] == [p.max_tokens for p in params]
         if reference is not None:
             assert tokens == reference

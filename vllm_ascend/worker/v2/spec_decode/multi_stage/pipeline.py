@@ -88,7 +88,9 @@ class IntermediatePipeline:
         return results
 
     def _refine(self, prefixes, primary_tokens, limits, req_ids):
-        limits = [min(limit, self.capacity) for limit in limits]
+        # Limits describe request/model context room only. Storage is derived
+        # from the stop conditions and must never clip a completed round.
+        token_threshold = getattr(self.config, "max_generated_tokens", None)
         accepted = [[] for _ in prefixes]
         drafts = [tokens[:limit] for tokens, limit in zip(primary_tokens, limits)]
         active = [i for i, limit in enumerate(limits) if limit > 0]
@@ -121,7 +123,10 @@ class IntermediatePipeline:
                     # Keep graph output alive until all microbatches finish;
                     # perform one compact D2H copy instead of synchronizing
                     # once per microbatch.
-                    decision_tensors.append(logits.clone() if decision_runner.graph_enabled else logits)
+                    # The last microbatch is consumed before any subsequent
+                    # replay. Only earlier outputs need independent storage.
+                    last_batch = sum(t.shape[0] for t in decision_tensors) + len(lengths) == len(active)
+                    decision_tensors.append(logits.clone() if decision_runner.graph_enabled and not last_batch else logits)
                     continue
                 offset = len(decisions)
                 decisions.extend(
@@ -153,7 +158,7 @@ class IntermediatePipeline:
                     decisions.extend(decision_output.cpu().tolist())
             intermediate_ms = (perf_counter() - started) * 1000 if trace else 0.0
             continuing = []
-            accepted_by_request = [0] * len(prefixes)
+            accepted_by_request = [0] * len(prefixes) if trace else None
             for i, (length, replacement) in zip(active, decisions):
                 additions = drafts[i][:length] + [replacement]
                 stopped = False
@@ -164,7 +169,11 @@ class IntermediatePipeline:
                     if token in self.eos_ids:
                         stopped = True
                         break
-                if not stopped and len(accepted[i]) < limits[i]:
+                if (
+                    not stopped
+                    and len(accepted[i]) < limits[i]
+                    and (token_threshold is None or len(accepted[i]) <= token_threshold)
+                ):
                     continuing.append(i)
             active = continuing
             secondary_ms = 0.0

@@ -162,14 +162,7 @@ class NPUModelRunner(GPUModelRunner):
         # update actual seq_lens_cpu. gpu attention backend doesn't need these
         # attributes, cause their attention backends doesn't use seq_lens_cpu.
         # and seq_lens_cpu is deprecated in gpu_model_runner_v2.
-        self.num_computed_tokens_event = torch.npu.Event()
-        self.num_computed_tokens_stream = torch.npu.Stream()
-        self.num_computed_tokens_cpu = torch.empty(
-            self.max_num_reqs,
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=True,
-        )
+        self._init_num_computed_tokens_copy()
 
         # NOTE: In GPUModelRunner, decode_query_len is initialized in load_model(),
         # +1 is hardcoded here but not in vllm.
@@ -749,10 +742,27 @@ class NPUModelRunner(GPUModelRunner):
         if self.speculator is not None and not getattr(self.speculator, "updates_computed_tokens_cpu", False):
             self._copy_num_computed_tokens_to_cpu()
 
+    def _init_num_computed_tokens_copy(self):
+        self.num_computed_tokens_event = None
+        self.num_computed_tokens_stream = None
+        self.num_computed_tokens_cpu = None
+        # Multi-stage publishes progress in its existing combined D2H. Without
+        # speculation, scheduler metadata supplies progress directly.
+        if self.speculator is None or getattr(self.speculator, "updates_computed_tokens_cpu", False):
+            return
+        self.num_computed_tokens_event = torch.npu.Event()
+        self.num_computed_tokens_stream = torch.npu.Stream()
+        self.num_computed_tokens_cpu = torch.empty(
+            self.max_num_reqs,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+
     def _copy_num_computed_tokens_to_cpu(self):
         # npu attention backend still need to use seq_lens_cpu,
         # we need to copy num_computed_tokens back to cpu.
-        default_stream = torch.cuda.current_stream()
+        default_stream = torch.npu.current_stream()
         assert self.num_computed_tokens_stream is not None
         assert self.num_computed_tokens_cpu is not None
         with torch.npu.stream(self.num_computed_tokens_stream):

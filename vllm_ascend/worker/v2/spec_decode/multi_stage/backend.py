@@ -161,10 +161,14 @@ class IntermediateGraphState:
             self._depth = 0
 
 
-def init_secondary_graphs(drafter, mode, device):
+def init_secondary_graphs(drafter, mode, device, update_stream=None):
     """Initialize after set_attn, inside the intermediate graph-state scope."""
     enabled = mode != CUDAGraphMode.NONE
-    drafter.update_stream = torch.npu.Stream(device=device) if enabled else None
+    # All three models execute sequentially. Reuse the runner's dedicated
+    # attention-update stream while keeping it separate from graph replay.
+    if enabled and update_stream is None:
+        update_stream = torch.npu.Stream(device=device)
+    drafter.update_stream = update_stream if enabled else None
     # Let upstream DFlash resolve the selected mode, including FULL_DECODE_ONLY.
     drafter.init_cudagraph_manager(mode)
 
@@ -180,6 +184,7 @@ class IntermediateBackend:
         self.config = config
         self.device = device
         self.parent_config = parent_config
+        self.update_stream = None
         self.graph_enabled = (
             not parent_config.model_config.enforce_eager
             and parent_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
@@ -468,7 +473,7 @@ class IntermediateBackend:
         self.drafter.set_attn(
             self.model_state, self.kv_cache_config, self.block_tables, self.input_buffers, self.attn_groups
         )
-        init_secondary_graphs(self.drafter, cfg.compilation_config.cudagraph_mode, self.device)
+        init_secondary_graphs(self.drafter, cfg.compilation_config.cudagraph_mode, self.device, self.update_stream)
         self.kv_caches = []
         init_kv_cache(
             self.kv_caches,

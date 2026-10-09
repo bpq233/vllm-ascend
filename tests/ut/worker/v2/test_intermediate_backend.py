@@ -71,6 +71,7 @@ def backend():
     obj.cache = cache_cls(2)
     obj.graph_state = NS(context=nullcontext)
     obj.cudagraph_manager = None
+    obj.update_stream = None
     obj.graph_replays = 0
     obj.forward_tokens = obj.reused_tokens = 0
     obj.executed_tokens = 0
@@ -196,7 +197,7 @@ def test_adapter_replaces_only_candidate_buffer_and_publishes_real_lengths():
     batch = NS(num_reqs=2, idx_mapping=torch.tensor([0, 1]), idx_mapping_np=np.array([0, 1]), req_ids=["a", "b"])
     result = obj.propose(batch)
     assert result.tolist() == [[7, 11, 12, 0, 0], [0, 0, 0, 0, 0]]
-    assert obj.pipeline.refine.call_args.args == ([[1, 2, 3, 4], [5, 6]], [[7, 8], [9, 10]], [5, 0])
+    assert obj.pipeline.refine.call_args.args == ([[1, 2, 3, 4], [5, 6]], [[7, 8], [9, 10]], [11, 0])
     assert obj.pipeline.refine.call_args.kwargs == {"req_ids": ["a", "b"]}
     assert obj.get_draft_tokens() == (["a", "b"], [[7, 11, 12], []])
     assert torch.equal(history, original_history)

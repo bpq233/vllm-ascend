@@ -83,7 +83,7 @@ def test_device_verifier_uploads_only_prefix_and_delays_cache_commit(backend):
     assert metadata.call_args.kwargs["seq_lens"].untyped_storage().nbytes() == 144
 
 
-def test_device_microbatches_preserve_reused_decision_output(backend, modules):
+def test_device_microbatches_preserve_reused_decision_output(backend, modules, monkeypatch):
     obj, _, _ = backend
     config, Pipeline = modules
 
@@ -98,11 +98,21 @@ def test_device_microbatches_preserve_reused_decision_output(backend, modules):
             return self.output
 
     obj.decision_runner = Decision()
+    clones = []
+    original_clone = torch.Tensor.clone
+
+    def clone(tensor, *args, **kwargs):
+        if tensor.data_ptr() == obj.decision_runner.output.data_ptr():
+            clones.append(tensor.shape)
+        return original_clone(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "clone", clone)
     pipe = Pipeline(obj, config.IntermediateConfig("v", "d", num_rounds=1, verification={"method": "all"}), 3)
     prefixes = [list(range(1, 8)), list(range(11, 16))]
     result = pipe.refine(prefixes, [torch.tensor([8]), torch.tensor([16])], [3, 3], ["a", "b"])
     assert obj.model.call_count == 2  # 14 tokens exceed the 12-token microbatch budget.
     assert result == [[8, 9], [16, 17]]
+    assert len(clones) == 1  # Keep the first output; consume the last in place.
     assert obj.cache.tokens == [list(range(1, 9)), list(range(11, 17))]
 
 

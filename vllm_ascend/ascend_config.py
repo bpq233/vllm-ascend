@@ -1243,6 +1243,9 @@ def init_ascend_config(vllm_config):
         from vllm_ascend.worker.v2.spec_decode.multi_stage.config import validate_multi_stage
 
         validate_multi_stage(vllm_config, new_config.multi_stage_speculative)
+        # Pydantic may copy the options dict. Publish the resolved primary
+        # width alongside the derived speculative capacity for worker reuse.
+        additional_config["multi_stage_speculative"] = new_config.multi_stage_speculative
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)
     new_config.xlite_graph_config._validate_preconditions(vllm_config)

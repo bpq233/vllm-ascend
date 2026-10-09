@@ -50,7 +50,7 @@ CPU 回归覆盖普通/多级/无投机分支、空批次、请求重排、新�
 VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /models/Qwen-8B \
   --no-async-scheduling \
   --max-model-len 4096 \
-  --speculative-config '{"method":"dflash","model":"/models/DFlash-8B","num_speculative_tokens":20}' \
+  --speculative-config '{"method":"dflash","model":"/models/DFlash-8B","num_speculative_tokens":4}' \
   --additional-config '{
     "multi_stage_speculative": {
       "primary_num_speculative_tokens": 4,
@@ -58,6 +58,7 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /models/Qwen-8B \
         "verifier": {"model": "/models/Qwen-4B"},
         "drafter": {"model": "/models/DFlash-4B"},
         "num_rounds": 4,
+        "max_generated_tokens": 12,
         "num_speculative_tokens": 4,
         "max_num_seqs": 4,
         "max_model_len": 4096,
@@ -71,14 +72,19 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /models/Qwen-8B \
 将示例路径替换为兼容的实际模型。中间 verifier 与 Target 必须具有相同词表和 token ID，中间 DFlash 必须与中间 verifier 匹配。
 
 - `primary_num_speculative_tokens`：原 DFlash 的单轮生成长度。省略时，最终容量 ≤15 则沿用最终容量，最终容量 >15 则默认 4。显式设置超过 15 不会被自动截断，会提示具体字段和值。
-- 原 `speculative_config.num_speculative_tokens`：最终候选容量，供原 scheduler、Target KV 和缓冲区预分配使用。中间候选最多占用这一容量，实际长度单独返回 scheduler。
-- `intermediate.num_rounds`：中间校验次数。3 表示“校验原 draft → 中间 draft → 校验 → 中间 draft → 校验”，不会把最后一批未经中间校验的 draft 追加进候选。
+- 原 `speculative_config.num_speculative_tokens`：启用中间流水线后不再作为候选截断上限。初始化根据轮数、停止阈值和单轮 draft 宽度推导容量，并写回该字段，供 scheduler、Target KV 和采样缓冲区预分配；实际候选长度单独返回 scheduler。建议显式设置 `primary_num_speculative_tokens`，避免将旧的最终容量误当作 Primary 单轮宽度。未启用中间流水线时保持原语义。
+- `intermediate.num_rounds`：中间校验次数上限 `n`。3 表示“校验原 draft → 中间 draft → 校验 → 中间 draft → 校验”，不会把最后一批未经中间校验的 draft 追加进候选。
+- `intermediate.max_generated_tokens`：可选的非负整数阈值 `m`。每个请求完成一轮校验后，如果累计候选数 **严格大于** `m`，立即停止该请求的中间扩展；达到 `n` 轮也停止。计数包含通过中间校验的 Primary/Secondary token，以及中间模型生成的修正/bonus token，不包含已提交上下文。等于 `m` 时仍可继续，超过时保留该轮全部结果，不按 `m` 截断。省略该字段只按轮数停止，`0` 表示第一轮完成后停止。
 - `intermediate.num_speculative_tokens`：每次中间 DFlash 的生成长度。
 - `intermediate.max_num_seqs`：中间模型每个小批次的请求数，默认 4；同时受 token 预算限制。
 - `intermediate.cache_max_num_seqs`：中间 KV 可同时驻留的请求数，必须不小于 `max_num_seqs`；省略时沿用 `max_num_seqs`。例如计算 batch 为 4、希望保留 12 个活跃请求的 KV，可设置为 12。该值只扩大 KV 页、缓存页表和按请求保存的短 hidden，不扩大计算 batch、图输入和捕获桶。当前每个槽位仍按 `max_model_len` 预分配独立 KV，增大前需要核算设备内存。
 - `intermediate.max_model_len`：独立 KV 的上下文容量，默认继承 Target；超过该容量的请求直接回到 Target 解码。
 
-每轮保留连续接受前缀，并追加中间 verifier 的 greedy 修正或 bonus token。完全接受时，最大候选长度为 `primary_length + (num_rounds - 1) * secondary_length + num_rounds`；示例为 20。容量更小时会截断，遇到 EOS 或请求长度上限也会停止扩展。
+每轮保留连续接受前缀，并追加中间 verifier 的 greedy 修正或 bonus token。完全接受且不设置阈值时，最大候选长度为 `primary_length + (num_rounds - 1) * secondary_length + num_rounds`。`n > 1` 且设置阈值时，预分配容量为该值与 `max(primary_length + 1, m + secondary_length + 1)` 的较小者，覆盖任意接受率下最后一轮越过阈值的结果。单轮只预留 `primary_length + 1`。这只是存储边界，不是独立的候选截断条件；EOS、模型上下文和请求输出长度限制仍有效。
+
+上面的示例在全接受时依次产生 5、10、15 个累计候选，第三轮超过 12，便把完整的 15 个 token 交给 Target，不再执行第四轮。预分配容量为 17，以覆盖部分接受导致的不同停止位置。长候选继续使用下述 cached-prefill 验证路径；`max_num_batched_tokens` 必须至少覆盖自动推导容量加一个 context token，否则启动时报错。
+
+容量推导先于 upstream scheduler 和图尺寸默认值初始化，避免默认图范围仍使用旧的短 draft 宽度而使长验证回退 eager；用户显式图桶仍按原配置保留。停止判断复用已有 CPU 接受结果，没有为检查阈值增加设备标量读取或 D2H。
 
 ## 长候选 Target 验证
 
@@ -150,6 +156,12 @@ Secondary 候选通过独立设备 tensor 保存，避免下一次 DFlash 图重
 稀疏图的冷前缀预热仍只在 padding 超过实际 query 的 8 倍时触发，使用已有较小图桶。多个请求的前缀块现在共同占用该桶的 token 预算，并受计算 batch 大小约束；不会为此新增捕获桶。预热不含最终 predictor 行，正式预测继续合批。CPU 回归中的两个短前缀用例由 3 次执行降为 2 次，含 padding 的 token 由 24 降为 16；该数字是该用例的调度工作量，不是硬件耗时或通用加速比。
 
 ## 调试与性能
+
+本次代码优化消除了两类冗余流：多级流水线已在组合 D2H 中发布进度，runner 不再为它创建闲置的进度拷贝 stream/event/pinned buffer；中间 verifier 和 Secondary 与 Target/Primary 顺序执行，复用 runner 已有的专用 attention 更新流，同时保留各模型独立的图参数。正常 FULL 多级配置因此少创建两条显式 NPU 流。attention 更新流仍与计算流分离，不能直接合并到默认流。decision capture 流及图内部通信流保留，减少图桶的收益需结合真实 padding 和重放命中率评估。
+
+决策结果只在后续微批次会覆盖它时复制；最后一个微批次直接消费图输出。通常单微批次每轮省去一次 decision clone，多微批次保留前面结果的独立存储。关闭 DEBUG 时跳过接受数列表分配。CPU 回归验证了流分配条件、结果覆盖安全和自动容量边界；这些是代码工作量变化，不是 NPU 加速比。
+
+尚需真机评估的主要开销：每组每轮一次决策 D2H 与 CPU 轮次控制；稀疏图桶造成的 padding；请求数超过驻留 KV 槽位时的淘汰；最终候选长度与 Target 验证成本的权衡。当前没有本次运行的 NPU trace 或基准结果，KG 健康检查也超时，因此本次 NPU 性能收益为 **[未核实]**。应使用相同模型、prompt、采样参数、并发度与输出长度，对照测量 TPOT、吞吐、峰值内存、图命中率和 stream 数，不能仅以流更少判断更快。
 
 初始化记录三套 draft/intermediate 模型信息及轮数、策略。设置现有 `VLLM_LOGGING_LEVEL=DEBUG` 后记录：
 

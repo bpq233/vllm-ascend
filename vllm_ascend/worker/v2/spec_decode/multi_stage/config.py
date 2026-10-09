@@ -47,6 +47,9 @@ class IntermediateConfig:
     # Resident KV slots can exceed the compute microbatch without enlarging
     # graph inputs. None preserves the existing KV memory allocation.
     cache_max_num_seqs: int | None = None
+    # Stop after a completed verification round produces MORE than this many
+    # candidates, including correction/bonus tokens. Never truncate that round.
+    max_generated_tokens: int | None = None
 
     @classmethod
     def from_dict(cls, values):
@@ -61,10 +64,13 @@ class IntermediateConfig:
             not isinstance(sizes, list) or not sizes or any(type(size) is not int or size <= 0 for size in sizes)
         ):
             raise ValueError("intermediate.cudagraph_capture_sizes must be a nonempty list of positive integers.")
-        for name in ("num_rounds", "num_speculative_tokens", "max_num_seqs", "cache_max_num_seqs", "max_model_len"):
+        for name in (
+            "num_rounds", "num_speculative_tokens", "max_num_seqs", "cache_max_num_seqs",
+            "max_model_len", "max_generated_tokens",
+        ):
             value = getattr(result, name)
-            minimum = 0 if name == "num_rounds" else 1
-            if value is None and name in ("max_model_len", "cache_max_num_seqs"):
+            minimum = 0 if name in ("num_rounds", "max_generated_tokens") else 1
+            if value is None and name in ("max_model_len", "cache_max_num_seqs", "max_generated_tokens"):
                 continue
             if type(value) is not int or value < minimum:
                 raise ValueError(f"intermediate.{name} must be an integer >= {minimum}.")
@@ -73,8 +79,49 @@ class IntermediateConfig:
         return result
 
 
+def candidate_capacity(primary_width, intermediate):
+    """Storage bound, including a full round's overshoot of the stop threshold."""
+    if intermediate.num_rounds == 0:
+        return primary_width
+    first_round = primary_width + 1
+    capacity = first_round + (intermediate.num_rounds - 1) * (intermediate.num_speculative_tokens + 1)
+    if intermediate.max_generated_tokens is not None and intermediate.num_rounds > 1:
+        capacity = min(capacity, max(first_round, intermediate.max_generated_tokens + intermediate.num_speculative_tokens + 1))
+    return capacity
+
+
+def _validate_draft_widths(width, intermediate):
+    if type(width) is not int or width < 1:
+        raise ValueError("primary_num_speculative_tokens must be a positive integer.")
+    if width > MAX_DFLASH_DRAFT_TOKENS or intermediate.num_speculative_tokens > MAX_DFLASH_DRAFT_TOKENS:
+        raise ValueError(
+            f"DFlash per-round widths must be <= 15: primary_num_speculative_tokens={width}, "
+            f"intermediate.num_speculative_tokens={intermediate.num_speculative_tokens}. "
+            "Increase intermediate.num_rounds to accumulate long candidates."
+        )
+
+
+def prepare_multi_stage_config(vllm_config):
+    """Resolve capacity before upstream derives scheduler and graph defaults.
+
+    Full validation happens later, after upstream has resolved execution modes.
+    This early step deliberately depends only on the explicit draft options.
+    """
+    config = (vllm_config.additional_config or {}).get("multi_stage_speculative", {})
+    spec = vllm_config.speculative_config
+    if spec is None or "intermediate" not in config:
+        return
+    intermediate = IntermediateConfig.from_dict(config["intermediate"])
+    if intermediate.num_rounds == 0:
+        return
+    width = primary_draft_width(config, spec.num_speculative_tokens)
+    _validate_draft_widths(width, intermediate)
+    config["primary_num_speculative_tokens"] = width
+    spec.num_speculative_tokens = candidate_capacity(width, intermediate)
+
+
 def validate_multi_stage(vllm_config, config):
-    """Validate before loading weights; the upstream width is the final budget."""
+    """Validate and derive storage before scheduler, KV and graph initialization."""
     if not config:
         return
     if set(config) - {"primary_num_speculative_tokens", "intermediate", "final_verification"}:
@@ -98,22 +145,17 @@ def validate_multi_stage(vllm_config, config):
     intermediate = IntermediateConfig.from_dict(config["intermediate"])
     AcceptancePolicy(**intermediate.verification)
     width = primary_draft_width(config, spec.num_speculative_tokens)
-    if type(width) is not int or not 0 < width <= spec.num_speculative_tokens:
-        raise ValueError("primary_num_speculative_tokens must be within the final speculative budget.")
-    if long_candidates:
-        if width > MAX_DFLASH_DRAFT_TOKENS or intermediate.num_speculative_tokens > MAX_DFLASH_DRAFT_TOKENS:
-            raise ValueError(
-                f"DFlash per-round widths must be <= 15: primary_num_speculative_tokens={width}, "
-                f"intermediate.num_speculative_tokens={intermediate.num_speculative_tokens}; "
-                f"final speculative_config.num_speculative_tokens={spec.num_speculative_tokens} is allowed. "
-                "Set both draft widths to 4 and increase intermediate.num_rounds to accumulate long candidates."
-            )
+    _validate_draft_widths(width, intermediate)
+    capacity = candidate_capacity(width, intermediate)
+    if capacity > MAX_DFLASH_DRAFT_TOKENS:
         if getattr(vllm_config.model_config, "use_mla", False) or getattr(vllm_config.model_config, "is_hybrid", False):
             raise ValueError("Long candidate verification currently requires a full-attention target.")
         if vllm_config.cache_config.cache_dtype not in ("auto", "float16", "bfloat16"):
             raise ValueError("Long candidate verification requires unquantized target KV cache.")
-        if vllm_config.scheduler_config.max_num_batched_tokens < spec.num_speculative_tokens + 1:
-            raise ValueError("max_num_batched_tokens must fit the final candidate budget plus its context token.")
+    if vllm_config.scheduler_config.max_num_batched_tokens < capacity + 1:
+        raise ValueError(
+            f"max_num_batched_tokens must fit the derived candidate capacity plus its context token ({capacity + 1})."
+        )
     if intermediate.num_rounds == 0:
         if width != spec.num_speculative_tokens:
             raise ValueError("With zero intermediate rounds, primary and final widths must match.")
@@ -139,3 +181,9 @@ def validate_multi_stage(vllm_config, config):
         raise ValueError("Intermediate decoding currently supports text-only models without LoRA.")
     if getattr(spec, "enable_adaptive_verification", False):
         raise ValueError("Intermediate decoding cannot reuse primary adaptive-verification confidences.")
+    if getattr(spec, "num_speculative_tokens_per_batch_size", None):
+        raise ValueError("Intermediate decoding derives its own capacity; per-batch speculative limits are unsupported.")
+    # Preserve the original primary width before replacing upstream's capacity.
+    # This must be idempotent when the config is initialized again in workers.
+    config["primary_num_speculative_tokens"] = width
+    spec.num_speculative_tokens = capacity
