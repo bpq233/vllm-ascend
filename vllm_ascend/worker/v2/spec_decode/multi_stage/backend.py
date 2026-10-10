@@ -29,7 +29,7 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_metadata, get_kv_cache_s
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_states import init_asecnd_model_state
 from vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance import AcceptancePolicy, IntermediateDecisionRunner
-from vllm_ascend.worker.v2.spec_decode.multi_stage.config import intermediate_capture_sizes, primary_draft_width
+from vllm_ascend.worker.v2.spec_decode.multi_stage.config import initial_draft_width, intermediate_capture_sizes
 from vllm_ascend.worker.v2.spec_decode.multi_stage.drafter import IntermediateDFlashSpeculator
 
 logger = logging.getLogger(__name__)
@@ -210,7 +210,7 @@ class IntermediateBackend:
         self.decode_query_len = (
             max(
                 config.num_speculative_tokens,
-                primary_draft_width(options, parent_config.speculative_config.num_speculative_tokens),
+                initial_draft_width(options, parent_config.speculative_config.num_speculative_tokens),
             )
             + 1
         )
@@ -315,7 +315,7 @@ class IntermediateBackend:
         if self.graph_enabled:
             # Every bucket captures pieces in every verifier layer and holds
             # runtime/TP stream resources. Dense 1..32 gears are too costly
-            # with four resident models; use sparse padding-compatible gears.
+            # with multiple resident models; use sparse padding-compatible gears.
             cfg.compilation_config.cudagraph_capture_sizes = intermediate_capture_sizes(
                 self.max_num_tokens,
                 self.max_num_reqs,
@@ -330,7 +330,7 @@ class IntermediateBackend:
                 AcceptancePolicy(**self.config.verification),
                 max(
                     self.config.num_speculative_tokens,
-                    primary_draft_width(
+                    initial_draft_width(
                         self.parent_config.additional_config["multi_stage_speculative"],
                         self.parent_config.speculative_config.num_speculative_tokens,
                     ),
@@ -964,7 +964,7 @@ class IntermediateBackend:
         self.propose(rows)
         width = max(
             self.config.num_speculative_tokens,
-            primary_draft_width(
+            initial_draft_width(
                 self.parent_config.additional_config["multi_stage_speculative"],
                 self.parent_config.speculative_config.num_speculative_tokens,
             ),

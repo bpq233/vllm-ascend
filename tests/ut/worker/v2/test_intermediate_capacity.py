@@ -37,7 +37,7 @@ def test_capacity_configuration_preserves_compute_size(backend, modules, capacit
         IntermediateKVCache=type(obj.cache),
         CompilationConfig=NS,
         CompilationMode=NS(NONE=0),
-        primary_draft_width=config.primary_draft_width,
+        initial_draft_width=config.initial_draft_width,
     )
     parent = NS(
         model_config=NS(enforce_eager=True, max_model_len=8),

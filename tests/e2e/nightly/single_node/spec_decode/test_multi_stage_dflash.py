@@ -52,6 +52,9 @@ def _candidate_probe(worker, install=False):
         "context_kv_tokens": worker._context_kv_tokens,
         "verifier_tokens": pipeline.backend.forward_tokens - worker._initial_verifier_tokens,
         "secondary_precomputed_calls": worker._secondary_precomputed_calls,
+        "uses_primary_drafter": runner.speculator.uses_primary_drafter,
+        "target_aux_hidden_states": runner.use_aux_hidden_state_outputs,
+        "target_draft_model_present": runner.get_draft_model() is not None,
     }
 
 
@@ -202,10 +205,11 @@ def _target_graph_probe(worker, install=False):
                 return desc
 
             verifier_manager.dispatch = record_dispatch
-        for label, draft_manager in (
-            ("primary", worker.model_runner.speculator.query_cudagraph_manager),
-            ("secondary", backend.drafter.query_cudagraph_manager),
-        ):
+        worker._primary_graph_calls = 0
+        draft_managers = [("secondary", backend.drafter.query_cudagraph_manager)]
+        if worker.model_runner.speculator.uses_primary_drafter:
+            draft_managers.insert(0, ("primary", worker.model_runner.speculator.query_cudagraph_manager))
+        for label, draft_manager in draft_managers:
             setattr(worker, f"_{label}_graph_calls", 0)
             original_draft = draft_manager.run_fullgraph
 
@@ -215,6 +219,9 @@ def _target_graph_probe(worker, install=False):
                 return _original(*args, **kwargs)
 
             draft_manager.run_fullgraph = record_draft
+    graph_managers = [manager, backend.cudagraph_manager, backend.drafter.query_cudagraph_manager]
+    if worker.model_runner.speculator.uses_primary_drafter:
+        graph_managers.append(worker.model_runner.speculator.query_cudagraph_manager)
     return {
         "piecewise_sizes": [desc.num_tokens for desc in manager._capture_descs.get(CUDAGraphMode.PIECEWISE, [])],
         "full_sizes": [desc.num_tokens for desc in manager._capture_descs.get(CUDAGraphMode.FULL, [])],
@@ -235,12 +242,7 @@ def _target_graph_probe(worker, install=False):
         "long_target_dispatches": worker._long_target_dispatches.copy(),
         "non_full_capture_count": sum(
             len(descs)
-            for graph_manager in (
-                manager,
-                backend.cudagraph_manager,
-                worker.model_runner.speculator.query_cudagraph_manager,
-                backend.drafter.query_cudagraph_manager,
-            )
+            for graph_manager in graph_managers
             for mode, descs in graph_manager._capture_descs.items()
             if mode != CUDAGraphMode.FULL
         ),
@@ -286,11 +288,12 @@ def test_long_cached_prefill_attention_matches_causal_reference():
 
 
 @pytest.mark.parametrize("method", ["topk", "all", "prob_ratio"])
+@pytest.mark.parametrize("use_primary_drafter", [False, True])
 @pytest.mark.parametrize(
     "long_candidates,graph_mode",
     [(False, None), (False, "FULL"), (True, None), (True, "FULL"), (True, "FULL_DECODE_ONLY")],
 )
-def test_multi_stage_dflash(method, long_candidates, graph_mode, monkeypatch):
+def test_multi_stage_dflash(method, use_primary_drafter, long_candidates, graph_mode, monkeypatch):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     models = DFLASH["dflash"]
     prompts = ["The capital of France is", "List three prime numbers:", "Count from one to ten:", "A triangle has"]
@@ -308,7 +311,7 @@ def test_multi_stage_dflash(method, long_candidates, graph_mode, monkeypatch):
         with VllmRunner(models["main"], **common) as runner:
             reference = [out.outputs[0].token_ids for out in runner.model.generate(prompts, params)]
     options = {
-        "primary_num_speculative_tokens": 4 if long_candidates else 2,
+        "use_primary_drafter": use_primary_drafter,
         "intermediate": {
             "verifier": {"model": models["main"]},
             "drafter": {"model": models["spec"]},
@@ -325,6 +328,8 @@ def test_multi_stage_dflash(method, long_candidates, graph_mode, monkeypatch):
         if method == "prob_ratio"
         else {"method": method, "top_k": 1},
     }
+    if use_primary_drafter:
+        options["primary_num_speculative_tokens"] = 4 if long_candidates else 2
     with VllmRunner(
         models["main"],
         **{**common, "enforce_eager": graph_mode is None},
@@ -344,6 +349,9 @@ def test_multi_stage_dflash(method, long_candidates, graph_mode, monkeypatch):
         initial = runner.model.llm_engine.collective_rpc(_candidate_probe, kwargs={"install": True})
         assert all(row["capacity"] == (23 if long_candidates else 6) for row in initial)
         assert all(row["unused_progress_stream"] and row["shared_update_stream"] for row in initial)
+        assert all(row["uses_primary_drafter"] == use_primary_drafter for row in initial)
+        assert all(row["target_aux_hidden_states"] == use_primary_drafter for row in initial)
+        assert all(row["target_draft_model_present"] == use_primary_drafter for row in initial)
         if graph_mode:
             before = runner.model.llm_engine.collective_rpc(_target_graph_probe, kwargs={"install": True})
             assert all(
@@ -374,7 +382,9 @@ def test_multi_stage_dflash(method, long_candidates, graph_mode, monkeypatch):
         if graph_mode:
             after = runner.model.llm_engine.collective_rpc(_target_graph_probe)
             assert all(row["calls"] > 0 for row in after)
-            assert all(row["primary_calls"] > 0 and row["secondary_calls"] > 0 for row in after)
+            assert all(
+                (row["primary_calls"] > 0) == use_primary_drafter and row["secondary_calls"] > 0 for row in after
+            )
             assert all(end["intermediate_calls"] > begin["intermediate_calls"] for begin, end in zip(before, after))
             assert all(end["reused_tokens"] > begin["reused_tokens"] for begin, end in zip(before, after))
             assert all(end["reused_hidden_tokens"] > begin["reused_hidden_tokens"] for begin, end in zip(before, after))

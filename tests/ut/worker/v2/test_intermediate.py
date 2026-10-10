@@ -272,6 +272,7 @@ def vllm_config():
 
 def settings(**intermediate):
     return {
+        "use_primary_drafter": True,
         "intermediate": {"verifier": {"model": "v"}, "drafter": {"model": "d"}, **intermediate},
         "final_verification": {"method": "all"},
     }

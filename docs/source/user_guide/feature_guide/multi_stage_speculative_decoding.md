@@ -1,12 +1,16 @@
 # MRV2 多级投机解码
 
-原 DFlash 先生成 token，中间 verifier 校验这些 token，再由中间 DFlash 继续生成；最终候选通过原 MRV2 draft 缓冲区交给 Target。原 DFlash 实现和 Target 的提交、拒绝回退流程保持不变。
+默认使用三个模型：**DFlash-4B → Qwen-4B 校验/扩展 → Target**。不加载 Target 配套的 DFlash-8B；第一轮和后续轮次共用同一个中间 DFlash 实例。最终候选通过原 MRV2 draft 缓冲区交给 Target，复用原提交和拒绝回退流程。
 
-实现统一放在 `vllm_ascend/worker/v2/spec_decode/multi_stage/`：`adapter.py` 接入原 DFlash，`config.py` 管理配置，`pipeline.py` 控制迭代，`backend.py` 包含中间模型、KV/hidden 缓存及图状态，`acceptance.py` 与 `final_verification.py` 管理接受策略和最终验证。包入口保持轻量，配置校验时不会提前加载模型模块。原来的独立 cache/graph 辅助文件已合并，不保留重复实现；部署更新需要同步新目录和引用路径修改。
+首次投机前需要 Qwen-4B 计算已提交上下文的隐藏状态并填充独立 context KV；后续按有效前缀增量复用。DFlash-4B 使用 Qwen-4B 的辅助隐藏层、embedding/lm_head 和独立 KV，不使用 Target 的 8B 隐藏状态或 KV。Target 不再为 Primary DFlash 输出辅助隐藏层，也不捕获 Primary 图。
+
+设置 `use_primary_drafter=true` 可启用旧四模型链路：Target 配套 Primary DFlash → 中间 verifier → 中间 DFlash 继续生成 → Target。只有这个模式需要配置 Target 配套的 DFlash。
+
+实现统一放在 `vllm_ascend/worker/v2/spec_decode/multi_stage/`：`intermediate_speculator.py` 接入默认三模型链路，`adapter.py` 提供历史/发布逻辑及可选 Primary 路径，`config.py` 管理配置，`pipeline.py` 控制迭代，`backend.py` 包含中间模型、KV/hidden 缓存及图状态，`acceptance.py` 与 `final_verification.py` 管理接受策略和最终验证。包入口保持轻量，配置校验时不会提前加载模型模块。部署更新需要同步新目录和引用路径修改。
 
 ## 热路径审计与传输边界
 
-调用链为：CPU scheduler 生成请求和候选长度 → Target 图执行及设备端采样/提交 → Primary DFlash 图生成候选 → `adapter._read_step` 回传有界历史增量 → `pipeline.refine` 驱动中间轮次 → `backend.verify_batches` 增量 KV 验证 → `_decide` 设备端验收并回传决策 → Secondary DFlash 图生成下一轮候选 → adapter 发布 CPU 候选并写入设备 draft buffer → 下一步 Target 验证。中间 KV 按请求隔离、核对前缀并截断分歧后缀；它不提交正式 Target 状态。
+默认调用链为：CPU scheduler → Target 采样/提交 → `_read_step` 回传有界历史与进度 → 按驻留请求分组 → 中间 DFlash 生成初始候选 → 中间 verifier 验证 → 设备端验收并回传决策 → 中间 DFlash 继续生成/验证 → 发布候选 → 下一步 Target 验证。初始提案也在各驻留组内部执行，避免提案后、验证前发生 KV 淘汰。中间 KV 不提交正式 Target 状态。旧模式在 `_read_step` 前额外执行 Primary DFlash。
 
 | 优先级 | 位置及频率 | 成本与处理 |
 |---|---|---|
@@ -38,7 +42,7 @@ CPU stand-in 单次 warm `_forward` 的同输入算子追踪：`aten::to` 6→3�
 
 多级 adapter 的同步 `_read_step` 同时回传 `num_computed_tokens`，按 request index 发布至 runner 的 CPU 状态。`updates_computed_tokens_cpu` 仅由该 adapter 声明，runner 因此不再另行回传整个进度缓冲区，也不等待对应的独立 event。普通 DFlash 保留原异步进度回传和等待，无投机路径继续使用 scheduler 元数据。仅更新实际请求行，保持新请求、未调度槽位和请求重排的语义；不能把这一约定直接移植到异步调度器。
 
-中间最后一轮 `retain_hidden=False`，删除无后续 Secondary 消费者的预测 hidden clone，并清除旧引用；KV 写入仍执行，下一次 Target 接受/拒绝后继续校验前缀并增量复用。稀疏图的前缀预热同样不保存无用 hidden。其余轮次仍保留独立 hidden 存储，防止图输出被覆盖。
+三模型模式保留最后一轮的预测 hidden，供下一次 Target 周期的首次 DFlash 提案复用；只有 token 前缀完全匹配时才复用。旧四模型模式最后一轮 `retain_hidden=False`，删除无后续 Secondary 消费者的预测 hidden clone，并清除旧引用。两种模式都保留 KV，下一次 Target 接受/拒绝后继续校验前缀并增量复用。稀疏图的前缀预热不保存无用 hidden。保存的 hidden 使用独立存储，防止图输出被覆盖。
 
 CPU 回归覆盖普通/多级/无投机分支、空批次、请求重排、新请求/未调度槽位、最后一轮后 Target 拒绝及下一周期 KV 复用。NPU DMA 时长和完整周期吞吐尚需真机验证。
 
@@ -50,10 +54,10 @@ CPU 回归覆盖普通/多级/无投机分支、空批次、请求重排、新�
 VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /models/Qwen-8B \
   --no-async-scheduling \
   --max-model-len 4096 \
-  --speculative-config '{"method":"dflash","model":"/models/DFlash-8B","num_speculative_tokens":4}' \
+  --speculative-config '{"method":"dflash","model":"/models/DFlash-4B","num_speculative_tokens":4}' \
   --additional-config '{
     "multi_stage_speculative": {
-      "primary_num_speculative_tokens": 4,
+      "use_primary_drafter": false,
       "intermediate": {
         "verifier": {"model": "/models/Qwen-4B"},
         "drafter": {"model": "/models/DFlash-4B"},
@@ -69,18 +73,19 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /models/Qwen-8B \
   }'
 ```
 
-将示例路径替换为兼容的实际模型。中间 verifier 与 Target 必须具有相同词表和 token ID，中间 DFlash 必须与中间 verifier 匹配。
+将示例路径替换为兼容的实际模型。中间 verifier 与 Target 必须具有相同词表和 token ID，中间 DFlash 必须与中间 verifier 匹配。默认模式下外层 `speculative_config.model` 也指向 DFlash-4B，只用于上游投机配置元数据；实际权重仅由中间后端加载一次，不与 Target 绑定。
 
-- `primary_num_speculative_tokens`：原 DFlash 的单轮生成长度。省略时，最终容量 ≤15 则沿用最终容量，最终容量 >15 则默认 4。显式设置超过 15 不会被自动截断，会提示具体字段和值。
-- 原 `speculative_config.num_speculative_tokens`：启用中间流水线后不再作为候选截断上限。初始化根据轮数、停止阈值和单轮 draft 宽度推导容量，并写回该字段，供 scheduler、Target KV 和采样缓冲区预分配；实际候选长度单独返回 scheduler。建议显式设置 `primary_num_speculative_tokens`，避免将旧的最终容量误当作 Primary 单轮宽度。未启用中间流水线时保持原语义。
-- `intermediate.num_rounds`：中间校验次数上限 `n`。3 表示“校验原 draft → 中间 draft → 校验 → 中间 draft → 校验”，不会把最后一批未经中间校验的 draft 追加进候选。
+- `use_primary_drafter`：默认 `false`，只加载中间 verifier 与配套 DFlash。`true` 使用旧四模型链路，此时外层 `speculative_config.model` 应指向与 Target 匹配的 Primary DFlash。
+- `primary_num_speculative_tokens`：仅 `use_primary_drafter=true` 时有效，指定原 DFlash 的单轮生成长度，最大 15；默认模式设置此字段会启动报错。
+- `speculative_config.num_speculative_tokens`：启用中间流水线后由轮数、阈值和初始 draft 宽度推导并写回，供 scheduler、Target KV 和采样缓冲区预分配；实际候选长度单独返回 scheduler。默认模式初始宽度等于 `intermediate.num_speculative_tokens`，不从外层字段推导初始 DFlash 宽度。
+- `intermediate.num_rounds`：中间校验次数上限 `n`。默认模式 3 表示“三次中间 DFlash 提案 → 4B 校验”，不会提交未经 4B 校验的尾部草稿。旧模式第一轮校验 Primary 草稿，后两轮才执行中间 DFlash。
 - `intermediate.max_generated_tokens`：可选的非负整数阈值 `m`。每个请求完成一轮校验后，如果累计候选数 **严格大于** `m`，立即停止该请求的中间扩展；达到 `n` 轮也停止。计数包含通过中间校验的 Primary/Secondary token，以及中间模型生成的修正/bonus token，不包含已提交上下文。等于 `m` 时仍可继续，超过时保留该轮全部结果，不按 `m` 截断。省略该字段只按轮数停止，`0` 表示第一轮完成后停止。
 - `intermediate.num_speculative_tokens`：每次中间 DFlash 的生成长度。
 - `intermediate.max_num_seqs`：中间模型每个小批次的请求数，默认 4；同时受 token 预算限制。
 - `intermediate.cache_max_num_seqs`：中间 KV 可同时驻留的请求数，必须不小于 `max_num_seqs`；省略时沿用 `max_num_seqs`。例如计算 batch 为 4、希望保留 12 个活跃请求的 KV，可设置为 12。该值只扩大 KV 页、缓存页表和按请求保存的短 hidden，不扩大计算 batch、图输入和捕获桶。当前每个槽位仍按 `max_model_len` 预分配独立 KV，增大前需要核算设备内存。
 - `intermediate.max_model_len`：独立 KV 的上下文容量，默认继承 Target；超过该容量的请求直接回到 Target 解码。
 
-每轮保留连续接受前缀，并追加中间 verifier 的 greedy 修正或 bonus token。完全接受且不设置阈值时，最大候选长度为 `primary_length + (num_rounds - 1) * secondary_length + num_rounds`。`n > 1` 且设置阈值时，预分配容量为该值与 `max(primary_length + 1, m + secondary_length + 1)` 的较小者，覆盖任意接受率下最后一轮越过阈值的结果。单轮只预留 `primary_length + 1`。这只是存储边界，不是独立的候选截断条件；EOS、模型上下文和请求输出长度限制仍有效。
+每轮保留连续接受前缀，并追加中间 verifier 的 greedy 修正或 bonus token。默认模式不设置阈值时，容量为 `num_rounds * (intermediate.num_speculative_tokens + 1)`。旧模式为 `primary_length + (num_rounds - 1) * secondary_length + num_rounds`。`n > 1` 且设置阈值时，容量为上述值与 `max(initial_length + 1, m + secondary_length + 1)` 的较小者，覆盖最后一轮越过阈值的完整结果；默认模式 `initial_length=secondary_length`，单轮只预留 `initial_length+1`。EOS、模型上下文和请求输出长度限制仍有效。
 
 上面的示例在全接受时依次产生 5、10、15 个累计候选，第三轮超过 12，便把完整的 15 个 token 交给 Target，不再执行第四轮。预分配容量为 17，以覆盖部分接受导致的不同停止位置。长候选继续使用下述 cached-prefill 验证路径；`max_num_batched_tokens` 必须至少覆盖自动推导容量加一个 context token，否则启动时报错。
 
@@ -94,7 +99,7 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /models/Qwen-8B \
 
 cached-prefill 复用 `attention_v1` 的 paged FIA：Q 长度为累计 query 长度，KV 长度为各请求的有效总长度，`block_table` 指向已有前缀，右下因果遮罩使用 `sparse_mode=3`。同一 FIA 接口由实际 query 形状执行多 token prefill，未提高 Decode kernel 的上限，也不重新计算正式前缀。该路径限制为 full-attention Target 和未量化 Target KV；MLA、混合状态模型不在首版范围内。参数语义参见 [TorchNPU FIA 文档](https://www.hiascend.com/document/detail/en/Pytorch/2610/apiref/customapi/docs/en/custom_APIs/torch_npu/torch_npu-npu_fused_infer_attention_score.md)。
 
-图执行遵循 `enforce_eager` 和显式 Target 捕获桶配置，允许 eager 和 NONE。设置 `compilation_config={"cudagraph_mode": "FULL"}` 可捕获四个模型的 forward（包含 attention）。对于 `FULL_DECODE_ONLY`，独立 intermediate verifier 和长候选 Target 的 graph manager 使用 mixed FULL；两套 DFlash 仍使用原有图模式，`PIECEWISE` 和 `FULL_AND_PIECEWISE` 保持原配置。
+图执行遵循 `enforce_eager` 和显式 Target 捕获桶配置，允许 eager 和 NONE。设置 `compilation_config={"cudagraph_mode": "FULL"}` 可捕获默认三个模型的 forward（旧模式四个，均包含 attention）。对于 `FULL_DECODE_ONLY`，独立 intermediate verifier 和长候选 Target 的 graph manager 使用 mixed FULL；DFlash 仍使用原有图模式，`PIECEWISE` 和 `FULL_AND_PIECEWISE` 保持原配置。
 
 `fix[12]` 的漏图原因是固定 query 宽度与实际验证输入不匹配。例如 primary/secondary 宽度为 15、最终容量为 55 时，原 intermediate 图只接受每请求 16 个 query token，原 Target 图只接受每请求 56 个 query token。首轮补齐 KV 前缀、末轮截短以及 Top-k 接受数量不同都会改变 query 长度；即使总 token 数落在捕获范围内，也会分派到 NONE。mixed FULL 用总 token 桶覆盖这些变长输入，attention 仍走原有 FIA 参数更新和 causal cached-prefill 路径，未放宽 16-token Decode 分类边界。
 
@@ -125,7 +130,7 @@ additional_config["multi_stage_speculative"]["final_verification"] = {
 
 最终 Target 的修正/bonus 复用原 sampler，包括请求采样参数；Top-k 和概率比均使用 sampler 返回的、经过采样参数处理的 logits，因此温度、惩罚和采样过滤等可能影响接受结果。概率比使用等价的 `草稿 logit - 最大 logit > log(threshold)` 判定，避免整张词表 softmax 和概率下溢；它不使用 Drafter 概率。首次拒绝后截断，随后追加 Target 修正 token；全部接受则追加 Target bonus。中间修正/bonus 和中间 DFlash 使用 greedy。三种策略均属于近似策略，不保证严格投机解码的分布等价性。
 
-仅设置 `final_verification` 可以单独替换最终接受策略。完全移除 `multi_stage_speculative` 即恢复原流程。`num_rounds=0` 不加载中间模型，此时 primary 长度必须与原 speculative 长度一致。
+仅设置 `final_verification` 可以单独替换最终接受策略。完全移除 `multi_stage_speculative` 或设置 `num_rounds=0` 会恢复普通 Target+DFlash 流程，外层 model 必须换成与 Target 匹配的 DFlash；零轮时 primary 长度必须与原 speculative 长度一致。
 
 ## 状态与 KV
 
@@ -133,9 +138,9 @@ additional_config["multi_stage_speculative"]["final_verification"] = {
 
 原 Target 的 `postprocess_sampled` 提交结果后，适配层才读取请求历史并处理原 draft。适配层只替换返回的 draft tensor 和交给 scheduler 的候选列表；Target 最终拒绝时仍使用原计数和 KV 回退流程。
 
-支持文本、full-attention、未量化的中间 verifier，复用 TP；不支持中间流水线的 PP/DP/CP、LoRA、异步调度或 adaptive verification。显式选择 FULL 时，四个模型的正式 forward 使用完整图，缺少匹配图即报错；其他模式遵循用户配置。中间 verifier 预捕获稀疏 token 桶；稳定输入缓冲区填入实际 query，padding 槽置为 -1，通过只读 block 0 的虚拟请求补齐 FIA 的 TND 边界，真实 KV 长度不变。中间图参数、更新流及 RoPE 与主模型隔离。图捕获、预热和内存 profile 是初始化过程，不属于正式重放。按缓存容量分组完成多轮，避免轮间反复淘汰；microbatch 预算按新增 query 计算。
+支持文本、full-attention、未量化的中间 verifier，复用 TP；不支持中间流水线的 PP/DP/CP、LoRA、异步调度或 adaptive verification。显式选择 FULL 时，三个模型（旧模式为四个）的正式 forward 使用完整图，缺少匹配图即报错；其他模式遵循用户配置。中间 verifier 预捕获稀疏 token 桶；稳定输入缓冲区填入实际 query，padding 槽置为 -1，通过只读 block 0 的虚拟请求补齐 FIA 的 TND 边界，真实 KV 长度不变。中间图参数、更新流及 RoPE 与主模型隔离。图捕获、预热和内存 profile 是初始化过程，不属于正式重放。按缓存容量分组完成多轮，避免轮间反复淘汰；microbatch 预算按新增 query 计算。
 
-FULL 的范围是四个模型的 forward（包含 attention），不是把整个多级周期封装成一张图：logits/验收、候选列表、必要回传、FIA 参数更新和 CPU 轮次控制仍在模型图外。选择 FULL 时不使用 PIECEWISE；首次捕获会增加加载时间和常驻内存。仍需在目标 CANN/torch_npu 版本上验证长 query 的 FIA task update、图资源占用及吞吐。冷启动混合批次直接拼接设备端预测片段，避免额外上传预测行索引；关闭 DEBUG 时跳过逐 token 接受率统计和计时。
+FULL 的范围是实际启用模型的 forward（包含 attention），不是把整个多级周期封装成一张图：logits/验收、候选列表、必要回传、FIA 参数更新和 CPU 轮次控制仍在模型图外。选择 FULL 时不使用 PIECEWISE；首次捕获会增加加载时间和常驻内存。仍需在目标 CANN/torch_npu 版本上验证长 query 的 FIA task update、图资源占用及吞吐。冷启动混合批次直接拼接设备端预测片段，避免额外上传预测行索引；关闭 DEBUG 时跳过逐 token 接受率统计和计时。三模型模式的 `multi_stage_initial_draft` 单独记录首次中间上下文补算与 DFlash 提案的 `initial_draft_ms`，不将其漏记为调度间隙。
 
 遇到 `EE1023 / Alloc Stream resource failed / Too many streams are created` 时，需要降低总捕获桶数量，而不是增加候选 token 限额。中间层默认采用稀疏桶（例如 token buffer 为 4096、4 请求、DFlash 宽度 15 时为 `[1,16,64,256,1024,4096]`），不再捕获完整的 `1..32` 小桶。可在 `intermediate` 中设置 `"cudagraph_capture_sizes": [64,256]`；实现会补齐最大中间 token buffer 和 Secondary 最大批次桶，确保全部输入长度仍有图覆盖。更少桶会增加 padding 计算量，需要真机测量权衡。主模型的 `compilation_config.cudagraph_capture_sizes` 单独控制 Target/Primary，不能替代此中间层选项。捕获资源耗尽后应退出并重新启动该任务，不能在已报异步错误的进程内继续捕获。不要同时开启 `ASCEND_LAUNCH_BLOCKING=1` 与 ACL 图。
 
@@ -194,6 +199,7 @@ CPU 测试不依赖安装完整 vLLM/NPU 环境：
 python -m pytest --confcutdir=tests/ut/worker/v2 \
   tests/ut/worker/v2/test_final_verification.py \
   tests/ut/worker/v2/test_intermediate.py \
+  tests/ut/worker/v2/test_intermediate_only.py \
   tests/ut/worker/v2/test_intermediate_backend.py \
   tests/ut/worker/v2/test_intermediate_capacity.py \
   tests/ut/worker/v2/test_intermediate_device_drafts.py \
@@ -207,7 +213,7 @@ python -m pytest --confcutdir=tests/ut/worker/v2 \
   tests/ut/worker/v2/test_dummy_fia_metadata.py
 ```
 
-NPU 集成测试使用仓库已有的 Qwen3-8B/DFlash 配对作为主、中间两套独立实例，覆盖短/长候选、Top-1 对照、全接受、不同请求长度和请求结束后复用。长候选用中间全接受生成 20-token candidate，再以最终 Top-1 对照普通 greedy 输出。图用例断言四模型都有实际重放、中间 KV 命中、请求复用后没有新增图捕获。实际 8B/4B 配对仍需使用对应权重执行验证：
+NPU 集成测试使用仓库已有的 Qwen3-8B/DFlash 权重配对，分别覆盖默认三模型与可选旧四模型模式，检查短/长候选、Top-1 对照、全接受、不同请求长度和请求结束后复用。默认模式检查 Target 没有 Primary draft 模型或辅助 hidden 输出；旧模式检查 Primary 仍正常重放。长候选用中间全接受生成 20-token candidate，再以最终 Top-1 对照普通 greedy 输出。图用例检查启用模型的实际重放、中间 KV 命中、请求复用后没有新增图捕获。测试中的中间实例也使用现有 8B 权重，实际 Target/4B 配对仍需使用对应权重执行验证：
 
 ```bash
 VLLM_USE_V2_MODEL_RUNNER=1 pytest -q \

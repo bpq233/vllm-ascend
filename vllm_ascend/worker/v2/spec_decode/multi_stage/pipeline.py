@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class IntermediatePipeline:
-    """Refine primary tokens without modifying committed request state."""
+    """Generate/refine draft tokens without modifying committed request state."""
 
     def __init__(self, backend, config, capacity, eos_token_id=None):
         self.backend = backend
@@ -79,7 +79,7 @@ class IntermediatePipeline:
             group = order[start : start + width]
             refined = self._refine(
                 [prefixes[i] for i in group],
-                [primary_tokens[i] for i in group],
+                [primary_tokens[i] for i in group] if primary_tokens is not None else None,
                 [limits[i] for i in group],
                 [req_ids[i] for i in group],
             )
@@ -98,10 +98,33 @@ class IntermediatePipeline:
         # from the stop conditions and must never clip a completed round.
         token_threshold = getattr(self.config, "max_generated_tokens", None)
         accepted = [[] for _ in prefixes]
-        drafts = [tokens[:limit] for tokens, limit in zip(primary_tokens, limits)]
         active = [i for i, limit in enumerate(limits) if limit > 0]
-        contexts_by_request = list(prefixes)
         trace = logger.isEnabledFor(logging.DEBUG)
+        if primary_tokens is None:
+            # Generate the first draft with the same independent DFlash used
+            # in later rounds. Keep each group resident through its full cycle.
+            drafts = [[] for _ in prefixes]
+            if active:
+                propose = (
+                    getattr(self.backend, "propose_device", self.backend.propose)
+                    if getattr(self.backend, "decision_runner", None) is not None
+                    else self.backend.propose
+                )
+                initial_started = perf_counter() if trace else 0.0
+                initial = propose([prefixes[i] for i in active], req_ids=[req_ids[i] for i in active])
+                if trace:
+                    logger.debug(
+                        "multi_stage_initial_draft initial_draft_ms=%.3f "
+                        "timing=host_wall_with_context request_ids=%s proposed=%d",
+                        (perf_counter() - initial_started) * 1000,
+                        [req_ids[i] for i in active],
+                        sum(map(len, initial)),
+                    )
+                for i, tokens in zip(active, initial):
+                    drafts[i] = tokens[: limits[i]]
+        else:
+            drafts = [tokens[:limit] for tokens, limit in zip(primary_tokens, limits)]
+        contexts_by_request = list(prefixes)
         for round_id in range(self.config.num_rounds):
             if not active:
                 break
@@ -123,7 +146,9 @@ class IntermediatePipeline:
                 contexts,
                 round_drafts,
                 req_ids=[req_ids[i] for i in active],
-                retain_hidden=round_id + 1 < self.config.num_rounds,
+                # Independent mode also uses context hidden rows for the first
+                # DFlash proposal of the NEXT Target cycle, after prefix checks.
+                retain_hidden=primary_tokens is None or round_id + 1 < self.config.num_rounds,
                 **({"decision": decision_runner} if decision_runner is not None else {}),
             ):
                 if decision_runner is not None:

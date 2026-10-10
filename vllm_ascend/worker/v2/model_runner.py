@@ -162,6 +162,10 @@ class NPUModelRunner(GPUModelRunner):
         self.speculator: AscendEagleSpeculator | None = None
         if self.speculative_config is not None and (not self.use_spec_pp or self.is_last_pp_rank):
             self.speculator = init_speculator(self.vllm_config, self.device)
+            if not getattr(self.speculator, "uses_primary_drafter", True):
+                # The independent 4B pair owns its auxiliary hidden layers.
+                # The final Target neither conditions nor loads that DFlash.
+                self.use_aux_hidden_state_outputs = False
             # Shared update_stream: main model (ModelAclGraphManager) and draft
             # (Eagle/DFlash/DSpark AclGraphManager) all use this same stream.
             self.speculator.update_stream = self.update_stream

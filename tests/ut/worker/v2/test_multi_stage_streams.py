@@ -79,7 +79,8 @@ def test_eager_secondary_does_not_attach_parent_stream(graph_helpers):
     h.torch.npu.Stream.assert_not_called()
 
 
-def test_adapter_supplies_stream_before_backend_load():
+@pytest.mark.parametrize("use_primary", [False, True])
+def test_adapter_supplies_stream_before_backend_load(use_primary):
     path = SOURCE / "spec_decode/multi_stage/adapter.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     adapter = next(node for node in tree.body if isinstance(node, ast.ClassDef))
@@ -100,6 +101,7 @@ def test_adapter_supplies_stream_before_backend_load():
     )
     exec(compile(tree, str(path), "exec"), namespace)
     adapter = NS(
+        uses_primary_drafter=use_primary,
         intermediate_config=NS(
             verifier_model="verifier",
             drafter_model="secondary",
@@ -125,6 +127,8 @@ def test_adapter_supplies_stream_before_backend_load():
     assert adapter.req_states is runner.req_states
     assert adapter.final_verifier is runner.rejection_sampler
     assert adapter.final_verifier.defer_trace
+    logged = namespace["logger"].info.call_args.args
+    assert logged[1:3] == (use_primary, "primary" if use_primary else None)
 
 
 @pytest.mark.parametrize("trace", [False, True])

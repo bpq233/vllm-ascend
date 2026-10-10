@@ -21,6 +21,7 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
     # The synchronous propose path publishes committed progress along with its
     # existing D2H. The runner must not enqueue a second progress-only transfer.
     updates_computed_tokens_cpu = True
+    uses_primary_drafter = True
 
     def __init__(self, vllm_config, device):
         options = vllm_config.additional_config["multi_stage_speculative"]
@@ -98,10 +99,12 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
             backend, self.intermediate_config, self.final_capacity, runner.model_config.hf_text_config.eos_token_id
         )
         logger.info(
-            "multi_stage_init primary_drafter_model=%s intermediate_verifier_model=%s secondary_drafter_model=%s "
+            "multi_stage_init use_primary_drafter=%s primary_drafter_model=%s "
+            "intermediate_verifier_model=%s secondary_drafter_model=%s "
             "num_intermediate_rounds=%d max_generated_tokens=%s intermediate_num_speculative_tokens=%d "
             "intermediate_verification_method=%s final_verification_method=%s final_capacity=%d",
-            runner.vllm_config.speculative_config.model,
+            self.uses_primary_drafter,
+            runner.vllm_config.speculative_config.model if self.uses_primary_drafter else None,
             self.intermediate_config.verifier_model,
             self.intermediate_config.drafter_model,
             self.intermediate_config.num_rounds,
@@ -125,6 +128,9 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
             output[:, : primary.shape[1]] = primary
             return output
         lengths, prefixes, primary_tokens = self._read_step(input_batch, primary)
+        return self._refine_and_publish(input_batch, lengths, prefixes, primary_tokens, output)
+
+    def _refine_and_publish(self, input_batch, lengths, prefixes, primary_tokens, output):
         # postprocess_sampled has already committed the current target result.
         # Partial prefill rows must not enter the intermediate pipeline.
         limits = [

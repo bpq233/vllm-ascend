@@ -6,7 +6,7 @@ MAX_DFLASH_DRAFT_TOKENS = 15
 
 
 def intermediate_capture_sizes(max_tokens, max_reqs, draft_width, requested=None):
-    """Sparse gears: four resident models share the device's stream budget."""
+    """Sparse gears: resident models share the device's stream budget."""
     if requested is not None:
         if any(size > max_tokens for size in requested):
             raise ValueError("intermediate.cudagraph_capture_sizes must fit the intermediate token buffer.")
@@ -32,6 +32,17 @@ def primary_draft_width(options, final_capacity):
     # turn that budget into an unsupported single DFlash query.
     default = 4 if final_capacity > MAX_DFLASH_DRAFT_TOKENS else final_capacity
     return options.get("primary_num_speculative_tokens", default)
+
+
+def initial_draft_width(options, final_capacity):
+    intermediate = options.get("intermediate", {})
+    if (
+        "intermediate" in options
+        and intermediate.get("num_rounds", 3) > 0
+        and not options.get("use_primary_drafter", False)
+    ):
+        return intermediate.get("num_speculative_tokens", 4)
+    return primary_draft_width(options, final_capacity)
 
 
 @dataclass
@@ -65,8 +76,12 @@ class IntermediateConfig:
         ):
             raise ValueError("intermediate.cudagraph_capture_sizes must be a nonempty list of positive integers.")
         for name in (
-            "num_rounds", "num_speculative_tokens", "max_num_seqs", "cache_max_num_seqs",
-            "max_model_len", "max_generated_tokens",
+            "num_rounds",
+            "num_speculative_tokens",
+            "max_num_seqs",
+            "cache_max_num_seqs",
+            "max_model_len",
+            "max_generated_tokens",
         ):
             value = getattr(result, name)
             minimum = 0 if name in ("num_rounds", "max_generated_tokens") else 1
@@ -86,7 +101,9 @@ def candidate_capacity(primary_width, intermediate):
     first_round = primary_width + 1
     capacity = first_round + (intermediate.num_rounds - 1) * (intermediate.num_speculative_tokens + 1)
     if intermediate.max_generated_tokens is not None and intermediate.num_rounds > 1:
-        capacity = min(capacity, max(first_round, intermediate.max_generated_tokens + intermediate.num_speculative_tokens + 1))
+        capacity = min(
+            capacity, max(first_round, intermediate.max_generated_tokens + intermediate.num_speculative_tokens + 1)
+        )
     return capacity
 
 
@@ -114,9 +131,14 @@ def prepare_multi_stage_config(vllm_config):
     intermediate = IntermediateConfig.from_dict(config["intermediate"])
     if intermediate.num_rounds == 0:
         return
-    width = primary_draft_width(config, spec.num_speculative_tokens)
+    if type(config.get("use_primary_drafter", False)) is not bool:
+        raise ValueError("use_primary_drafter must be a boolean.")
+    if not config.get("use_primary_drafter", False) and "primary_num_speculative_tokens" in config:
+        raise ValueError("primary_num_speculative_tokens requires use_primary_drafter=true.")
+    width = initial_draft_width(config, spec.num_speculative_tokens)
     _validate_draft_widths(width, intermediate)
-    config["primary_num_speculative_tokens"] = width
+    if config.get("use_primary_drafter", False):
+        config["primary_num_speculative_tokens"] = width
     spec.num_speculative_tokens = candidate_capacity(width, intermediate)
 
 
@@ -124,8 +146,10 @@ def validate_multi_stage(vllm_config, config):
     """Validate and derive storage before scheduler, KV and graph initialization."""
     if not config:
         return
-    if set(config) - {"primary_num_speculative_tokens", "intermediate", "final_verification"}:
+    if set(config) - {"use_primary_drafter", "primary_num_speculative_tokens", "intermediate", "final_verification"}:
         raise ValueError("Unknown multi_stage_speculative option.")
+    if type(config.get("use_primary_drafter", False)) is not bool:
+        raise ValueError("use_primary_drafter must be a boolean.")
     from vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance import AcceptancePolicy
 
     if "final_verification" in config:
@@ -144,7 +168,7 @@ def validate_multi_stage(vllm_config, config):
         return
     intermediate = IntermediateConfig.from_dict(config["intermediate"])
     AcceptancePolicy(**intermediate.verification)
-    width = primary_draft_width(config, spec.num_speculative_tokens)
+    width = initial_draft_width(config, spec.num_speculative_tokens)
     _validate_draft_widths(width, intermediate)
     capacity = candidate_capacity(width, intermediate)
     if capacity > MAX_DFLASH_DRAFT_TOKENS:
@@ -160,8 +184,10 @@ def validate_multi_stage(vllm_config, config):
         if width != spec.num_speculative_tokens:
             raise ValueError("With zero intermediate rounds, primary and final widths must match.")
         return
+    if not config.get("use_primary_drafter", False) and "primary_num_speculative_tokens" in config:
+        raise ValueError("primary_num_speculative_tokens requires use_primary_drafter=true.")
     if not spec.use_dflash():
-        raise ValueError("The intermediate pipeline currently requires a DFlash primary drafter.")
+        raise ValueError("The intermediate pipeline requires speculative method='dflash'.")
     if "final_verification" not in config:
         raise ValueError("Intermediate candidates require explicit final_verification: topk, all, or prob_ratio.")
     parallel = vllm_config.parallel_config
@@ -182,8 +208,11 @@ def validate_multi_stage(vllm_config, config):
     if getattr(spec, "enable_adaptive_verification", False):
         raise ValueError("Intermediate decoding cannot reuse primary adaptive-verification confidences.")
     if getattr(spec, "num_speculative_tokens_per_batch_size", None):
-        raise ValueError("Intermediate decoding derives its own capacity; per-batch speculative limits are unsupported.")
+        raise ValueError(
+            "Intermediate decoding derives its own capacity; per-batch speculative limits are unsupported."
+        )
     # Preserve the original primary width before replacing upstream's capacity.
     # This must be idempotent when the config is initialized again in workers.
-    config["primary_num_speculative_tokens"] = width
+    if config.get("use_primary_drafter", False):
+        config["primary_num_speculative_tokens"] = width
     spec.num_speculative_tokens = capacity
