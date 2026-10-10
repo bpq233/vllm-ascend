@@ -165,7 +165,7 @@ def test_microbatch_limits_and_rope_restored_on_error(backend):
     assert rope._cos is main_rope
 
 
-def test_adapter_replaces_only_candidate_buffer_and_publishes_real_lengths():
+def test_adapter_replaces_only_candidate_buffer_and_publishes_real_lengths(monkeypatch):
     primary = torch.tensor([[7, 8], [9, 10]])
 
     class OriginalDFlash:
@@ -179,6 +179,7 @@ def test_adapter_replaces_only_candidate_buffer_and_publishes_real_lengths():
     )
     obj = cls.__new__(cls)
     obj.final_capacity, obj.max_model_len, obj.device = 5, 16, torch.device("cpu")
+    obj.final_verifier = NS(flush_trace=Mock())
     history = torch.tensor([[1, 2, 3, 4, 0], [5, 6, 0, 0, 0]])
     obj.req_states = NS(
         total_len=NS(gpu=torch.tensor([4, 2])),
@@ -202,9 +203,21 @@ def test_adapter_replaces_only_candidate_buffer_and_publishes_real_lengths():
     assert obj.get_draft_tokens() == (["a", "b"], [[7, 11, 12], []])
     assert torch.equal(history, original_history)
     assert primary.tolist() == [[7, 8], [9, 10]]
+    obj.final_verifier.flush_trace.assert_called_once_with()
     obj.propose(batch, dummy_run=True, is_profile=True)
     obj.pipeline.backend.profile.assert_called_once()
     assert obj.pipeline.refine.call_count == 1
+    obj.final_verifier.flush_trace.assert_called_once_with()
+    pointer = obj._host_candidates.data_ptr()
+    obj.pipeline.refine.return_value = [[16777217], [14, 15]]
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "empty", Mock(side_effect=AssertionError("Repeated pinned allocation")))
+        second = obj.propose(batch)
+    assert obj._host_candidates.data_ptr() == pointer
+    assert second.tolist() == [[16777217, 0, 0, 0, 0], [14, 15, 0, 0, 0]]
+    # A new upload owns its output; replacing the pinned source cannot alter
+    # an earlier device candidate buffer. Shorter rows must clear stale tails.
+    assert result.tolist() == [[7, 11, 12, 0, 0], [0, 0, 0, 0, 0]]
 
 
 def test_cached_rounds_forward_only_suffix_and_hydrate_secondary(backend):

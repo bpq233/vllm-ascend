@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+from collections import OrderedDict
 from contextlib import contextmanager
 
 import numpy as np
@@ -77,6 +78,38 @@ class NPUModelRunner(GPUModelRunner):
     """Model runner for Ascend NPUs."""
 
     execute_model_state: ExecuteModelState | None
+    MAX_SPEC_METADATA_SHAPES = 16
+
+    def _invalidate_spec_metadata(self):
+        self._spec_metadata = OrderedDict()
+        self._query_metadata = None
+
+    def _copy_spec_metadata(self, name, values, out=None):
+        """Reuse read-only Target metadata in the synchronous multi-stage path.
+
+        Keys snapshot values, not request IDs or array addresses: reordering,
+        request-slot reuse and candidate length changes must all miss. The
+        query boundaries retain the fixed graph input address. Dummy runs and
+        stream changes invalidate the scratch-buffer shortcut in execute_model.
+        """
+        if not getattr(self.speculator, "updates_computed_tokens_cpu", False):
+            return async_copy_to_gpu(values, out=out, device=self.device)
+        if not hasattr(self, "_spec_metadata"):
+            self._invalidate_spec_metadata()
+        key = (name, values.dtype.str, values.shape, values.tobytes())
+        if out is not None:
+            previous = self._query_metadata
+            if previous is not None and previous[0] is out and previous[1] == key:
+                return out
+            result = async_copy_to_gpu(values, out=out, device=self.device)
+            self._query_metadata = (out, key)
+            return result
+        if key not in self._spec_metadata:
+            self._spec_metadata[key] = async_copy_to_gpu(values, device=self.device)
+            if len(self._spec_metadata) > self.MAX_SPEC_METADATA_SHAPES:
+                self._spec_metadata.popitem(last=False)
+        self._spec_metadata.move_to_end(key)
+        return self._spec_metadata[key]
 
     @property
     def pcp_manager_cls(self) -> type[AscendPCPManager]:
@@ -209,6 +242,7 @@ class NPUModelRunner(GPUModelRunner):
         super().shutdown()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        self._invalidate_spec_metadata()
         with graph_manager_wrapper(self):
             super().initialize_kv_cache(kv_cache_config)
             if self.pcp_manager is not None:
@@ -217,6 +251,12 @@ class NPUModelRunner(GPUModelRunner):
                 self.model_state.pcp_manager = self.pcp_manager
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
+
+    def capture_model(self, *args, **kwargs):
+        # Capture can write dummy query boundaries directly without going
+        # through execute_model. Never reuse its scratch contents afterward.
+        self._invalidate_spec_metadata()
+        return super().capture_model(*args, **kwargs)
 
     @torch.inference_mode()
     def execute_model(
@@ -228,6 +268,11 @@ class NPUModelRunner(GPUModelRunner):
         is_profile: bool = False,
         context_len: int = 0,
     ):
+        if getattr(self.speculator, "updates_computed_tokens_cpu", False):
+            stream = torch.npu.current_stream()
+            if dummy_run or getattr(self, "_spec_metadata_stream", None) != stream:
+                self._invalidate_spec_metadata()
+            self._spec_metadata_stream = stream
         self._cpp_execution_time_ms = None
         profiling_config = self.ascend_config.scheduler_config.profiling_chunk_config
         execution_start_time = _start_profiling_chunk_timing(
@@ -236,7 +281,12 @@ class NPUModelRunner(GPUModelRunner):
         )
         trace_verification = hasattr(self.rejection_sampler, "begin_forward")
         if trace_verification:
-            self.rejection_sampler.begin_forward(scheduler_output, dummy_run)
+            self.rejection_sampler.begin_forward(
+                scheduler_output,
+                dummy_run,
+                proposal_timing=getattr(self.speculator, "proposal_timing", None),
+                update_stream=self.update_stream,
+            )
 
         if vllm_version_is("0.27.1"):
             output = super().execute_model(
@@ -325,8 +375,7 @@ class NPUModelRunner(GPUModelRunner):
             )
             idx_mapping_iter = map(self.req_states.req_id_to_index.get, req_ids)
             idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.int32, count=num_reqs)
-            idx_mapping_cpu = torch.from_numpy(idx_mapping_np)
-            idx_mapping = async_copy_to_gpu(idx_mapping_cpu, device=self.device)
+            idx_mapping = self._copy_spec_metadata("idx_mapping", idx_mapping_np)
 
             # Get the number of draft tokens for each request.
             draft_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -352,7 +401,7 @@ class NPUModelRunner(GPUModelRunner):
                 cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
                 cu_num_logits_np[0] = 0
                 np.cumsum(num_logits, out=cu_num_logits_np[1:])
-                cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+                cu_num_logits = self._copy_spec_metadata("cu_num_logits", cu_num_logits_np)
 
                 max_expand_len = self.decode_query_len
                 expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
@@ -381,7 +430,7 @@ class NPUModelRunner(GPUModelRunner):
                     batch_desc.num_reqs,
                 )
 
-            async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
+            self._copy_spec_metadata("query_start_loc", query_start_loc_np, out=self.input_buffers.query_start_loc)
 
             query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
             query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
@@ -544,8 +593,7 @@ class NPUModelRunner(GPUModelRunner):
             )
             idx_mapping_iter = map(self.req_states.req_id_to_index.get, req_ids)
             idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.int32, count=num_reqs)
-            idx_mapping_cpu = torch.from_numpy(idx_mapping_np)
-            idx_mapping = async_copy_to_gpu(idx_mapping_cpu, device=self.device)
+            idx_mapping = self._copy_spec_metadata("idx_mapping", idx_mapping_np)
 
             # Get the number of draft tokens for each request.
             draft_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -571,7 +619,7 @@ class NPUModelRunner(GPUModelRunner):
                 cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
                 cu_num_logits_np[0] = 0
                 np.cumsum(num_logits, out=cu_num_logits_np[1:])
-                cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+                cu_num_logits = self._copy_spec_metadata("cu_num_logits", cu_num_logits_np)
 
                 max_expand_len = self.decode_query_len
                 expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
@@ -600,7 +648,7 @@ class NPUModelRunner(GPUModelRunner):
                     batch_desc.num_reqs,
                 )
 
-            async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
+            self._copy_spec_metadata("query_start_loc", query_start_loc_np, out=self.input_buffers.query_start_loc)
 
             query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
             query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]

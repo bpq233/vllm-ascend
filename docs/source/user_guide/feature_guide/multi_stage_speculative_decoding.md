@@ -20,7 +20,7 @@
 
 复查范围包含 multi_stage 和 DFlash 中的 `.item/.tolist/.cpu/.numpy`、标量转换及 tensor 工厂调用。NumPy query 长度和 CPU metadata 上的转换不是 D2H；上游 DFlash 的 `seq_lens_cpu_upper_bound.max().item()` 同样操作 CPU tensor。DFlash replay 的 DP token-count tensor 创建仍保留，修改涉及原始 DFlash 通信上下文，应在 NPU 上验证其跨 stream 生命周期后再调整。
 
-设备 token 只在 `verify_batches` 当前 yield 期间有效，恢复生成器后即清除引用，防止下一次图重放覆盖后误用。异步 H2D 的 pinned 源仍按调用独立分配，避免未经 event 保护的主机缓冲区复用造成数据竞争。CPU 控制循环、EOS/长度裁剪、前缀比较和 scheduler 发布仍存在；当前实现不能宣称全流水线已图捕获，也不能以 CPU 测试推断 NPU 加速比。
+设备 token 只在 `verify_batches` 当前 yield 期间有效，恢复生成器后即清除引用，防止下一次图重放覆盖后误用。backend 输入 metadata 的异步 H2D pinned 源仍按调用独立分配，避免未经完成边界保护的主机缓冲区复用造成数据竞争。CPU 控制循环、EOS/长度裁剪、前缀比较和 scheduler 发布仍存在；当前实现不能宣称全流水线已图捕获，也不能以 CPU 测试推断 NPU 加速比。
 
 ## `aten::to` / `_to_copy` / `copy_` 专项检查
 
@@ -161,14 +161,30 @@ Secondary 候选通过独立设备 tensor 保存，避免下一次 DFlash 图重
 
 决策结果只在后续微批次会覆盖它时复制；最后一个微批次直接消费图输出。通常单微批次每轮省去一次 decision clone，多微批次保留前面结果的独立存储。关闭 DEBUG 时跳过接受数列表分配。CPU 回归验证了流分配条件、结果覆盖安全和自动容量边界；这些是代码工作量变化，不是 NPU 加速比。
 
-尚需真机评估的主要开销：每组每轮一次决策 D2H 与 CPU 轮次控制；稀疏图桶造成的 padding；请求数超过驻留 KV 槽位时的淘汰；最终候选长度与 Target 验证成本的权衡。当前没有本次运行的 NPU trace 或基准结果，KG 健康检查也超时，因此本次 NPU 性能收益为 **[未核实]**。应使用相同模型、prompt、采样参数、并发度与输出长度，对照测量 TPOT、吞吐、峰值内存、图命中率和 stream 数，不能仅以流更少判断更快。
+中间 DFlash 现在通过 `IntermediateDFlashSpeculator.propose_precomputed` 复用现有输入准备、图分派及采样，只消费 verifier 已写入的 context KV。此前 proposal 会再次投影、归一化、旋转并写入末尾 context KV，还拷贝无用 hidden；FULL 路径在图管理器内外各构建一次 draft metadata。新入口跳过这些重复工作，命中中间缓存时也不再构建未使用的 verifier metadata 和 slot mapping。缓存失配仍执行 verifier 并更新 context KV；proposal 前仍截断有效前缀，防止把 DFlash query 写入的临时 KV 当成已验证 context。
+
+中间验收复用重复形状的设备长度与索引；FULL decision graph 的长度未改变时不再分配 pinned 长度或重复 H2D，形状改变时继续使用独立 pinned 源。采样值每轮重新计算，不能缓存验收结果。
+
+下一次 Target 的 `prepare_inputs` 复用只读 `idx_mapping` 和 `cu_num_logits`，以名称、dtype、shape 和内容快照作为缓存键，最多保留 16 项。固定图输入 `query_start_loc` 仅在当前值、目标 tensor 对象和执行流均有效时跳过上传。dummy、重新 capture、KV 初始化或计算流切换会失效缓存。请求重排、槽位复用、候选长度或 padding 改变会更新对应字段；位置、实际序列长度及 token 每步照常准备，不缓存推理结果。两版真实 `prepare_inputs` 的 CPU 替身回归中，稳定的长/短混合候选与 FULL padding 均将这三项 metadata H2D 调用从每步 3 次降为 0 次；这不是 NPU 耗时或端到端加速比。
+
+最终候选发布使用可复用 pinned buffer，直接在 NumPy 视图填入 token 并清零 padding，省去每步 Python 补齐列表和 pinned tensor 重建。adapter 的 `_read_step` 阻塞 D2H 已完成当前流的前序任务，包括上轮该 buffer 的 H2D，之后才允许覆写；形状、dtype 或流改变则分配新源。最终候选 H2D 仍保留，CPU scheduler 仍消费实际候选列表。
+
+Target 在全部 intermediate rounds 完成后，通过下一次 scheduler step 执行。最后一轮中间校验之后还需要决策 D2H、CPU 接受/EOS/长度处理、候选上传、worker 输出与 scheduler 往返，以及下一轮 Target 输入准备。这些开销可以逐项缩短；完全消除 scheduler 往返需要多级投机的异步调度契约，包括乐观长度、有效候选长度和拒绝后 KV/slot 回退，不能仅切换流或提前调用 Target forward。上游 [异步投机调度方案](https://github.com/vllm-project/vllm-ascend/pull/7640) 使用 CPU 乐观状态并以设备状态修正，本实现仍保留同步调度。KG `id=vllmascend_docs_source_userguide_releasenotespart0004_zero_bubble_scheduling`，`source_file=inference-serving/vllm-ascend/docs/source/user_guide/release_notes-part0004.md`，通过 Cypher 直接定位，无 score。正常路径仍每组每轮一次决策 D2H。开启 DEBUG 的 Target 统计改为在当前计算流异步拷贝至独立 pinned 存储，等 adapter 已有的阻塞 D2H 完成后输出，不再额外阻塞 Primary/Intermediate 启动；仅启用最终接受策略而不启用中间 adapter 时保留同步统计路径。
+
+Target 与中间 verifier 的主图都在调用时的当前计算流提交。时间线上的不同 kernel stream ID 还可能来自图捕获内部执行流，不能仅凭 ID 判断主机切换了计算流。专用 `update_stream` 则更新 attention 图任务并记录 `ExternalEvent`；图内等待该事件后执行 attention。现有顺序先提交 replay，再从更新流记录事件，将更新流直接合并为 replay 流会使等待依赖自身后续任务。官方接口还要求更新流与捕获流不同。保持更新流独立，主、中间模型仍复用同一条更新流。
+
+流约束参考：KG `id=opplugin_docs_context_torchnpunpugraphtaskupdatebegin_event_torch_npu_externalevent`，`source_file=cann-ops/op-plugin/docs/context/torch_npu-npu-graph_task_update_begin.md`，`score=0.941535`；[官方 replay 源码](https://github.com/Ascend/pytorch/blob/master/torch_npu/csrc/core/npu/NPUGraph.cpp) 使用当前流提交图执行，[捕获上下文](https://github.com/Ascend/pytorch/blob/master/torch_npu/npu/graphs.py) 支持内部捕获流。
+
+尚需真机评估的主要开销：每组每轮一次决策 D2H 与 CPU 轮次控制；稀疏图桶造成的 padding；请求数超过驻留 KV 槽位时的淘汰；最终候选长度与 Target 验证成本的权衡。KG 已核实相关接口和同步约束，但当前没有本次运行的 NPU trace 或基准结果，因此 NPU 性能收益为 **[未核实]**。应使用相同模型、prompt、采样参数、并发度与输出长度，对照测量 TPOT、吞吐、峰值内存、图命中率和 stream 数，不能仅以流更少判断更快。
 
 初始化记录三套 draft/intermediate 模型信息及轮数、策略。设置现有 `VLLM_LOGGING_LEVEL=DEBUG` 后记录：
 
-- `multi_stage_intermediate`：round、proposed、accepted、accepted_by_request、intermediate_model_ms、secondary_model_ms。时间为包含组装、模型、必要 D2H 和接受策略的主机墙钟时间。
+- `multi_stage_intermediate`：round、proposed、accepted、accepted_by_request、intermediate_model_ms、secondary_model_ms、decision_transfer_ms、host_update_ms。前两项时间包含组装、模型、必要 D2H 和接受策略；decision_transfer_ms 包含等待此前排队设备工作完成的时间，不能当成纯 DMA 时间。
+- `multi_stage_target_handoff`：intermediate_to_target_ms、candidate_publish_ms、scheduler_handoff_ms，以及中间/Target 当前计算流和 attention 更新流。计时从整个 refine 返回起，到下一次 execute_model 入口止，区分候选发布和 scheduler 往返；不包含下一轮 Target 输入准备，也不是设备 kernel 间的精确空隙。
+- `verification_graph_submit`：replay_submit_ms、attention_update_submit_ms，以及两条流。它们是主机提交耗时，后者包含图更新上下文准备；不等待设备完成，不等于 attention kernel 耗时。
 - `multi_stage_final`：candidate_lengths、accepted_lengths、verification_path、target_ms。accepted 为策略接受数（不含修正/bonus，后续 EOS/长度截断仍由原流程处理）；target_ms 使用 NPU event，包含 forward 区间，不含中间流水线。分块采样时按采样块输出长度，共用同一 forward 时间。
 
-最终详细日志会同步 NPU；正式性能测试关闭 DEBUG，使用相同 prompts、输出长度和采样设置，对比普通 DFlash、15 容量及 20 容量配置的总吞吐、TTFT、TPOT，并记录 NPU 型号、CANN/torch_npu/vLLM 版本、TP 和上下文长度。不能用 CPU 耗时推断 NPU 加速比。
+仅最终策略模式的详细日志会同步 NPU；完整多级模式在已有回传完成后输出。DEBUG 日志仍有主机开销，正式性能测试关闭 DEBUG，使用相同 prompts、输出长度和采样设置，对比普通 DFlash、15 容量及 20 容量配置的总吞吐、TTFT、TPOT，并记录 NPU 型号、CANN/torch_npu/vLLM 版本、TP 和上下文长度。不能用 CPU 耗时推断 NPU 加速比。
 
 ## 验证
 
@@ -181,6 +197,9 @@ python -m pytest --confcutdir=tests/ut/worker/v2 \
   tests/ut/worker/v2/test_intermediate_backend.py \
   tests/ut/worker/v2/test_intermediate_capacity.py \
   tests/ut/worker/v2/test_intermediate_device_drafts.py \
+  tests/ut/worker/v2/test_intermediate_drafter.py \
+  tests/ut/worker/v2/test_multi_stage_streams.py \
+  tests/ut/worker/v2/test_target_metadata_cache.py \
   tests/ut/worker/v2/test_intermediate_warmup.py \
   tests/ut/worker/v2/test_intermediate_graph.py \
   tests/ut/worker/v2/test_long_verification.py \

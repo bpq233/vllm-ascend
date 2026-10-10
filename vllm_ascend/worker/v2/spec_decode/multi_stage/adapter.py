@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 import logging
 from copy import copy
+from time import perf_counter
 
 import torch
 from vllm.v1.outputs import DraftTokenIds
@@ -49,6 +50,9 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
         positions = (lengths_gpu[:, None] - width + offsets).clamp(min=0)
         tails = source[indices[:, None], positions.long()]
         packed_cpu = torch.cat((lengths_gpu[:, None], computed_gpu[:, None], primary, tails), dim=1).cpu()
+        final_verifier = getattr(self, "final_verifier", None)
+        if final_verifier is not None:
+            final_verifier.flush_trace()
         # Publish only real request rows; unused/recycled slots must retain
         # their add_request state. numpy() views already completed CPU storage.
         self.req_states.num_computed_tokens_cpu.numpy()[input_batch.idx_mapping_np] = packed_cpu.numpy()[:, 1]
@@ -83,6 +87,10 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
 
     def initialize_intermediate(self, runner):
         self.req_states = runner.req_states
+        final_verifier = getattr(runner, "rejection_sampler", None)
+        if hasattr(final_verifier, "flush_trace"):
+            self.final_verifier = final_verifier
+            self.final_verifier.defer_trace = True
         backend = IntermediateBackend(runner.vllm_config, self.intermediate_config, self.device)
         backend.update_stream = runner.update_stream
         backend.load_model()
@@ -135,10 +143,31 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
         self.pipeline.backend.cache.retain(self.req_states.req_id_to_index)
         self.candidates = self.pipeline.refine(prefixes, primary_tokens, limits, req_ids=list(input_batch.req_ids))
         self.req_ids = list(input_batch.req_ids)
-        # Padding is only storage; the handler publishes the actual row lengths.
-        padded = [tokens + [0] * (self.final_capacity - len(tokens)) for tokens in self.candidates]
-        host_output = torch.tensor(padded, dtype=output.dtype, pin_memory=self.device.type != "cpu")
+        # _read_step's blocking D2H has completed all earlier uploads on this
+        # stream, including the previous use of this pinned source. Reuse it
+        # without adding an event; a different stream/shape gets fresh storage.
+        # Padding is only storage; the handler publishes actual row lengths.
+        stream = torch.npu.current_stream() if self.device.type == "npu" else None
+        host_output = getattr(self, "_host_candidates", None)
+        if (
+            host_output is None
+            or host_output.shape != output.shape
+            or host_output.dtype != output.dtype
+            or getattr(self, "_host_candidate_stream", None) != stream
+        ):
+            host_output = self._host_candidates = torch.empty(
+                output.shape, dtype=output.dtype, pin_memory=self.device.type != "cpu"
+            )
+            self._host_candidate_stream = stream
+        host_rows = host_output.numpy()
+        host_rows.fill(0)
+        for row, tokens in enumerate(self.candidates):
+            host_rows[row, : len(tokens)] = tokens
         output.copy_(host_output, non_blocking=True)
+        refined_at = getattr(self.pipeline, "last_refine_finished_at", None)
+        self.proposal_timing = (
+            (refined_at, perf_counter(), self.pipeline.last_compute_stream) if refined_at is not None else None
+        )
         return output
 
     def set_draft_tokens(self, input_batch, draft_tokens):

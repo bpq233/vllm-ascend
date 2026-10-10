@@ -85,6 +85,12 @@ class IntermediatePipeline:
             )
             for i, tokens in zip(group, refined):
                 results[i] = tokens
+        trace = logger.isEnabledFor(logging.DEBUG)
+        self.last_refine_finished_at = perf_counter() if trace else None
+        device = getattr(self.backend, "device", None)
+        self.last_compute_stream = (
+            torch.npu.current_stream() if trace and device is not None and device.type == "npu" else None
+        )
         return results
 
     def _refine(self, prefixes, primary_tokens, limits, req_ids):

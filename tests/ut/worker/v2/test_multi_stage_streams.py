@@ -3,6 +3,7 @@
 """CPU checks for stream ownership and progress-copy dependencies."""
 
 import ast
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -111,6 +112,7 @@ def test_adapter_supplies_stream_before_backend_load():
     )
     runner = NS(
         req_states=object(),
+        rejection_sampler=NS(flush_trace=Mock(), defer_trace=False),
         update_stream=shared,
         model_config=NS(hf_text_config=NS(eos_token_id=1)),
         vllm_config=NS(
@@ -121,3 +123,56 @@ def test_adapter_supplies_stream_before_backend_load():
     namespace["initialize_intermediate"](adapter, runner)
     backend.load_model.assert_called_once_with()
     assert adapter.req_states is runner.req_states
+    assert adapter.final_verifier is runner.rejection_sampler
+    assert adapter.final_verifier.defer_trace
+
+
+@pytest.mark.parametrize("trace", [False, True])
+def test_target_replay_keeps_external_event_updater_separate_without_host_sync(trace):
+    path = SOURCE / "aclgraph_utils.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ModelAclGraphManager")
+    cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "run_fullgraph"]
+    events = []
+    output = object()
+
+    class Parent:
+        def run_fullgraph(self, desc):
+            events.append("replay")
+            return output
+
+    compute = NS(synchronize=Mock(side_effect=AssertionError("Host synchronization")))
+    update = NS(wait_stream=Mock(side_effect=lambda stream: events.append("wait")))
+    updater = Mock(side_effect=lambda *args: events.append("update"))
+    logger = Mock()
+    logger.isEnabledFor.return_value = trace
+    timing = Mock(side_effect=[1.0, 1.002, 1.005])
+    namespace = dict(
+        ModelCudaGraphManager=Parent,
+        torch=NS(npu=NS(current_stream=lambda: compute), full=Mock()),
+        logger=logger,
+        DEBUG=10,
+        perf_counter=timing,
+        set_current_vllm_config=lambda *a: nullcontext(),
+        set_forward_context=lambda *a, **kw: nullcontext(),
+        get_forward_context=lambda: object(),
+        _get_graph_update_backend=lambda groups: "backend",
+        update_full_graph_params=updater,
+    )
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), cls],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    manager = namespace["ModelAclGraphManager"]()
+    manager.update_stream = update
+    manager.vllm_config = object()
+    manager.model_runner = NS(dp_size=1, model_state=NS(attn_metadata={}), attn_groups=[], speculative_config=None)
+    desc = NS(num_tokens=17, cg_mode="full")
+    assert manager.run_fullgraph(desc) is output
+    assert events == ["wait", "replay", "update"]
+    update.wait_stream.assert_called_once_with(compute)
+    assert updater.call_args.args[1] is update and update is not compute
+    compute.synchronize.assert_not_called()
+    assert timing.call_count == (3 if trace else 0)
+    assert logger.debug.call_count == int(trace)

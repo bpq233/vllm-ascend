@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from vllm import SamplingParams
@@ -9,6 +10,9 @@ from vllm import SamplingParams
 from tests.e2e.conftest import VllmRunner
 from tests.e2e.pull_request.one_card.spec_decode.utils import DFLASH
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl, AscendAttentionState
+from vllm_ascend.worker.v2 import model_runner as runner_module
+from vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance import AcceptancePolicy
+from vllm_ascend.worker.v2.spec_decode.multi_stage.final_verification import FinalVerificationSampler
 
 
 def _candidate_probe(worker, install=False):
@@ -66,6 +70,86 @@ def test_packed_metadata_views_and_block_table_out_on_npu():
     assert output.data_ptr() == pointer
     assert output.cpu().tolist() == [[8, 9, 10, 11], [0, 1, 2, 3], [4, 5, 6, 7]]
     assert ids.cpu().tolist() == [2147483647, 16777217, 3]
+
+
+def test_deferred_final_trace_uses_existing_stream_completion_on_npu(monkeypatch):
+    """Verify pinned async statistics before/after the adapter's D2H boundary."""
+    verifier = FinalVerificationSampler.__new__(FinalVerificationSampler)
+    verifier.policy = AcceptancePolicy("all")
+    verifier.num_speculative_steps = 2
+    verifier._verification_steps = torch.arange(3, device="npu")
+    verifier.trace_forward = verifier.defer_trace = True
+    verifier.verification_path = "decode"
+    verifier._pending_traces = []
+    verifier.forward_events = (torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True))
+    verifier.forward_events[0].record()
+    logits = torch.zeros(3, 4, device="npu")
+    targets = torch.tensor([1, 2, 3], device="npu")
+    verifier.forward_events[1].record()
+    verifier.sampler = SimpleNamespace(sample=lambda **kwargs: (targets, logits))
+    messages = []
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.spec_decode.multi_stage.final_verification.logger.debug",
+        lambda *args: messages.append(args),
+    )
+    mapping = torch.tensor([0], device="npu")
+    _, sampled, counts = verifier._verify(
+        logits,
+        None,
+        torch.tensor([0, 1, 2], device="npu"),
+        torch.arange(3, device="npu"),
+        torch.tensor([0, 3], dtype=torch.int32, device="npu"),
+        mapping,
+        mapping.cpu().numpy(),
+        torch.zeros(3, dtype=torch.int32, device="npu"),
+        torch.arange(3, device="npu"),
+    )
+    assert not messages
+    # This queued D2H is the same ordering boundary used by _read_step. No
+    # stream/event synchronize is needed specifically for tracing.
+    assert sampled.cpu().tolist() == [[1, 2, 3]]
+    verifier.flush_trace()
+    assert len(messages) == 1 and messages[0][1:4] == ([2], [2], "decode")
+    assert counts.cpu().tolist() == [3] and not verifier._pending_traces
+
+
+def test_target_metadata_cache_on_npu(monkeypatch):
+    """Check immutable indices and stable graph query storage on real hardware."""
+    runner = runner_module.NPUModelRunner.__new__(runner_module.NPUModelRunner)
+    runner.speculator = SimpleNamespace(updates_computed_tokens_cpu=True)
+    runner.device = torch.device("npu:0")
+    upload = runner_module.async_copy_to_gpu
+    calls = []
+
+    def record(*args, **kwargs):
+        calls.append(args[0].copy())
+        return upload(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "async_copy_to_gpu", record)
+    inputs = [np.array(values, dtype=np.int32) for values in ([1, 0], [0, 2, 5], [0, 2, 5, 8])]
+    query = torch.empty(4, dtype=torch.int32, device=runner.device)
+    pointer = query.data_ptr()
+
+    def stage():
+        return [
+            runner._copy_spec_metadata(name, values, out=query if index == 2 else None)
+            for index, (name, values) in enumerate(zip(("idx_mapping", "cu_num_logits", "query_start_loc"), inputs))
+        ]
+
+    first, second = stage(), stage()
+    assert len(calls) == 3
+    assert all(a is b for a, b in zip(first, second))
+    assert [tensor.cpu().tolist() for tensor in second] == [values.tolist() for values in inputs]
+    inputs[0][:] = [0, 1]
+    inputs[1][:] = [0, 1, 5]
+    inputs[2][:] = [0, 1, 5, 8]
+    changed = stage()
+    assert len(calls) == 6 and query.data_ptr() == pointer
+    assert first[0].cpu().tolist() == [1, 0]  # Old read-only entries cannot change.
+    assert [tensor.cpu().tolist() for tensor in changed] == [values.tolist() for values in inputs]
+    runner._invalidate_spec_metadata()
+    stage()
+    assert len(calls) == 9 and query.data_ptr() == pointer
 
 
 def _target_graph_probe(worker, install=False):

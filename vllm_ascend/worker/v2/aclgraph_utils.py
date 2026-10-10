@@ -18,6 +18,8 @@
 #
 from collections.abc import Callable
 from contextlib import contextmanager
+from logging import DEBUG
+from time import perf_counter
 from typing import Any
 
 import torch
@@ -152,8 +154,14 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         num_tokens = desc.num_tokens
         logger.info_once("run_fullgraph with num_tokens=%s", num_tokens)
         assert self.update_stream is not None
-        self.update_stream.wait_stream(torch.npu.current_stream())
+        compute_stream = torch.npu.current_stream()
+        # The captured attention waits for ExternalEvent records from this
+        # updater. It must remain separate from the graph's execution stream.
+        self.update_stream.wait_stream(compute_stream)
+        trace = logger.isEnabledFor(DEBUG)
+        replay_started = perf_counter() if trace else 0.0
         ret = super().run_fullgraph(desc)
+        replay_submitted = perf_counter() if trace else 0.0
 
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
         # calculate num_tokens_across_dp.
@@ -186,6 +194,16 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 num_tokens,
                 self.vllm_config,
                 self.model_runner.speculative_config,
+            )
+        if trace:
+            logger.debug(
+                "verification_graph_submit num_tokens=%d replay_submit_ms=%.3f attention_update_submit_ms=%.3f "
+                "timing=host_wall compute_stream=%s attention_update_stream=%s",
+                num_tokens,
+                (replay_submitted - replay_started) * 1000,
+                (perf_counter() - replay_submitted) * 1000,
+                compute_stream,
+                self.update_stream,
             )
         return ret
 

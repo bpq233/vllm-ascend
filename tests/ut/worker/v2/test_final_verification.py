@@ -250,6 +250,50 @@ class TestFinalVerificationSampler(unittest.TestCase):
         verifier.forward_events[1].synchronize.assert_not_called()
         self.assertEqual(debug.call_args.args[1:3], ([1], [1]))
 
+        # Multi-stage tracing queues its copy, then uses the adapter's existing
+        # D2H completion. It must not block before Primary DFlash is launched.
+        verifier.defer_trace = True
+        empty_like = torch.empty_like
+        with (
+            patch.object(
+                torch, "empty_like", side_effect=lambda *a, **kw: empty_like(*a, **{**kw, "pin_memory": False})
+            ),
+            patch.object(torch.Tensor, "cpu", side_effect=AssertionError("Unexpected trace synchronization")),
+            patch.object(module.logger, "debug") as debug,
+        ):
+            verifier._verify(logits, None, draft, pos, cumulative, mapping, mapping_np, expanded, local)
+            verifier.verification_path = "prefill"
+            verifier._verify(logits, None, draft, pos, cumulative, mapping, mapping_np, expanded, local)
+            debug.assert_not_called()
+            first, second = [entry[0] for entry in verifier._pending_traces]
+            self.assertNotEqual(first.data_ptr(), second.data_ptr())
+            verifier.flush_trace()
+            self.assertEqual(
+                [call.args[1:4] for call in debug.call_args_list], [([1], [1], "decode"), ([1], [1], "prefill")]
+            )
+            self.assertFalse(verifier._pending_traces)
+        verifier.forward_events[1].synchronize.assert_not_called()
+
+        stream, update_stream = object(), object()
+        npu = SimpleNamespace(current_stream=MagicMock(return_value=stream), Event=MagicMock())
+        with (
+            patch.object(torch, "npu", npu, create=True),
+            patch.object(module.logger, "isEnabledFor", return_value=True),
+            patch.object(module.logger, "debug") as debug,
+            patch.object(module, "perf_counter", return_value=1.025),
+        ):
+            scheduled = SimpleNamespace(scheduled_spec_decode_tokens={"a": [1]}, num_scheduled_tokens={"a": 18})
+            verifier.begin_forward(scheduled, False, (1.0, 1.005, stream), update_stream)
+            self.assertEqual(verifier.verification_path, "prefill")
+            for actual, expected in zip(debug.call_args.args[1:4], (25, 5, 20)):
+                self.assertAlmostEqual(actual, expected)
+            self.assertEqual(debug.call_args.args[4:], (stream, stream, update_stream))
+            npu.Event.assert_not_called()
+            verifier.forward_events[0].record.assert_called_once()
+            debug.reset_mock()
+            verifier.begin_forward(scheduled, True, (1.0, 1.005, stream), update_stream)
+            debug.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
