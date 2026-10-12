@@ -17,9 +17,12 @@ logger = logging.getLogger(__name__)
 class FinalVerificationSampler(RejectionSampler):
     """Optional top-k/all verification; retain MRV2 output and logprob handling."""
 
-    def __init__(self, sampler, spec_config, device: torch.device, policy: AcceptancePolicy):
+    def __init__(
+        self, sampler, spec_config, device: torch.device, policy: AcceptancePolicy, emit_bonus_token: bool = True
+    ):
         super().__init__(sampler, spec_config, device)
         self.policy = policy
+        self.emit_bonus_token = emit_bonus_token
         self._verification_steps = torch.arange(self.num_speculative_steps + 1, device=device)
         self.forward_events = None
         self.trace_forward = False
@@ -105,8 +108,20 @@ class FinalVerificationSampler(RejectionSampler):
             self.policy,
             self._verification_steps,
         )
+        # Capture the accepted prefix before dropping a fully accepted bonus.
+        # After that, num_sampled - 1 is no longer the acceptance count.
+        accepted = num_sampled - 1 if self.trace_forward else None
+        if not self.emit_bonus_token:
+            lengths = cu_num_logits[1:] - cu_num_logits[:-1]
+            omit_bonus = (lengths > 1) & (num_sampled == lengths)
+            num_sampled = num_sampled - omit_bonus.to(num_sampled.dtype)
+            sampled.masked_fill_(self._verification_steps >= num_sampled[:, None], -1)
+            # Keep the final accepted candidate as the next cycle's anchor.
+            # Upstream derives num_rejected = lengths - num_sampled, thereby
+            # reserving its Target KV position for the next forward. Rejected
+            # drafts still get a correction; empty drafts still get one token.
         if self.trace_forward:
-            counts = torch.stack((cu_num_logits[1:] - cu_num_logits[:-1] - 1, num_sampled - 1))
+            counts = torch.stack((cu_num_logits[1:] - cu_num_logits[:-1] - 1, accepted))
             if self.defer_trace:
                 # The multi-stage adapter already blocks for primary tokens and
                 # committed progress. Queue this tiny copy on the SAME stream;

@@ -55,6 +55,7 @@ def _candidate_probe(worker, install=False):
         "uses_primary_drafter": runner.speculator.uses_primary_drafter,
         "target_aux_hidden_states": runner.use_aux_hidden_state_outputs,
         "target_draft_model_present": runner.get_draft_model() is not None,
+        "emit_target_bonus_token": runner.rejection_sampler.emit_bonus_token,
     }
 
 
@@ -75,10 +76,12 @@ def test_packed_metadata_views_and_block_table_out_on_npu():
     assert ids.cpu().tolist() == [2147483647, 16777217, 3]
 
 
-def test_deferred_final_trace_uses_existing_stream_completion_on_npu(monkeypatch):
+@pytest.mark.parametrize("emit_bonus", [False, True])
+def test_deferred_final_trace_uses_existing_stream_completion_on_npu(monkeypatch, emit_bonus):
     """Verify pinned async statistics before/after the adapter's D2H boundary."""
     verifier = FinalVerificationSampler.__new__(FinalVerificationSampler)
     verifier.policy = AcceptancePolicy("all")
+    verifier.emit_bonus_token = emit_bonus
     verifier.num_speculative_steps = 2
     verifier._verification_steps = torch.arange(3, device="npu")
     verifier.trace_forward = verifier.defer_trace = True
@@ -110,10 +113,10 @@ def test_deferred_final_trace_uses_existing_stream_completion_on_npu(monkeypatch
     assert not messages
     # This queued D2H is the same ordering boundary used by _read_step. No
     # stream/event synchronize is needed specifically for tracing.
-    assert sampled.cpu().tolist() == [[1, 2, 3]]
+    assert sampled.cpu().tolist() == [[1, 2, 3 if emit_bonus else -1]]
     verifier.flush_trace()
     assert len(messages) == 1 and messages[0][1:4] == ([2], [2], "decode")
-    assert counts.cpu().tolist() == [3] and not verifier._pending_traces
+    assert counts.cpu().tolist() == [3 if emit_bonus else 2] and not verifier._pending_traces
 
 
 def test_target_metadata_cache_on_npu(monkeypatch):
@@ -352,6 +355,7 @@ def test_multi_stage_dflash(method, use_primary_drafter, long_candidates, graph_
         assert all(row["uses_primary_drafter"] == use_primary_drafter for row in initial)
         assert all(row["target_aux_hidden_states"] == use_primary_drafter for row in initial)
         assert all(row["target_draft_model_present"] == use_primary_drafter for row in initial)
+        assert all(not row["emit_target_bonus_token"] for row in initial)
         if graph_mode:
             before = runner.model.llm_engine.collective_rpc(_target_graph_probe, kwargs={"install": True})
             assert all(

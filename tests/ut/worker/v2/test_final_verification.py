@@ -187,7 +187,7 @@ class TestAcceptancePolicy(unittest.TestCase):
 
 
 class TestFinalVerificationSampler(unittest.TestCase):
-    def test_sampling_metadata_forwarded_and_draft_probabilities_ignored(self):
+    def setUp(self):
         parent = ModuleType("vllm.v1.worker.gpu.spec_decode.rejection_sampler")
 
         class RejectionSampler:
@@ -206,7 +206,11 @@ class TestFinalVerificationSampler(unittest.TestCase):
                 "vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance": acceptance,
             },
         ):
-            module = load_module("_test_final_verification", "final_verification.py")
+            self.module = load_module("_test_final_verification", "final_verification.py")
+        self.utils = utils
+
+    def test_sampling_metadata_forwarded_and_draft_probabilities_ignored(self):
+        module, utils = self.module, self.utils
         logits = torch.tensor([[3.0, 2.0, 1.0], [2.0, 1.0, 3.0]])
         processed = torch.tensor([[1.0, 3.0, 2.0], [3.0, 1.0, 2.0]])
         sampler = MagicMock()
@@ -293,6 +297,86 @@ class TestFinalVerificationSampler(unittest.TestCase):
             debug.reset_mock()
             verifier.begin_forward(scheduled, True, (1.0, 1.005, stream), update_stream)
             debug.assert_not_called()
+
+    def test_no_bonus_preserves_corrections_empty_drafts_and_long_ragged_batches(self):
+        widths = [0, 1, 3, 17, 32]
+        boundaries = torch.tensor([0, *np.cumsum([width + 1 for width in widths])], dtype=torch.int32)
+        size = int(boundaries[-1])
+        drafts = torch.arange(size) % 47
+        targets = torch.full((size,), 48)
+        mapping = torch.arange(len(widths))
+        for method, emit_bonus, failure in product(("all", "topk", "prob_ratio"), (False, True), range(33)):
+            with self.subTest(method=method, emit_bonus=emit_bonus, failure=failure):
+                logits = torch.full((size, 49), -10.0)
+                logits[torch.arange(size), drafts.roll(-1)] = 10.0
+                if failure < 32:
+                    row = int(boundaries[-2]) + failure
+                    logits[row, :] = -10.0
+                    logits[row, 47] = 10.0
+                verifier = self.module.FinalVerificationSampler(
+                    SimpleNamespace(sample=MagicMock(return_value=(targets, logits))),
+                    SimpleNamespace(num_speculative_tokens=32),
+                    torch.device("cpu"),
+                    AcceptancePolicy(method, top_k=1),
+                    emit_bonus_token=emit_bonus,
+                )
+                # The production path must not read device scalars on the host.
+                with patch.object(torch.Tensor, "cpu", side_effect=AssertionError("Unexpected synchronization")):
+                    processed, sampled, counts = verifier._verify(
+                        logits,
+                        None,
+                        drafts,
+                        torch.arange(size),
+                        boundaries,
+                        mapping,
+                        mapping.numpy(),
+                        torch.zeros(size, dtype=torch.int32),
+                        torch.arange(size),
+                    )
+                self.assertIs(processed, logits)
+                self.assertEqual(sampled.shape, (5, 33))
+                self.assertEqual(counts.dtype, torch.int32)
+                for req, width in enumerate(widths):
+                    accepted = width if req != 4 or method == "all" else failure
+                    start = int(boundaries[req])
+                    expected = drafts[start + 1 : start + accepted + 1].tolist()
+                    if emit_bonus or accepted < width or width == 0:
+                        expected.append(48)
+                    count = int(counts[req])
+                    self.assertEqual(sampled[req, :count].tolist(), expected)
+                    self.assertTrue((sampled[req, count:] == -1).all())
+                    self.assertGreater(count, 0)
+                    # Upstream reserves the last output as the next anchor.
+                    rejected = width + 1 - count
+                    total_before = 10
+                    computed_after = total_before - 1 + width + 1 - rejected
+                    self.assertEqual(computed_after, total_before + count - 1)
+
+    def test_no_bonus_trace_reports_all_accepted_candidates(self):
+        logits = torch.zeros(3, 4)
+        verifier = self.module.FinalVerificationSampler(
+            SimpleNamespace(sample=lambda **kwargs: (torch.tensor([3, 3, 3]), logits)),
+            SimpleNamespace(num_speculative_tokens=2),
+            torch.device("cpu"),
+            AcceptancePolicy("all"),
+            emit_bonus_token=False,
+        )
+        verifier.trace_forward = True
+        verifier._log_trace = MagicMock()
+        _, sampled, counts = verifier._verify(
+            logits,
+            None,
+            torch.tensor([0, 1, 2]),
+            torch.arange(3),
+            torch.tensor([0, 3]),
+            torch.tensor([0]),
+            np.array([0]),
+            torch.zeros(3, dtype=torch.int32),
+            torch.arange(3),
+        )
+        self.assertEqual(sampled.tolist(), [[1, 2, -1]])
+        self.assertEqual(counts.tolist(), [2])
+        verifier._log_trace.assert_called_once_with([2], [2], "decode")
 
 
 if __name__ == "__main__":

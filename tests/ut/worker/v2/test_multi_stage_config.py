@@ -4,8 +4,10 @@
 
 import ast
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 import pytest
 from test_intermediate import modules as modules
@@ -18,10 +20,15 @@ def platform_defaults(modules, monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm_ascend.worker.v2.spec_decode.multi_stage.config", config)
     path = Path(__file__).resolve().parents[4] / "vllm_ascend/platform.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_get_default_max_cudagraph_capture_size")
+    helper = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_get_default_max_cudagraph_capture_size"
+    )
     method = next(
-        n for cls in tree.body if isinstance(cls, ast.ClassDef)
-        for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "apply_config_platform_defaults"
+        n
+        for cls in tree.body
+        if isinstance(cls, ast.ClassDef)
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == "apply_config_platform_defaults"
     )
     method.decorator_list = []
     namespace = {"VllmConfig": object}
@@ -59,3 +66,42 @@ def test_inactive_pipeline_leaves_upstream_capacity_alone(modules, options):
     config.prepare_multi_stage_config(cfg)
     assert cfg.speculative_config.num_speculative_tokens == 8
     assert "primary_num_speculative_tokens" not in options
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_runner_disables_target_bonus_for_active_intermediate(modules, monkeypatch, active):
+    path = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/model_runner.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    method = next(
+        method
+        for cls in tree.body
+        if isinstance(cls, ast.ClassDef) and cls.name == "NPUModelRunner"
+        for method in cls.body
+        if isinstance(method, ast.FunctionDef) and method.name == "load_model"
+    )
+    base = type("Base", (), {"load_model": lambda *args, **kwargs: None})
+    cls = ast.ClassDef(
+        name="Runner", bases=[ast.Name(id="Base", ctx=ast.Load())], keywords=[], body=[method], decorator_list=[]
+    )
+    namespace = {"Base": base}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), str(path), "exec"), namespace)
+    sampler = Mock()
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.worker.v2.spec_decode.multi_stage.final_verification",
+        NS(FinalVerificationSampler=sampler),
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm.utils.mem_utils", NS(DeviceMemoryProfiler=lambda: nullcontext(NS(consumed_memory=0)))
+    )
+    runner = namespace["Runner"]()
+    options = {"final_verification": {"method": "all"}}
+    runner.ascend_config = NS(multi_stage_speculative=options)
+    runner.is_last_pp_rank = True
+    runner.speculator = NS(initialize_intermediate=Mock()) if active else NS()
+    runner.sampler, runner.speculative_config, runner.device = object(), object(), "cpu"
+    runner.model_memory_usage = 0
+    runner.load_model()
+    assert sampler.call_args.kwargs["emit_bonus_token"] == (not active)
+    if active:
+        runner.speculator.initialize_intermediate.assert_called_once_with(runner)

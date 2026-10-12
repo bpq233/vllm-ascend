@@ -244,6 +244,24 @@ def test_cached_rounds_forward_only_suffix_and_hydrate_secondary(backend):
     assert metadata.call_args.kwargs["seq_lens"].tolist() == [4]
 
 
+@pytest.mark.parametrize("target_bonus", [False, True])
+def test_next_cycle_without_target_bonus_skips_intermediate_catchup(backend, target_bonus):
+    obj, _, _ = backend
+    obj.drafter.propose_precomputed = Mock(return_value=torch.tensor([[6, 7]]))
+    list(obj.verify_batches([[1, 2]], [[3, 4]], req_ids=["a"], retain_hidden=False))
+    # The intermediate verifier forwards 1,2,3,4 and predicts 5; the
+    # candidates sent to Target are 3,4,5. Target accepts all of them.
+    committed = [1, 2, 3, 4, 5] + ([9] if target_bonus else [])
+    before = obj.forward_tokens
+    calls = obj.model.call_count
+    assert obj.propose([committed], req_ids=["a"]) == [[6, 7]]
+    assert obj.forward_tokens - before == int(target_bonus)
+    assert obj.model.call_count - calls == int(target_bonus)
+    anchors = obj.drafter.propose_precomputed.call_args.args[1]
+    assert anchors[0].item() == committed[-1]
+    assert obj.cache.tokens[obj.cache.slots["a"]] == committed[:-1]
+
+
 def test_cached_context_owns_storage_and_reuses_rejection_predictor(backend):
     obj, _, _ = backend
     output = torch.tensor([[1, 0], [2, 1], [3, 2], [4, 3]])
