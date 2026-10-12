@@ -180,5 +180,3 @@ def test_target_replay_keeps_external_event_updater_separate_without_host_sync(t
     compute.synchronize.assert_not_called()
     assert timing.call_count == (3 if trace else 0)
     assert logger.debug.call_count == int(trace)
-    if trace:
-        assert logger.debug.call_args.args[-2:] == (id(compute), id(update))

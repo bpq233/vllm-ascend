@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-import ast
 import importlib.util
 import sys
 from contextlib import contextmanager, nullcontext
@@ -23,11 +22,6 @@ def modules(monkeypatch):
         return module
 
     load("vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance", "acceptance.py")
-    packet = ast.parse((root / "round_packet.py").read_text(encoding="utf-8"))
-    packet.body = [node for node in packet.body if isinstance(node, ast.FunctionDef) and node.name == "pack_round"]
-    packet_module = NS(torch=torch)
-    exec(compile(packet, "round_packet.py", "exec"), vars(packet_module))
-    monkeypatch.setitem(sys.modules, "vllm_ascend.worker.v2.spec_decode.multi_stage.round_packet", packet_module)
     config = load("_intermediate_test_config", "config.py")
     pipeline = load("_intermediate_test_pipeline", "pipeline.py")
     return config, pipeline.IntermediatePipeline
@@ -99,6 +93,28 @@ def test_empty_active_batch_does_not_run_backend(modules):
     backend = Backend([])
     assert Pipeline(backend, config.IntermediateConfig("v", "d"), 4).refine([[1]], [[2]], [0]) == [[]]
     assert backend.calls == []
+
+
+@pytest.mark.parametrize("width", [0, 4, 15])
+@pytest.mark.parametrize("room", [0, 1, 64])
+@pytest.mark.parametrize("eos_ids", [None, 0, [2, 5], [99, 2]])
+def test_batched_cpu_append_matches_three_token_loop(modules, width, room, eos_ids):
+    config, Pipeline = modules
+    pipe = Pipeline(Backend([]), config.IntermediateConfig("v", "d"), 64, eos_token_id=eos_ids)
+    draft = list(range(1, width + 1))
+    for length in range(width + 1):
+        expected, actual = [40, 41], [40, 41]
+        stopped, accepted = False, 0
+        additions = draft[:length] + [99]
+        for position, token in enumerate(additions[:room]):
+            expected.append(token)
+            accepted += int(position < length)
+            if token in pipe.eos_ids:
+                stopped = True
+                break
+        result = pipe._append_candidates(actual, draft, length, 99, 2 + room)
+        assert actual == expected
+        assert result == (stopped, accepted)
 
 
 @pytest.mark.parametrize("method,top_k", [("all", 1), ("topk", 1), ("topk", 5), ("prob_ratio", 1)])

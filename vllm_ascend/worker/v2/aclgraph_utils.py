@@ -198,12 +198,12 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         if trace:
             logger.debug(
                 "verification_graph_submit num_tokens=%d replay_submit_ms=%.3f attention_update_submit_ms=%.3f "
-                "timing=host_wall compute_stream_wrapper_id=%s update_stream_wrapper_id=%s",
+                "timing=host_wall compute_stream=%s attention_update_stream=%s",
                 num_tokens,
                 (replay_submitted - replay_started) * 1000,
                 (perf_counter() - replay_submitted) * 1000,
-                id(compute_stream),
-                id(self.update_stream),
+                compute_stream,
+                self.update_stream,
             )
         return ret
 

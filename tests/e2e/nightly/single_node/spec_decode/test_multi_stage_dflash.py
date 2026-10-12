@@ -13,8 +13,6 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl, Ascen
 from vllm_ascend.worker.v2 import model_runner as runner_module
 from vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance import AcceptancePolicy
 from vllm_ascend.worker.v2.spec_decode.multi_stage.final_verification import FinalVerificationSampler
-from vllm_ascend.worker.v2.spec_decode.multi_stage.round_packet import pack_round
-from vllm_ascend.worker.v2.spec_decode.multi_stage.step_packet import pack_step
 
 
 def _candidate_probe(worker, install=False):
@@ -75,76 +73,6 @@ def test_packed_metadata_views_and_block_table_out_on_npu():
     assert output.data_ptr() == pointer
     assert output.cpu().tolist() == [[8, 9, 10, 11], [0, 1, 2, 3], [4, 5, 6, 7]]
     assert ids.cpu().tolist() == [2147483647, 16777217, 3]
-
-
-@pytest.mark.parametrize("primary_width", [0, 2])
-def test_fused_step_packet_matches_reference_on_npu(primary_width):
-    source = torch.arange(48, dtype=torch.int32).reshape(3, 16)
-    lengths, computed = torch.tensor([2, 99, 5, 99, 1, 99]), torch.tensor([1, 99, 4, 99, 0, 99])
-    primary = torch.tensor([[16777217, 99, 5, 99], [2147483647, 99, 6, 99], [7, 99, 8, 99]])
-    state = lambda device: SimpleNamespace(
-        total_len=SimpleNamespace(gpu=lengths.to(device)[::2]),
-        num_computed_tokens=SimpleNamespace(gpu=computed.to(device)[::2]),
-        all_token_ids=SimpleNamespace(gpu=source.to(device)[:, ::2]),
-    )
-    batch = lambda device: SimpleNamespace(
-        num_reqs=3, idx_mapping=torch.tensor([2, 99, 0, 99, 1, 99], device=device)[::2]
-    )
-    expected = pack_step(state("cpu"), batch("cpu"), primary[:, ::2][:, :primary_width], 4)
-    actual = pack_step(state("npu"), batch("npu"), primary.to("npu")[:, ::2][:, :primary_width], 4)
-    assert actual.cpu().tolist() == expected.tolist()
-
-
-@pytest.mark.parametrize("eos_ids", [[], [5, 7], [151643, 151645, 151646, 151647, 7]])
-def test_fused_round_packet_and_device_candidates_match_reference_on_npu(eos_ids):
-    decisions = torch.tensor([[2, 7], [0, 4], [1, 9]])
-    drafts = [torch.tensor([16777217, 5]), torch.empty(0, dtype=torch.int64), torch.tensor([8])]
-    candidate = torch.zeros(4, 8, dtype=torch.int64)
-    candidate[2, :2] = torch.tensor([11, 12])
-    counts, limits = torch.tensor([0, 0, 2, 0], dtype=torch.int32), torch.tensor([0, 8, 5, 8], dtype=torch.int32)
-    output, output_counts = candidate.to("npu"), counts.to("npu")
-    expected = pack_round(decisions, drafts, candidate, counts, limits, [2, 0, 3], eos_ids)
-    actual = pack_round(
-        decisions.to("npu"),
-        [t.to("npu") for t in drafts],
-        output,
-        output_counts,
-        limits,
-        [2, 0, 3],
-        eos_ids,
-    )
-    assert actual.cpu().tolist() == expected.tolist()
-    assert output.cpu().tolist() == candidate.tolist()
-    assert output_counts.cpu().tolist() == counts.tolist()
-
-
-@pytest.mark.parametrize("num_reqs", [1, 4, 5, 9])
-@pytest.mark.parametrize("initialize", [False, True])
-def test_flat_round_packet_launch_and_chunk_offsets_on_npu(num_reqs, initialize):
-    """Exercise the legacy binder regression and requests beyond one launch."""
-    decisions = torch.tensor([[i % 3, 70 + i] for i in range(num_reqs)])
-    drafts = [torch.arange(10 + i * 3, 10 + i * 3 + i % 3) for i in range(num_reqs)]
-    candidate = torch.zeros(num_reqs, 8, dtype=torch.int64)
-    counts = torch.full((num_reqs,), -777 if initialize else 1, dtype=torch.int32)
-    if not initialize:
-        candidate[:, 0] = 99
-    limits = [2 + i % 3 for i in range(num_reqs)]
-    row_ids = list(reversed(range(num_reqs)))
-    output, output_counts = candidate.to("npu"), counts.to("npu")
-    expected = pack_round(decisions, drafts, candidate, counts, limits, row_ids, [14, 72], initialize=initialize)
-    actual = pack_round(
-        decisions.to("npu"),
-        [t.to("npu") for t in drafts],
-        output,
-        output_counts,
-        limits,
-        row_ids,
-        [14, 72],
-        initialize=initialize,
-    )
-    assert actual.cpu().tolist() == expected.tolist()
-    assert output.cpu().tolist() == candidate.tolist()
-    assert output_counts.cpu().tolist() == counts.tolist()
 
 
 def test_deferred_final_trace_uses_existing_stream_completion_on_npu(monkeypatch):
@@ -302,7 +230,7 @@ def _target_graph_probe(worker, install=False):
         "cached_long_calls": worker._long_target_cached_full_calls,
         "forward_tokens": backend.forward_tokens,
         "reused_tokens": backend.reused_tokens,
-        "precomputed_context_hits": backend.precomputed_context_hits,
+        "reused_hidden_tokens": backend.reused_hidden_tokens,
         "intermediate_calls": backend.graph_replays,
         "intermediate_sizes": [
             desc.num_tokens for desc in backend.cudagraph_manager._capture_descs.get(CUDAGraphMode.FULL, [])
@@ -459,9 +387,7 @@ def test_multi_stage_dflash(method, use_primary_drafter, long_candidates, graph_
             )
             assert all(end["intermediate_calls"] > begin["intermediate_calls"] for begin, end in zip(before, after))
             assert all(end["reused_tokens"] > begin["reused_tokens"] for begin, end in zip(before, after))
-            assert all(
-                end["precomputed_context_hits"] > begin["precomputed_context_hits"] for begin, end in zip(before, after)
-            )
+            assert all(end["reused_hidden_tokens"] > begin["reused_hidden_tokens"] for begin, end in zip(before, after))
             for row in after:
                 for label in ("target", "intermediate"):
                     dispatches = row["verification_dispatches"][label]

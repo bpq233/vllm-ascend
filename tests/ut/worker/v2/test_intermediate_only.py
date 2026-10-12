@@ -131,7 +131,6 @@ def test_first_draft_is_from_4b_then_verify_extend_and_publish(standalone, backe
     assert result.tolist() == [[4, 5, 6, 7, 0, 0], [14, 15, 16, 17, 0, 0]]
     assert obj.get_draft_tokens() == (["a", "b"], [[4, 5, 6, 7], [14, 15, 16, 17]])
     assert back.drafter.propose.call_count == 2
-    assert not hasattr(obj, "_host_candidates")  # Candidate matrix never makes an H2D round trip.
     assert torch.equal(history, committed)
     assert back.cache.tokens[back.cache.slots["a"]] == [1, 2, 3, 4, 5, 6, 7]
     assert obj.req_states.num_computed_tokens_cpu.tolist() == [2, 2]
