@@ -80,9 +80,14 @@ class IntermediatePipeline:
         return stopped, min(length, len(additions))
 
     @torch.inference_mode()
-    def refine(self, prefixes, primary_tokens, limits, req_ids=None):
+    def refine(self, prefixes, primary_tokens, limits, req_ids=None, output=None):
         req_ids = req_ids if req_ids is not None else [str(i) for i in range(len(prefixes))]
         results = [[] for _ in prefixes]
+        # CPU lists remain authoritative for synchronous scheduling. When all
+        # drafts are device tensors, retain views of the EXISTING decision/D2H
+        # packets and publish from them without rebuilding a pinned H2D copy.
+        fragments = [[] for _ in prefixes] if output is not None else None
+        self.device_output_ready = False
         # Keep a group resident throughout its rounds. Round-major execution
         # across more requests than cache slots would evict every useful prefix.
         width = getattr(self.backend, "max_num_reqs", len(prefixes)) or 1
@@ -95,18 +100,35 @@ class IntermediatePipeline:
                 [primary_tokens[i] for i in group] if primary_tokens is not None else None,
                 [limits[i] for i in group],
                 [req_ids[i] for i in group],
+                **({"fragments": [fragments[i] for i in group]} if fragments is not None else {}),
             )
             for i, tokens in zip(group, refined):
                 results[i] = tokens
         trace = logger.isEnabledFor(logging.DEBUG)
         self.last_refine_finished_at = perf_counter() if trace else None
+        if fragments is not None and all(piece is not None for row in fragments for piece in row):
+            if output.shape != (len(prefixes), self.capacity):
+                raise ValueError("Device candidate output must match the request count and final capacity.")
+            padding = getattr(self, "_candidate_padding", None)
+            if padding is None or padding.device != output.device or padding.dtype != output.dtype:
+                padding = self._candidate_padding = output.new_zeros(self.capacity)
+            pieces = []
+            for row, tokens in zip(fragments, results):
+                if len(tokens) > self.capacity:
+                    raise ValueError("Intermediate candidates exceed the derived final capacity.")
+                pieces.extend(row)
+                if len(tokens) < self.capacity:
+                    pieces.append(padding[: self.capacity - len(tokens)])
+            if pieces:
+                torch.cat(pieces, out=output.view(-1))
+            self.device_output_ready = True
         device = getattr(self.backend, "device", None)
         self.last_compute_stream = (
             torch.npu.current_stream() if trace and device is not None and device.type == "npu" else None
         )
         return results
 
-    def _refine(self, prefixes, primary_tokens, limits, req_ids):
+    def _refine(self, prefixes, primary_tokens, limits, req_ids, fragments=None):
         # Limits describe request/model context room only. Storage is derived
         # from the stop conditions and must never clip a completed round.
         token_threshold = getattr(self.config, "max_generated_tokens", None)
@@ -154,6 +176,8 @@ class IntermediatePipeline:
                 started = perf_counter()
             decisions = []
             decision_tensors = []
+            packed_device = None
+            draft_offsets = []
             decision_transfer_ms = 0.0
             for logits, lengths in self.backend.verify_batches(
                 contexts,
@@ -193,12 +217,14 @@ class IntermediatePipeline:
                     # One round transfer supplies both the acceptance decision
                     # and token identities needed for CPU cache/sequence state.
                     # There is no Secondary D2H followed by candidate H2D.
-                    packed = torch.cat((decision_output.reshape(-1), *round_drafts)).cpu().tolist()
+                    packed_device = torch.cat((decision_output.reshape(-1), *round_drafts))
+                    packed = packed_device.cpu().tolist()
                     decision_transfer_ms = (perf_counter() - transfer_started) * 1000 if trace else 0.0
                     decisions.extend([packed[i : i + 2] for i in range(0, 2 * len(active), 2)])
                     offset = 2 * len(active)
                     for row, i in enumerate(active):
                         size = len(round_drafts[row])
+                        draft_offsets.append(offset)
                         drafts[i] = packed[offset : offset + size]
                         round_drafts[row] = drafts[i]
                         offset += size
@@ -210,8 +236,20 @@ class IntermediatePipeline:
             host_started = perf_counter() if trace else 0.0
             continuing = []
             accepted_by_request = [0] * len(prefixes) if trace else None
-            for i, (length, replacement) in zip(active, decisions):
+            for row, (i, (length, replacement)) in enumerate(zip(active, decisions)):
+                before = len(accepted[i])
                 stopped, num_accepted = self._append_candidates(accepted[i], drafts[i], length, replacement, limits[i])
+                if fragments is not None:
+                    if packed_device is None:
+                        # Host-primary and compatible legacy backends retain
+                        # the existing publication path for the whole batch.
+                        fragments[i].append(None)
+                    else:
+                        start = draft_offsets[row]
+                        if num_accepted:
+                            fragments[i].append(packed_device[start : start + num_accepted])
+                        if len(accepted[i]) - before > num_accepted:
+                            fragments[i].append(packed_device[2 * row + 1 : 2 * row + 2])
                 if trace:
                     accepted_by_request[i] = num_accepted
                 if (

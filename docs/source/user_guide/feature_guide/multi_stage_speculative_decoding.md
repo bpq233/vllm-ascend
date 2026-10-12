@@ -160,7 +160,7 @@ FULL 的范围是实际启用模型的 forward（包含 attention），不是把
 
 中间 KV 跨轮、跨 Target 周期复用；驻留容量不足时仍按 LRU 淘汰。模型依赖链上的 verifier → drafter 顺序执行，各阶段内部按 batch 计算。
 
-Secondary 候选通过独立设备 tensor 保存，避免下一次 DFlash 图重放覆盖。下一轮 verifier 仅上传 CPU 已知的前缀/anchor token，候选后缀直接写入固定设备输入；长度、位置等 metadata 仍上传。验证后把小决策与候选 ID 合并回传一次，CPU 再更新中间缓存 token 记录和接受前缀。设备候选尚未回传时，不把用于组装长度的占位 ID 标记成有效 KV；中断或异常只留下已确认的缓存前缀。兼容的普通 `propose` 接口仍返回 CPU 列表，正式多级路径使用 `propose_device`。这减少 Secondary 单独的 D2H 同步及候选再次 H2D，没有取消 CPU 轮次控制或最终候选上传。
+Secondary 候选通过独立设备 tensor 保存，避免下一次 DFlash 图重放覆盖。下一轮 verifier 仅上传 CPU 已知的前缀/anchor token，候选后缀直接写入固定设备输入；长度、位置等 metadata 仍上传。验证后把小决策与候选 ID 合并回传一次，CPU 再更新中间缓存 token 记录和接受前缀。设备候选尚未回传时，不把用于组装长度的占位 ID 标记成有效 KV；中断或异常只留下已确认的缓存前缀。兼容的普通 `propose` 接口仍返回 CPU 列表，正式多级路径使用 `propose_device`。三模型和四模型路径均复用这些设备验收包发布最终候选，省去最终候选 H2D；CPU 轮次控制和决策 D2H 仍保留。
 
 稀疏图的冷前缀预热仍只在 padding 超过实际 query 的 8 倍时触发，使用已有较小图桶。多个请求的前缀块现在共同占用该桶的 token 预算，并受计算 batch 大小约束；不会为此新增捕获桶。预热不含最终 predictor 行，正式预测继续合批。CPU 回归中的两个短前缀用例由 3 次执行降为 2 次，含 padding 的 token 由 24 降为 16；该数字是该用例的调度工作量，不是硬件耗时或通用加速比。
 
@@ -170,17 +170,21 @@ Secondary 候选通过独立设备 tensor 保存，避免下一次 DFlash 图重
 
 决策结果只在后续微批次会覆盖它时复制；最后一个微批次直接消费图输出。通常单微批次每轮省去一次 decision clone，多微批次保留前面结果的独立存储。关闭 DEBUG 时跳过接受数列表分配。CPU 回归验证了流分配条件、结果覆盖安全和自动容量边界；这些是代码工作量变化，不是 NPU 加速比。
 
-CPU 接受结果处理使用长度裁剪、列表 EOS 查找和一次 `extend`，替代逐 token 的 Python append/判断；最后一轮不再构造未使用的下一轮活跃列表。EOS、修正/bonus、请求长度和 `max_generated_tokens` 的语义保持原样。决策 D2H、最终候选 pinned H2D 和同步调度契约仍存在，不将这项 CPU 调整宣称为整个间隔已消失。
+CPU 接受结果处理使用长度裁剪、列表 EOS 查找和一次 `extend`，替代逐 token 的 Python append/判断；最后一轮不再构造未使用的下一轮活跃列表。EOS、中间修正/bonus、请求长度和 `max_generated_tokens` 的语义保持原样。决策 D2H 和同步调度契约仍存在，不将这项 CPU 调整宣称为整个间隔已消失。
 
 中间 DFlash 现在通过 `IntermediateDFlashSpeculator.propose_precomputed` 复用现有输入准备、图分派及采样，只消费 verifier 已写入的 context KV。此前 proposal 会再次投影、归一化、旋转并写入末尾 context KV，还拷贝无用 hidden；FULL 路径在图管理器内外各构建一次 draft metadata。新入口跳过这些重复工作，命中中间缓存时也不再构建未使用的 verifier metadata 和 slot mapping。缓存失配仍执行 verifier 并更新 context KV；proposal 前仍截断有效前缀，防止把 DFlash query 写入的临时 KV 当成已验证 context。
+
+中间校验到 DFlash 的剩余重复准备也已缩短：全 context KV 命中时，`_prepare_cached_proposal` 单次上传 resident slot、最后一个 context 位置、anchor、长度及兼容的末尾 token 字段，复用固定的请求索引和单行 query 边界，不再调用通用 `_forward` 或覆写 verifier 输入缓冲区。原路径分别上传通用输入和 anchor，再做位置、token、anchor 的设备复制。block table 在 resident slot 顺序、存储对象和执行流不变时跳过重复 gather；重排、更换存储或换流会更新，失败不会留下有效缓存键。上下文失配保留原 verifier/图分派路径。KG `id=vllmascend_vllmascend_ops_triton_docs_v2_specdecode_preparedflashinputs_dflash_context_kv_precompute`，`source_file=inference-serving/vllm-ascend/vllm_ascend/ops/triton/docs/v2/spec_decode/prepare_dflash_inputs.md`，`score=0.935704`；只参考 context/anchor 语义，实际调用 ABI 以当前仓库的版本适配为准。
 
 中间验收复用重复形状的设备长度与索引；FULL decision graph 的长度未改变时不再分配 pinned 长度或重复 H2D，形状改变时继续使用独立 pinned 源。采样值每轮重新计算，不能缓存验收结果。
 
 下一次 Target 的 `prepare_inputs` 复用只读 `idx_mapping` 和 `cu_num_logits`，以名称、dtype、shape 和内容快照作为缓存键，最多保留 16 项。固定图输入 `query_start_loc` 仅在当前值、目标 tensor 对象和执行流均有效时跳过上传。dummy、重新 capture、KV 初始化或计算流切换会失效缓存。请求重排、槽位复用、候选长度或 padding 改变会更新对应字段；位置、实际序列长度及 token 每步照常准备，不缓存推理结果。两版真实 `prepare_inputs` 的 CPU 替身回归中，稳定的长/短混合候选与 FULL padding 均将这三项 metadata H2D 调用从每步 3 次降为 0 次；这不是 NPU 耗时或端到端加速比。
 
-最终候选发布使用可复用 pinned buffer，直接在 NumPy 视图填入 token 并清零 padding，省去每步 Python 补齐列表和 pinned tensor 重建。adapter 的 `_read_step` 阻塞 D2H 已完成当前流的前序任务，包括上轮该 buffer 的 H2D，之后才允许覆写；形状、dtype 或流改变则分配新源。最终候选 H2D 仍保留，CPU scheduler 仍消费实际候选列表。
+三模型和四模型的最终候选均直接从各轮已有的设备验收包取连续接受前缀和修正/bonus 的视图，再用一次 `torch.cat(..., out=...)` 写入 Target 候选输出并补零，不增加逐 token kernel 或跨流同步。验收包本来就在该轮 D2H 前构建，拥有独立存储；保留其视图可避免后续 DFlash/decision 图重放和 resident KV 淘汰覆盖旧候选。CPU 列表继续执行 EOS/长度裁剪并供 scheduler 使用，设备视图应用相同裁剪。兼容的 host draft 路径仍使用可复用 pinned buffer；adapter 的 `_read_step` 阻塞 D2H 完成上轮 H2D 后才允许覆写该源，形状、dtype 或流变化会分配新源。
 
-Target 在全部 intermediate rounds 完成后，通过下一次 scheduler step 执行。最后一轮中间校验之后还需要决策 D2H、CPU 接受/EOS/长度处理、候选上传、worker 输出与 scheduler 往返，以及下一轮 Target 输入准备。这些开销可以逐项缩短；完全消除 scheduler 往返需要多级投机的异步调度契约，包括乐观长度、有效候选长度和拒绝后 KV/slot 回退，不能仅切换流或提前调用 Target forward。上游 [异步投机调度方案](https://github.com/vllm-project/vllm-ascend/pull/7640) 使用 CPU 乐观状态并以设备状态修正，本实现仍保留同步调度。KG `id=vllmascend_docs_source_userguide_releasenotespart0004_zero_bubble_scheduling`，`source_file=inference-serving/vllm-ascend/docs/source/user_guide/release_notes-part0004.md`，通过 Cypher 直接定位，无 score。正常路径仍每组每轮一次决策 D2H。开启 DEBUG 的 Target 统计改为在当前计算流异步拷贝至独立 pinned 存储，等 adapter 已有的阻塞 D2H 完成后输出，不再额外阻塞 Primary/Intermediate 启动；仅启用最终接受策略而不启用中间 adapter 时保留同步统计路径。
+四模型的 Primary 草稿保留设备视图，随首次中间验收包回传 ID，`_read_step` 只读取正式历史和进度，不再先回传 Primary ID 再上传到中间 verifier。Primary 的模型调用、Target hidden conditioning、dummy/profile/capture 路径均保持原样；其输出直到下一次 Target cycle 才会被复用，当前首次校验的验收包在那之前已拥有独立存储。Primary 与 Secondary 的长度可以不同，partial prefill 仍不进入中间校验；没有 decision runner 的兼容后端保留原 CPU 路径。
+
+Target 在全部 intermediate rounds 完成后，通过下一次 scheduler step 执行。最后一轮中间校验之后还需要决策 D2H、CPU 接受/EOS/长度处理、设备候选组装（兼容 host 路径为候选上传）、worker 输出与 scheduler 往返，以及下一轮 Target 输入准备。这些开销可以逐项缩短；完全消除 scheduler 往返需要多级投机的异步调度契约，包括乐观长度、有效候选长度和拒绝后 KV/slot 回退，不能仅切换流或提前调用 Target forward。上游 [异步投机调度方案](https://github.com/vllm-project/vllm-ascend/pull/7640) 使用 CPU 乐观状态并以设备状态修正，本实现仍保留同步调度。KG `id=vllmascend_docs_source_userguide_releasenotespart0004_zero_bubble_scheduling`，`source_file=inference-serving/vllm-ascend/docs/source/user_guide/release_notes-part0004.md`，通过 Cypher 直接定位，无 score。正常路径仍每组每轮一次决策 D2H。开启 DEBUG 的 Target 统计改为在当前计算流异步拷贝至独立 pinned 存储，等 adapter 已有的阻塞 D2H 完成后输出，不再额外阻塞 Primary/Intermediate 启动；仅启用最终接受策略而不启用中间 adapter 时保留同步统计路径。
 
 Target 与中间 verifier 的主图都在调用时的当前计算流提交。时间线上的不同 kernel stream ID 还可能来自图捕获内部执行流，不能仅凭 ID 判断主机切换了计算流。专用 `update_stream` 则更新 attention 图任务并记录 `ExternalEvent`；图内等待该事件后执行 attention。现有顺序先提交 replay，再从更新流记录事件，将更新流直接合并为 replay 流会使等待依赖自身后续任务。官方接口还要求更新流与捕获流不同。保持更新流独立，主、中间模型仍复用同一条更新流。
 

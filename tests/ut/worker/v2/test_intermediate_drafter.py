@@ -237,3 +237,75 @@ def test_precomputed_cache_miss_keeps_baseline_graph_dispatch_and_refreshes_kv(b
     assert obj.model.call_args.kwargs["input_ids"].tolist() == [8]
     assert metadata.call_count == 2
     assert obj.cache.tokens[obj.cache.slots["a"]] == [1, 8]
+
+
+def test_cached_proposal_preserves_verifier_buffers_and_uses_one_upload(backend, monkeypatch):
+    obj, _, _ = backend
+    obj.drafter.propose_precomputed = Mock(return_value=torch.tensor([[9, 10]]))
+    list(obj.verify([[1, 2]], [[3, 4]], req_ids=["a"]))
+    ids, positions = obj.input_buffers.input_ids.clone(), obj.input_buffers.positions.clone()
+    obj._forward = Mock(side_effect=AssertionError("Cached proposal rebuilt verifier inputs"))
+    uploads = []
+    original_to = torch.Tensor.to
+
+    def record(tensor, *args, **kwargs):
+        if kwargs.get("non_blocking"):
+            uploads.append((tensor.dtype, tensor.numel()))
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", record)
+    monkeypatch.setattr(torch, "index_select", Mock(side_effect=AssertionError("Repeated block table gather")))
+    assert obj.propose([[1, 2, 3, 4, 16777217]], ["a"]) == [[9, 10]]
+    assert uploads == [(torch.uint8, 32)]
+    torch.testing.assert_close(obj.input_buffers.input_ids, ids)
+    torch.testing.assert_close(obj.input_buffers.positions, positions)
+    batch, anchors, *_ = obj.drafter.propose_precomputed.call_args.args
+    assert batch.positions.tolist() == [3] and anchors.tolist() == [16777217]
+    assert batch.seq_lens.tolist() == [4] and batch.query_start_loc.tolist() == [0, 1]
+    assert batch.logits_indices.dtype == torch.int64 and batch.idx_mapping.dtype == torch.int32
+    assert batch.positions.untyped_storage().data_ptr() == anchors.untyped_storage().data_ptr()
+
+
+def test_cache_table_updates_on_reorder_buffer_replacement_and_stream_change(backend, monkeypatch):
+    obj, _, _ = backend
+    original = torch.index_select
+    gather = Mock(wraps=original)
+    monkeypatch.setattr(torch, "index_select", gather)
+    index = torch.tensor([0, 1])
+    obj._load_cache_tables([0, 1], index)
+    obj._load_cache_tables([0, 1], index)
+    assert gather.call_count == 1
+    obj._load_cache_tables([1, 0], index.flip(0))
+    assert gather.call_count == 2
+    assert obj.block_tables.input_block_tables[0].tolist() == [[3, 4], [1, 2]]
+    obj.block_tables.input_block_tables[0] = torch.full_like(obj.block_tables.input_block_tables[0], -9)
+    obj._load_cache_tables([1, 0], index.flip(0))
+    assert gather.call_count == 3
+    assert obj.block_tables.input_block_tables[0].tolist() == [[3, 4], [1, 2]]
+    stream = [object()]
+    monkeypatch.setattr(torch, "npu", NS(current_stream=lambda: stream[0]), raising=False)
+    obj.device = NS(type="npu")
+    obj._load_cache_tables([1, 0], index.flip(0))
+    obj._load_cache_tables([1, 0], index.flip(0))
+    assert gather.call_count == 4
+    stream[0] = object()
+    obj._load_cache_tables([1, 0], index.flip(0))
+    assert gather.call_count == 5
+
+
+def test_failed_table_update_cannot_leave_a_valid_cache_key(backend, monkeypatch):
+    obj, _, _ = backend
+    original = torch.index_select
+    obj._load_cache_tables([0], torch.tensor([0]))
+
+    def fail(source, dim, indices, **kwargs):
+        original(source, dim, indices, **kwargs)
+        raise RuntimeError("table update failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "index_select", fail)
+        with pytest.raises(RuntimeError, match="table update failed"):
+            obj._load_cache_tables([1], torch.tensor([1]))
+    assert obj._cache_table_state is None
+    obj._load_cache_tables([0], torch.tensor([0]))
+    assert obj.block_tables.input_block_tables[0][0].tolist() == [1, 2]

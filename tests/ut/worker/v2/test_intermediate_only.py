@@ -134,6 +134,8 @@ def test_first_draft_is_from_4b_then_verify_extend_and_publish(standalone, backe
     assert torch.equal(history, committed)
     assert back.cache.tokens[back.cache.slots["a"]] == [1, 2, 3, 4, 5, 6, 7]
     assert obj.req_states.num_computed_tokens_cpu.tolist() == [2, 2]
+    assert obj.pipeline.device_output_ready
+    assert not hasattr(obj, "_host_candidates")  # No final candidate H2D.
     # Target rejects the candidate tail and commits its own replacement. The
     # next independent proposal must hydrate that new prefix, not the old draft.
     history[:, 3] = torch.tensor([9, 19])

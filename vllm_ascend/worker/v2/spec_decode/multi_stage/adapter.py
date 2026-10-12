@@ -127,7 +127,14 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
                 self.pipeline.backend.profile()
             output[:, : primary.shape[1]] = primary
             return output
-        lengths, prefixes, primary_tokens = self._read_step(input_batch, primary)
+        if getattr(self.pipeline.backend, "decision_runner", None) is not None:
+            # Primary owns its output until the next Target cycle; Secondary
+            # has separate buffers. Keep these views through the first round's
+            # existing decision packet rather than copying Primary to CPU now.
+            lengths, prefixes, _ = self._read_step(input_batch, primary[:, :0])
+            primary_tokens = list(primary.unbind(0))
+        else:
+            lengths, prefixes, primary_tokens = self._read_step(input_batch, primary)
         return self._refine_and_publish(input_batch, lengths, prefixes, primary_tokens, output)
 
     def _refine_and_publish(self, input_batch, lengths, prefixes, primary_tokens, output):
@@ -147,8 +154,23 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
             for index, length in zip(input_batch.idx_mapping_np, lengths)
         ]
         self.pipeline.backend.cache.retain(self.req_states.req_id_to_index)
-        self.candidates = self.pipeline.refine(prefixes, primary_tokens, limits, req_ids=list(input_batch.req_ids))
+        publish_device = getattr(self.pipeline.backend, "decision_runner", None) is not None and (
+            primary_tokens is None or all(isinstance(tokens, torch.Tensor) for tokens in primary_tokens)
+        )
+        self.candidates = self.pipeline.refine(
+            prefixes,
+            primary_tokens,
+            limits,
+            req_ids=list(input_batch.req_ids),
+            **({"output": output} if publish_device else {}),
+        )
         self.req_ids = list(input_batch.req_ids)
+        if publish_device and self.pipeline.device_output_ready:
+            refined_at = getattr(self.pipeline, "last_refine_finished_at", None)
+            self.proposal_timing = (
+                (refined_at, perf_counter(), self.pipeline.last_compute_stream) if refined_at is not None else None
+            )
+            return output
         # _read_step's blocking D2H has completed all earlier uploads on this
         # stream, including the previous use of this pinned source. Reuse it
         # without adding an event; a different stream/shape gets fresh storage.

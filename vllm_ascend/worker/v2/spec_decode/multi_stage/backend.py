@@ -496,7 +496,9 @@ class IntermediateBackend:
         self._proposal_temperature = torch.zeros(self.max_num_reqs, device=self.device)
         self._proposal_seeds = torch.zeros(self.max_num_reqs, device=self.device, dtype=torch.int64)
         self._request_offsets = torch.arange(self.max_num_reqs + 1, device=self.device, dtype=torch.int32)
+        self._proposal_logits_indices = torch.arange(self.max_num_reqs, device=self.device, dtype=torch.int64)
         self._query_padding = torch.zeros(self.max_num_tokens, device=self.device, dtype=torch.bool)
+        self._cache_table_state = None
 
     def _batches(self, sequences, req_ids=None, required_starts=None):
         start, num_tokens = 0, 0
@@ -528,6 +530,95 @@ class IntermediateBackend:
             offset = position - saved[1]
             rows.append(saved[3][offset : offset + 1])
         return torch.cat(rows, dim=0) if rows else None
+
+    def _load_cache_tables(self, cache_slots, cache_slots_gpu):
+        # Only this backend loads these graph-input tables. Repeated proposals
+        # for the same resident rows need no device gather. A different stream
+        # must enqueue its own update rather than trust another stream's work.
+        stream = torch.npu.current_stream() if self.device.type == "npu" else None
+        key = (
+            tuple(cache_slots),
+            stream,
+            tuple(
+                (id(table), table.data_ptr(), id(cached), cached.data_ptr())
+                for table, cached in zip(self.block_tables.input_block_tables, self.cache_block_tables)
+            ),
+        )
+        if getattr(self, "_cache_table_state", None) == key:
+            return
+        self._cache_table_state = None
+        for table, cached in zip(self.block_tables.input_block_tables, self.cache_block_tables):
+            torch.index_select(cached, 0, cache_slots_gpu, out=table[: len(cache_slots)])
+        self._cache_table_state = key
+
+    def _prepare_cached_proposal(self, sequences, req_ids, anchor_ids):
+        """Prepare one context marker per request without verifier inputs."""
+        if not all(
+            req_id in self.cache.slots and self.cache.query_start(req_id, sequence, len(sequence)) == len(sequence)
+            for req_id, sequence in zip(req_ids, sequences)
+        ):
+            return None
+        n = len(sequences)
+        lengths = np.array([len(sequence) for sequence in sequences], dtype=np.int32)
+        cache_slots, _ = self.cache.plan(req_ids, sequences, (lengths - 1).tolist())
+        # prepare_dflash_inputs reads only the last context position and anchor
+        # to construct its own fixed query. Keep the original batch contract,
+        # but do not overwrite verifier input buffers or upload query rows.
+        # Three int64 fields followed by two int32 fields: 32 bytes/request.
+        host = torch.empty(n * 32, dtype=torch.uint8, pin_memory=self.device.type != "cpu")
+        host[: n * 8].view(torch.int64).numpy()[:] = cache_slots
+        host[n * 8 : n * 16].view(torch.int64).numpy()[:] = lengths - 1
+        host[n * 16 : n * 24].view(torch.int64).numpy()[:] = anchor_ids
+        host[n * 24 : n * 28].view(torch.int32).numpy()[:] = lengths
+        host[n * 28 :].view(torch.int32).numpy()[:] = [sequence[-1] for sequence in sequences]
+        packed = host.to(self.device, non_blocking=True)
+        self._load_cache_tables(cache_slots, packed[: n * 8].view(torch.int64))
+        positions = packed[n * 8 : n * 16].view(torch.int64)
+        anchors = packed[n * 16 : n * 24].view(torch.int64)
+        seq_lens = packed[n * 24 : n * 28].view(torch.int32)
+        starts = np.arange(n + 1, dtype=np.int32)
+        computed = lengths - 1
+        prefilling = computed == 0
+        batch = AscendInputBatch(
+            req_ids=list(req_ids),
+            num_reqs=n,
+            idx_mapping=self._request_offsets[:n],
+            idx_mapping_np=starts[:-1],
+            expanded_idx_mapping=self._request_offsets[:n],
+            expanded_local_pos=self._proposal_zeros[:n],
+            num_scheduled_tokens=np.ones(n, dtype=np.int32),
+            num_tokens=n,
+            num_tokens_after_padding=n,
+            num_draft_tokens=0,
+            num_draft_tokens_per_req=None,
+            query_start_loc=self._request_offsets[: n + 1],
+            query_start_loc_np=starts,
+            seq_lens=seq_lens,
+            seq_lens_cpu_upper_bound=torch.from_numpy(lengths),
+            dcp_local_seq_lens=None,
+            num_computed_tokens_np=computed,
+            prefill_len_np=lengths,
+            num_computed_prefill_tokens_np=computed,
+            is_prefilling_np=prefilling,
+            max_seq_len_np=None,
+            input_ids=packed[n * 28 :].view(torch.int32),
+            positions=positions,
+            is_padding=self._query_padding[:n],
+            logits_indices=self._proposal_logits_indices[:n],
+            cu_num_logits=self._request_offsets[: n + 1],
+            cu_num_logits_np=starts,
+            has_structured_output_reqs=False,
+            prompt_lens=None,
+            seq_lens_np=lengths,
+            attn_state=AscendAttentionState.PrefillNoCache
+            if np.all(prefilling)
+            else AscendAttentionState.ChunkedPrefill,
+            **({} if vllm_version_is("0.27.1") else {"has_prefill": bool(np.any(prefilling))}),
+        )
+        self.cache.commit(cache_slots, sequences)
+        self.reused_hidden_tokens += n
+        self.reused_tokens += int(lengths.sum())
+        return batch, anchors
 
     def _forward(
         self, sequences, req_ids=None, required_starts=None, reuse_context=False, retain_hidden=True, draft_tokens=None
@@ -621,8 +712,7 @@ class IntermediateBackend:
         cache_slots_gpu, token_rows, positions_gpu, logits_indices, seq_lens, starts_gpu, ids_gpu = (
             field.view(dtype) for field, dtype in zip(device_fields, dtypes)
         )
-        for table, cached in zip(self.block_tables.input_block_tables, self.cache_block_tables):
-            torch.index_select(cached, 0, cache_slots_gpu, out=table[:n])
+        self._load_cache_tables(cache_slots, cache_slots_gpu)
         positions = self.input_buffers.positions[:total]
         positions.copy_(positions_gpu)
         ids = self.input_buffers.input_ids[:total]
@@ -916,16 +1006,21 @@ class IntermediateBackend:
             for offset, rows in self._batches([prefixes[i][:-1] for i in active], active_ids):
                 n = len(rows)
                 batch_ids = active_ids[offset : offset + n]
-                batch, metadata, slots, hidden, aux = self._forward(rows, batch_ids, reuse_context=True)
-                anchors = self._proposal_anchors
-                # Fresh pinned host storage avoids an asynchronous H2D reuse
-                # race while keeping the captured device pointer stable.
-                host_anchors = torch.tensor(
-                    [prefixes[i][-1] for i in active[offset : offset + n]],
-                    dtype=torch.int64,
-                    pin_memory=self.device.type != "cpu",
+                anchor_ids = [prefixes[i][-1] for i in active[offset : offset + n]]
+                cached = (
+                    self._prepare_cached_proposal(rows, batch_ids, anchor_ids)
+                    if hasattr(self.drafter, "propose_precomputed")
+                    else None
                 )
-                anchors[:n].copy_(host_anchors, non_blocking=True)
+                if cached is not None:
+                    batch, anchors = cached
+                else:
+                    batch, metadata, slots, hidden, aux = self._forward(rows, batch_ids, reuse_context=True)
+                    anchors = self._proposal_anchors
+                    # Fresh host storage is required while an earlier H2D may
+                    # still be reading its source on this stream.
+                    host_anchors = torch.tensor(anchor_ids, dtype=torch.int64, pin_memory=self.device.type != "cpu")
+                    anchors[:n].copy_(host_anchors, non_blocking=True)
                 if hasattr(self.drafter, "propose_precomputed"):
                     tokens = self.drafter.propose_precomputed(
                         batch,

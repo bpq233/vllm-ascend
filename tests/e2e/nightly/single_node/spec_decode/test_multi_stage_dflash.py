@@ -56,6 +56,8 @@ def _candidate_probe(worker, install=False):
         "target_aux_hidden_states": runner.use_aux_hidden_state_outputs,
         "target_draft_model_present": runner.get_draft_model() is not None,
         "emit_target_bonus_token": runner.rejection_sampler.emit_bonus_token,
+        "device_candidate_publish": getattr(pipeline, "device_output_ready", False),
+        "host_candidate_buffer": hasattr(runner.speculator, "_host_candidates"),
     }
 
 
@@ -373,6 +375,7 @@ def test_multi_stage_dflash(method, use_primary_drafter, long_candidates, graph_
         # must not repeat the projection/cache update, including in eager mode.
         assert all(row["secondary_precomputed_calls"] > 0 for row in candidates)
         assert all(row["context_kv_tokens"] == row["verifier_tokens"] > 0 for row in candidates)
+        assert all(row["device_candidate_publish"] and not row["host_candidate_buffer"] for row in candidates)
         if long_candidates:
             assert all(row["largest_candidate"] == 20 for row in candidates)
         assert [len(row) for row in tokens] == [p.max_tokens for p in params]
