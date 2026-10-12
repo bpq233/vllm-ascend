@@ -37,14 +37,14 @@ class FinalVerificationSampler(RejectionSampler):
                 started_at = perf_counter()
                 logger.debug(
                     "multi_stage_target_handoff intermediate_to_target_ms=%.3f candidate_publish_ms=%.3f "
-                    "scheduler_handoff_ms=%.3f timing=host_wall intermediate_compute_stream=%s "
-                    "target_compute_stream=%s attention_update_stream=%s",
+                    "scheduler_handoff_ms=%.3f timing=host_wall intermediate_stream_wrapper_id=%s "
+                    "target_stream_wrapper_id=%s update_stream_wrapper_id=%s",
                     (started_at - refined_at) * 1000,
                     (published_at - refined_at) * 1000,
                     (started_at - published_at) * 1000,
-                    intermediate_stream,
-                    torch.npu.current_stream(),
-                    update_stream,
+                    id(intermediate_stream),
+                    id(torch.npu.current_stream()),
+                    id(update_stream),
                 )
             self.verification_path = "prefill" if max(scheduler_output.num_scheduled_tokens.values()) > 16 else "decode"
             if self.forward_events is None:

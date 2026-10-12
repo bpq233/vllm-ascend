@@ -287,7 +287,7 @@ class TestFinalVerificationSampler(unittest.TestCase):
             self.assertEqual(verifier.verification_path, "prefill")
             for actual, expected in zip(debug.call_args.args[1:4], (25, 5, 20)):
                 self.assertAlmostEqual(actual, expected)
-            self.assertEqual(debug.call_args.args[4:], (stream, stream, update_stream))
+            self.assertEqual(debug.call_args.args[4:], (id(stream), id(stream), id(update_stream)))
             npu.Event.assert_not_called()
             verifier.forward_events[0].record.assert_called_once()
             debug.reset_mock()

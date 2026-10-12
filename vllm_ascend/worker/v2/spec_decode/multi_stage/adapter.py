@@ -11,6 +11,7 @@ from vllm_ascend.worker.v2.spec_decode.dflash.speculator import AscendDFlashSpec
 from vllm_ascend.worker.v2.spec_decode.multi_stage.backend import IntermediateBackend
 from vllm_ascend.worker.v2.spec_decode.multi_stage.config import IntermediateConfig, primary_draft_width
 from vllm_ascend.worker.v2.spec_decode.multi_stage.pipeline import IntermediatePipeline
+from vllm_ascend.worker.v2.spec_decode.multi_stage.step_packet import pack_step
 
 logger = logging.getLogger(__name__)
 
@@ -37,20 +38,27 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
 
     def _read_step(self, input_batch, primary):
         """One bounded D2H for warm requests; read full history only on a miss."""
+        trace = logger.isEnabledFor(logging.DEBUG)
+        started = perf_counter() if trace else 0.0
         histories = getattr(self, "_host_histories", {})
         live = self.req_states.req_id_to_index
         histories = {key: value for key, value in histories.items() if key in live}
-        indices = input_batch.idx_mapping
-        lengths_gpu = self.req_states.total_len.gpu[indices]
-        computed_gpu = self.req_states.num_computed_tokens.gpu[indices]
         source = self.req_states.all_token_ids.gpu
         width = min(self.final_capacity + 1, source.shape[1])
-        offsets = getattr(self, "_history_offsets", None)
-        if offsets is None or offsets.numel() != width:
-            offsets = self._history_offsets = torch.arange(width, device=primary.device)
-        positions = (lengths_gpu[:, None] - width + offsets).clamp(min=0)
-        tails = source[indices[:, None], positions.long()]
-        packed_cpu = torch.cat((lengths_gpu[:, None], computed_gpu[:, None], primary, tails), dim=1).cpu()
+        packet = self._step_packet = pack_step(
+            self.req_states, input_batch, primary, width, out=getattr(self, "_step_packet", None)
+        )
+        packed_cpu = getattr(self, "_host_step_packet", None)
+        if packed_cpu is None or packed_cpu.shape != packet.shape:
+            packed_cpu = self._host_step_packet = torch.empty(
+                packet.shape, dtype=packet.dtype, pin_memory=self.device.type != "cpu"
+            )
+        # One bounded blocking copy remains: the CPU controller must see the
+        # postprocessed Target result. Reuse pinned storage and fuse the many
+        # device index/arithmetic/cat launches before this boundary.
+        packed_at = perf_counter() if trace else 0.0
+        packed_cpu.copy_(packet, non_blocking=False)
+        copied_at = perf_counter() if trace else 0.0
         final_verifier = getattr(self, "final_verifier", None)
         if final_verifier is not None:
             final_verifier.flush_trace()
@@ -84,6 +92,17 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
             prefixes.append(prefix)
             drafts.append(row[2 : 2 + primary.shape[1]])
         self._host_histories = histories
+        if trace:
+            logger.debug(
+                "multi_stage_target_to_draft step_pack_ms=%.3f step_d2h_ms=%.3f history_update_ms=%.3f "
+                "cold_requests=%d packet_bytes=%d timing=host_wall request_ids=%s",
+                (packed_at - started) * 1000,
+                (copied_at - packed_at) * 1000,
+                (perf_counter() - copied_at) * 1000,
+                len(missing),
+                packet.numel() * packet.element_size(),
+                input_batch.req_ids,
+            )
         return lengths, prefixes, drafts
 
     def initialize_intermediate(self, runner):
@@ -147,12 +166,25 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
             for index, length in zip(input_batch.idx_mapping_np, lengths)
         ]
         self.pipeline.backend.cache.retain(self.req_states.req_id_to_index)
-        self.candidates = self.pipeline.refine(prefixes, primary_tokens, limits, req_ids=list(input_batch.req_ids))
+        device_publish = primary_tokens is None and getattr(self.pipeline.backend, "decision_runner", None) is not None
+        self.candidates = self.pipeline.refine(
+            prefixes,
+            primary_tokens,
+            limits,
+            req_ids=list(input_batch.req_ids),
+            **({"device_output": output} if device_publish else {}),
+        )
         self.req_ids = list(input_batch.req_ids)
         # _read_step's blocking D2H has completed all earlier uploads on this
         # stream, including the previous use of this pinned source. Reuse it
         # without adding an event; a different stream/shape gets fresh storage.
         # Padding is only storage; the handler publishes actual row lengths.
+        if device_publish:
+            refined_at = getattr(self.pipeline, "last_refine_finished_at", None)
+            self.proposal_timing = (
+                (refined_at, perf_counter(), self.pipeline.last_compute_stream) if refined_at is not None else None
+            )
+            return output
         stream = torch.npu.current_stream() if self.device.type == "npu" else None
         host_output = getattr(self, "_host_candidates", None)
         if (

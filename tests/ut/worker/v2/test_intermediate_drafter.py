@@ -176,7 +176,8 @@ def test_backend_cached_fast_proposal_skips_verifier_metadata_and_preserves_posi
     assert obj.model.call_count == 1
     batch, anchors, ones, zeros, temperature, seeds = obj.drafter.propose_precomputed.call_args.args
     assert batch.req_ids == ["b", "a"] and batch.num_reqs == 2
-    assert batch.input_ids.tolist() == [8, 2]
+    # Precomputed preparation does not read verifier input IDs; no input copy.
+    assert batch.input_ids.data_ptr() == obj.input_buffers.input_ids.data_ptr()
     assert batch.positions.tolist() == [1, 1]
     assert batch.query_start_loc.tolist() == [0, 1, 2]
     assert batch.seq_lens.tolist() == [2, 2]
@@ -204,3 +205,27 @@ def test_backend_fast_entry_refreshes_context_after_prefix_mismatch(backend):
     assert obj.cache.tokens[obj.cache.slots["a"]] == [1, 9]
     obj.drafter.propose_precomputed.assert_called_once()
     obj.drafter.propose.assert_not_called()
+
+
+def test_precomputed_kv_hit_does_not_require_predictor_hidden_and_skips_repeated_table_copy(backend, monkeypatch):
+    obj, metadata, _ = backend
+    obj.drafter.propose_precomputed = Mock(return_value=torch.tensor([[10, 11]]))
+    list(obj.verify([[1, 2]], [[3, 4]], req_ids=["a"]))
+    # Only KV is needed, even when Target rejects back before the last round's
+    # predictor range. No stored hidden clone should have been made.
+    assert obj._context_rows[obj.cache.slots["a"]] is None
+    before = obj.model.call_count
+    metadata.reset_mock()
+    obj.drafter.model.precompute_and_store_context_kv.reset_mock()
+    select = Mock(wraps=torch.index_select)
+    monkeypatch.setattr(torch, "index_select", select)
+    assert obj.propose([[1, 9]], ["a"]) == [[10, 11]]
+    assert obj.model.call_count == before
+    assert obj.precomputed_context_hits == 1
+    assert obj.cache.tokens[obj.cache.slots["a"]] == [1]
+    assert obj.drafter.propose_precomputed.call_args.args[0].positions.tolist() == [0]
+    assert obj.propose([[1, 8]], ["a"]) == [[10, 11]]
+    assert obj.precomputed_context_hits == 2
+    select.assert_not_called()
+    metadata.assert_not_called()
+    obj.drafter.model.precompute_and_store_context_kv.assert_not_called()

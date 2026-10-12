@@ -7,6 +7,7 @@ from time import perf_counter
 import torch
 
 from vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance import AcceptancePolicy
+from vllm_ascend.worker.v2.spec_decode.multi_stage.round_packet import pack_round
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +68,12 @@ class IntermediatePipeline:
         return torch.stack((stop, replacement), dim=-1).cpu().tolist()
 
     @torch.inference_mode()
-    def refine(self, prefixes, primary_tokens, limits, req_ids=None):
+    def refine(self, prefixes, primary_tokens, limits, req_ids=None, device_output=None):
         req_ids = req_ids if req_ids is not None else [str(i) for i in range(len(prefixes))]
         results = [[] for _ in prefixes]
+        if device_output is not None:
+            device_output.zero_()
+            output_counts = torch.empty(len(prefixes), dtype=torch.int32, device=device_output.device)
         # Keep a group resident throughout its rounds. Round-major execution
         # across more requests than cache slots would evict every useful prefix.
         width = getattr(self.backend, "max_num_reqs", len(prefixes)) or 1
@@ -82,6 +86,11 @@ class IntermediatePipeline:
                 [primary_tokens[i] for i in group] if primary_tokens is not None else None,
                 [limits[i] for i in group],
                 [req_ids[i] for i in group],
+                **(
+                    {"device_publication": (device_output, output_counts, limits, group)}
+                    if device_output is not None
+                    else {}
+                ),
             )
             for i, tokens in zip(group, refined):
                 results[i] = tokens
@@ -93,7 +102,7 @@ class IntermediatePipeline:
         )
         return results
 
-    def _refine(self, prefixes, primary_tokens, limits, req_ids):
+    def _refine(self, prefixes, primary_tokens, limits, req_ids, device_publication=None):
         # Limits describe request/model context room only. Storage is derived
         # from the stop conditions and must never clip a completed round.
         token_threshold = getattr(self.config, "max_generated_tokens", None)
@@ -111,14 +120,16 @@ class IntermediatePipeline:
                     else self.backend.propose
                 )
                 initial_started = perf_counter() if trace else 0.0
+                hits_before = getattr(self.backend, "precomputed_context_hits", 0) if trace else 0
                 initial = propose([prefixes[i] for i in active], req_ids=[req_ids[i] for i in active])
                 if trace:
                     logger.debug(
                         "multi_stage_initial_draft initial_draft_ms=%.3f "
-                        "timing=host_wall_with_context request_ids=%s proposed=%d",
+                        "timing=host_wall_with_context request_ids=%s proposed=%d precomputed_context_hits=%d",
                         (perf_counter() - initial_started) * 1000,
                         [req_ids[i] for i in active],
                         sum(map(len, initial)),
+                        getattr(self.backend, "precomputed_context_hits", 0) - hits_before,
                     )
                 for i, tokens in zip(active, initial):
                     drafts[i] = tokens[: limits[i]]
@@ -180,7 +191,21 @@ class IntermediatePipeline:
                     # One round transfer supplies both the acceptance decision
                     # and token identities needed for CPU cache/sequence state.
                     # There is no Secondary D2H followed by candidate H2D.
-                    packed = torch.cat((decision_output.reshape(-1), *round_drafts)).cpu().tolist()
+                    if device_publication is not None:
+                        output, output_counts, output_limits, group = device_publication
+                        packet = pack_round(
+                            decision_output,
+                            round_drafts,
+                            output,
+                            output_counts,
+                            output_limits,
+                            [group[i] for i in active],
+                            sorted(eos for eos in self.eos_ids if eos is not None),
+                            initialize=round_id == 0,
+                        )
+                    else:
+                        packet = torch.cat((decision_output.reshape(-1), *round_drafts))
+                    packed = packet.cpu().tolist()
                     decision_transfer_ms = (perf_counter() - transfer_started) * 1000 if trace else 0.0
                     decisions.extend([packed[i : i + 2] for i in range(0, 2 * len(active), 2)])
                     offset = 2 * len(active)

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
+import ast
 import importlib.util
 import sys
 from contextlib import contextmanager, nullcontext
@@ -22,6 +23,11 @@ def modules(monkeypatch):
         return module
 
     load("vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance", "acceptance.py")
+    packet = ast.parse((root / "round_packet.py").read_text(encoding="utf-8"))
+    packet.body = [node for node in packet.body if isinstance(node, ast.FunctionDef) and node.name == "pack_round"]
+    packet_module = NS(torch=torch)
+    exec(compile(packet, "round_packet.py", "exec"), vars(packet_module))
+    monkeypatch.setitem(sys.modules, "vllm_ascend.worker.v2.spec_decode.multi_stage.round_packet", packet_module)
     config = load("_intermediate_test_config", "config.py")
     pipeline = load("_intermediate_test_pipeline", "pipeline.py")
     return config, pipeline.IntermediatePipeline

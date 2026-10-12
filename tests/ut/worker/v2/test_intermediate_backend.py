@@ -3,10 +3,12 @@
 """Exercise packed inputs and lifecycle with CPU stand-ins for NPU kernels."""
 
 import ast
+import logging
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from enum import Enum
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
@@ -18,6 +20,13 @@ SOURCE = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decod
 
 
 def load_class(filename, name, namespace):
+    if filename == "adapter.py":
+        namespace.setdefault("logger", logging.getLogger("multi_stage_test"))
+        namespace.setdefault("logging", logging)
+        namespace.setdefault("perf_counter", perf_counter)
+        helpers = ast.parse((SOURCE / "step_packet.py").read_text(encoding="utf-8"))
+        helpers.body = [node for node in helpers.body if isinstance(node, ast.FunctionDef) and node.name == "pack_step"]
+        exec(compile(helpers, "step_packet.py", "exec"), namespace)
     tree = ast.parse((SOURCE / filename).read_text(encoding="utf-8"))
     tree.body = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name]
     exec(compile(tree, filename, "exec"), namespace)
@@ -401,6 +410,7 @@ def test_host_history_delta_reorder_growth_and_slot_reuse():
     cls = load_class("adapter.py", "MultiStageDFlashSpeculator", dict(torch=torch, AscendDFlashSpeculator=object))
     obj = cls.__new__(cls)
     obj.final_capacity = 2
+    obj.device = torch.device("cpu")
     history = torch.arange(24).reshape(2, 12)
     lengths = torch.tensor([6, 4])
     obj.req_states = NS(
@@ -410,7 +420,7 @@ def test_host_history_delta_reorder_growth_and_slot_reuse():
         all_token_ids=NS(gpu=history),
         req_id_to_index={"a": 0, "b": 1},
     )
-    batch = NS(idx_mapping=torch.tensor([0, 1]), idx_mapping_np=np.array([0, 1]), req_ids=["a", "b"])
+    batch = NS(num_reqs=2, idx_mapping=torch.tensor([0, 1]), idx_mapping_np=np.array([0, 1]), req_ids=["a", "b"])
     drafts = torch.tensor([[7, 8], [9, 10]])
     assert obj._read_step(batch, drafts) == ([6, 4], [list(range(6)), list(range(12, 16))], drafts.tolist())
     assert obj.req_states.num_computed_tokens_cpu.tolist() == [5, 3]

@@ -205,6 +205,7 @@ class IntermediateBackend:
         self.executed_tokens = 0
         self.reused_tokens = 0
         self.reused_hidden_tokens = 0
+        self.precomputed_context_hits = 0
         self._context_rows = [None] * self.cache_capacity
         options = (parent_config.additional_config or {}).get("multi_stage_speculative", {})
         self.decode_query_len = (
@@ -497,6 +498,7 @@ class IntermediateBackend:
         self._proposal_seeds = torch.zeros(self.max_num_reqs, device=self.device, dtype=torch.int64)
         self._request_offsets = torch.arange(self.max_num_reqs + 1, device=self.device, dtype=torch.int32)
         self._query_padding = torch.zeros(self.max_num_tokens, device=self.device, dtype=torch.bool)
+        self._block_table_slots = None
 
     def _batches(self, sequences, req_ids=None, required_starts=None):
         start, num_tokens = 0, 0
@@ -528,6 +530,85 @@ class IntermediateBackend:
             offset = position - saved[1]
             rows.append(saved[3][offset : offset + 1])
         return torch.cat(rows, dim=0) if rows else None
+
+    def _precomputed_context_batch(self, sequences, req_ids, anchors):
+        """Prepare only DFlash query inputs when BOTH context KV caches are valid.
+
+        The precomputed proposer never reads verifier hidden/input IDs. Requiring
+        a retained predictor hidden row here causes needless verifier work when
+        Target rejects back to an earlier, otherwise fully cached prefix.
+        """
+        if not hasattr(self.drafter, "propose_precomputed"):
+            return None
+        if len(req_ids) != len(sequences) or len(set(req_ids)) != len(req_ids):
+            raise ValueError("Intermediate cache needs distinct request IDs within its capacity.")
+        slots = []
+        for req_id, sequence in zip(req_ids, sequences):
+            slot = self.cache.slots.get(req_id)
+            if slot is None or self.cache.query_start(req_id, sequence, len(sequence)) != len(sequence):
+                return None
+            slots.append(slot)
+        n = len(sequences)
+        lengths = np.array([len(s) for s in sequences], dtype=np.int32)
+        # One small upload covers only slot IDs, last context positions and
+        # anchors. Its fresh pinned source stays owned by the queued copy.
+        host = torch.tensor(
+            [slots, (lengths - 1).tolist(), anchors, lengths.tolist()],
+            dtype=torch.int64,
+            pin_memory=self.device.type != "cpu",
+        )
+        slots_gpu, positions, anchors_gpu, seq_lens = host.to(self.device, non_blocking=True).unbind(0)
+        slot_order = tuple(slots)
+        if getattr(self, "_block_table_slots", None) != slot_order:
+            for table, cached in zip(self.block_tables.input_block_tables, self.cache_block_tables):
+                torch.index_select(cached, 0, slots_gpu, out=table[:n])
+            self._block_table_slots = slot_order
+        for req_id, slot, sequence in zip(req_ids, slots, sequences):
+            # DFlash query KV may overwrite the unused speculative suffix.
+            # Retain every validated context row; no predictor recomputation.
+            del self.cache.tokens[slot][len(sequence) :]
+            self.cache.slots.move_to_end(req_id)
+        mapping = self._request_offsets[:n]
+        offsets_np = np.arange(n + 1, dtype=np.int32)
+        computed = lengths - 1
+        batch = AscendInputBatch(
+            req_ids=req_ids,
+            num_reqs=n,
+            num_reqs_after_padding=n,
+            idx_mapping=mapping,
+            idx_mapping_np=offsets_np[:-1],
+            expanded_idx_mapping=mapping,
+            expanded_local_pos=self._proposal_zeros[:n],
+            num_scheduled_tokens=np.ones(n, dtype=np.int32),
+            num_tokens=n,
+            num_tokens_after_padding=n,
+            num_draft_tokens=0,
+            num_draft_tokens_per_req=None,
+            query_start_loc=self._request_offsets[: n + 1],
+            query_start_loc_np=offsets_np,
+            seq_lens=seq_lens,
+            seq_lens_cpu_upper_bound=torch.from_numpy(lengths),
+            dcp_local_seq_lens=None,
+            num_computed_tokens_np=computed,
+            prefill_len_np=lengths,
+            num_computed_prefill_tokens_np=computed,
+            is_prefilling_np=computed == 0,
+            max_seq_len_np=None,
+            input_ids=self.input_buffers.input_ids[:n],  # Not consumed by the precomputed proposer.
+            positions=positions,
+            is_padding=self._query_padding[:n],
+            logits_indices=mapping,
+            cu_num_logits=self._request_offsets[: n + 1],
+            cu_num_logits_np=offsets_np,
+            has_structured_output_reqs=False,
+            prompt_lens=None,
+            seq_lens_np=lengths,
+            attn_state=AscendAttentionState.ChunkedPrefill,
+            **({} if vllm_version_is("0.27.1") else {"has_prefill": False}),
+        )
+        self.reused_tokens += int(lengths.sum())
+        self.precomputed_context_hits = getattr(self, "precomputed_context_hits", 0) + n
+        return batch, anchors_gpu
 
     def _forward(
         self, sequences, req_ids=None, required_starts=None, reuse_context=False, retain_hidden=True, draft_tokens=None
@@ -609,6 +690,7 @@ class IntermediateBackend:
         )
         for table, cached in zip(self.block_tables.input_block_tables, self.cache_block_tables):
             torch.index_select(cached, 0, cache_slots_gpu, out=table[:n])
+        self._block_table_slots = tuple(cache_slots)
         positions = self.input_buffers.positions[:total]
         positions.copy_(positions_gpu)
         ids = self.input_buffers.input_ids[:total]
@@ -767,9 +849,9 @@ class IntermediateBackend:
         # Device drafts are committed only after the pipeline's decision D2H
         # supplies their actual IDs. Failure leaves the old valid prefix only.
         for row, (req_id, slot, sequence, required) in enumerate(zip(req_ids, cache_slots, sequences, required_starts)):
-            if not retain_hidden:
-                # The last verification round has no following secondary
-                # proposal. Keep KV, but do not copy unused hidden activations.
+            if not retain_hidden or hasattr(self.drafter, "propose_precomputed"):
+                # Precomputed proposals consume context KV, never hidden rows.
+                # The fallback also drops rows with no following consumer.
                 self._context_rows[slot] = None
                 continue
             # Only retain prediction rows, never the full prompt activations.
@@ -902,16 +984,15 @@ class IntermediateBackend:
             for offset, rows in self._batches([prefixes[i][:-1] for i in active], active_ids):
                 n = len(rows)
                 batch_ids = active_ids[offset : offset + n]
-                batch, metadata, slots, hidden, aux = self._forward(rows, batch_ids, reuse_context=True)
-                anchors = self._proposal_anchors
-                # Fresh pinned host storage avoids an asynchronous H2D reuse
-                # race while keeping the captured device pointer stable.
-                host_anchors = torch.tensor(
-                    [prefixes[i][-1] for i in active[offset : offset + n]],
-                    dtype=torch.int64,
-                    pin_memory=self.device.type != "cpu",
-                )
-                anchors[:n].copy_(host_anchors, non_blocking=True)
+                anchor_ids = [prefixes[i][-1] for i in active[offset : offset + n]]
+                precomputed = self._precomputed_context_batch(rows, batch_ids, anchor_ids)
+                if precomputed is not None:
+                    batch, anchors = precomputed
+                else:
+                    batch, metadata, slots, hidden, aux = self._forward(rows, batch_ids, reuse_context=True)
+                    anchors = self._proposal_anchors
+                    host_anchors = torch.tensor(anchor_ids, dtype=torch.int64, pin_memory=self.device.type != "cpu")
+                    anchors[:n].copy_(host_anchors, non_blocking=True)
                 if hasattr(self.drafter, "propose_precomputed"):
                     tokens = self.drafter.propose_precomputed(
                         batch,
