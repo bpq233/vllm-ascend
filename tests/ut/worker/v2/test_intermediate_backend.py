@@ -46,6 +46,13 @@ def backend():
         }
     )
     rope = NS(update_cos_sin=Mock(), _cos=object())
+
+    def input_batch(*, req_ids, num_reqs, num_reqs_after_padding, **kwargs):
+        # This is required by the upstream constructor, even for the cached
+        # DFlash path where the verifier never runs. A permissive namespace
+        # previously concealed a missing argument until NPU worker startup.
+        return NS(req_ids=req_ids, num_reqs=num_reqs, num_reqs_after_padding=num_reqs_after_padding, **kwargs)
+
     namespace = dict(
         torch=torch,
         np=np,
@@ -54,7 +61,7 @@ def backend():
         vllm_version_is=lambda version: False,
         set_current_vllm_config=lambda *a: nullcontext(),
         set_forward_context=lambda *a, **kw: nullcontext(),
-        AscendInputBatch=NS,
+        AscendInputBatch=input_batch,
         AscendAttentionState=NS(PrefillNoCache="prefill", ChunkedPrefill="extend"),
         CUDAGraphMode=GraphMode,
         BatchDescriptor=lambda n: NS(num_tokens=n),

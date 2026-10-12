@@ -582,6 +582,7 @@ class IntermediateBackend:
         batch = AscendInputBatch(
             req_ids=list(req_ids),
             num_reqs=n,
+            num_reqs_after_padding=n,
             idx_mapping=self._request_offsets[:n],
             idx_mapping_np=starts[:-1],
             expanded_idx_mapping=self._request_offsets[:n],

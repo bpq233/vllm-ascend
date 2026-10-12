@@ -266,6 +266,24 @@ def test_cached_proposal_preserves_verifier_buffers_and_uses_one_upload(backend,
     assert batch.positions.untyped_storage().data_ptr() == anchors.untyped_storage().data_ptr()
 
 
+@pytest.mark.parametrize("path", ["cold", "cached", "mismatch"])
+@pytest.mark.parametrize("num_reqs", [1, 2])
+def test_proposal_batch_supplies_required_padded_request_count(backend, path, num_reqs):
+    obj, _, _ = backend
+    obj.drafter.propose_precomputed = Mock(return_value=torch.tensor([[9, 10], [19, 20]]))
+    ids = ["a", "b"][:num_reqs]
+    prefixes = [[1, 2, 3], [11, 12, 13]][:num_reqs]
+    if path != "cold":
+        list(obj.verify([[1, 2], [11, 12]][:num_reqs], [[3], [13]][:num_reqs], req_ids=ids))
+        prefixes = [[1, 2, 3, 4], [11, 12, 13, 14]][:num_reqs]
+        if path == "mismatch":
+            prefixes[0][1] = 8
+    obj.propose(prefixes, ids)
+    batch = obj.drafter.propose_precomputed.call_args.args[0]
+    assert batch.num_reqs_after_padding == batch.num_reqs == num_reqs
+    assert batch.num_tokens_after_padding == batch.num_tokens
+
+
 def test_cache_table_updates_on_reorder_buffer_replacement_and_stream_change(backend, monkeypatch):
     obj, _, _ = backend
     original = torch.index_select
