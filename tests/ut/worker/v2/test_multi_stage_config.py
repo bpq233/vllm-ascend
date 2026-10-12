@@ -68,8 +68,8 @@ def test_inactive_pipeline_leaves_upstream_capacity_alone(modules, options):
     assert "primary_num_speculative_tokens" not in options
 
 
-@pytest.mark.parametrize("active", [False, True])
-def test_runner_disables_target_bonus_for_active_intermediate(modules, monkeypatch, active):
+@pytest.mark.parametrize("chain,emit_bonus", [("ordinary", True), ("three", False), ("four", True)])
+def test_runner_disables_target_bonus_only_for_three_model_chain(modules, monkeypatch, chain, emit_bonus):
     path = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/model_runner.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     method = next(
@@ -98,10 +98,11 @@ def test_runner_disables_target_bonus_for_active_intermediate(modules, monkeypat
     options = {"final_verification": {"method": "all"}}
     runner.ascend_config = NS(multi_stage_speculative=options)
     runner.is_last_pp_rank = True
-    runner.speculator = NS(initialize_intermediate=Mock()) if active else NS()
+    active = chain != "ordinary"
+    runner.speculator = NS(initialize_intermediate=Mock(), uses_primary_drafter=chain == "four") if active else NS()
     runner.sampler, runner.speculative_config, runner.device = object(), object(), "cpu"
     runner.model_memory_usage = 0
     runner.load_model()
-    assert sampler.call_args.kwargs["emit_bonus_token"] == (not active)
+    assert sampler.call_args.kwargs["emit_bonus_token"] == emit_bonus
     if active:
         runner.speculator.initialize_intermediate.assert_called_once_with(runner)

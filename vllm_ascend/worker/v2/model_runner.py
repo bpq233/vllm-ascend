@@ -234,7 +234,10 @@ class NPUModelRunner(GPUModelRunner):
                 self.speculative_config,
                 self.device,
                 AcceptancePolicy(**options["final_verification"]),
-                emit_bonus_token=not hasattr(self.speculator, "initialize_intermediate"),
+                # Only the independent three-model chain reuses 4B context
+                # directly for its next initial DFlash proposal. The four-model
+                # chain starts with Target-conditioned Primary DFlash instead.
+                emit_bonus_token=getattr(self.speculator, "uses_primary_drafter", True),
             )
         if hasattr(self.speculator, "initialize_intermediate"):
             from vllm.utils.mem_utils import DeviceMemoryProfiler

@@ -116,7 +116,7 @@ logits 仍通过原 `combine_sampled_and_draft_tokens` / `logits_indices` 选取
 中间和最终校验共用独立 `AcceptancePolicy`：
 
 - `{"method": "topk", "top_k": 5}`：遇到第一个不在 Top-k 的 token 时截断。
-- `{"method": "all"}`：全部接受；启用中间流水线时不追加 Target bonus。
+- `{"method": "all"}`：全部接受；三模型不追加 Target bonus，四模型保留 Target bonus。
 - `{"method": "prob_ratio", "threshold": 0.5}`：当该位置的 `P(草稿 token) / max_token P(token) > threshold` 时接受；相等时拒绝。阈值为 `[0,1]` 内的有限数，默认 `0.5`；`0` 接受所有具有有限 logit 的候选，`1` 拒绝所有候选，被屏蔽或非有限的 logit 不接受。
 
 仅更换 Target 策略时，修改这一项即可，中间校验配置保持原值：
@@ -128,9 +128,9 @@ additional_config["multi_stage_speculative"]["final_verification"] = {
 }
 ```
 
-最终 Target 的修正/bonus 复用原 sampler，包括请求采样参数；Top-k 和概率比均使用 sampler 返回的、经过采样参数处理的 logits，因此温度、惩罚和采样过滤等可能影响接受结果。概率比使用等价的 `草稿 logit - 最大 logit > log(threshold)` 判定，避免整张词表 softmax 和概率下溢；它不使用 Drafter 概率。首次拒绝后截断，随后追加 Target 修正 token。启用中间流水线时，全接受只提交候选，固定不追加 Target bonus；无候选时仍生成一个正常 token。仅配置最终接受策略或中间轮数为零时保留普通 Target bonus 行为。中间修正/bonus 和中间 DFlash 使用 greedy。三种策略均属于近似策略，不保证严格投机解码的分布等价性。
+最终 Target 的修正/bonus 复用原 sampler，包括请求采样参数；Top-k 和概率比均使用 sampler 返回的、经过采样参数处理的 logits，因此温度、惩罚和采样过滤等可能影响接受结果。概率比使用等价的 `草稿 logit - 最大 logit > log(threshold)` 判定，避免整张词表 softmax 和概率下溢；它不使用 Drafter 概率。首次拒绝后截断，随后追加 Target 修正 token。默认三模型链路全接受时只提交候选，不追加 Target bonus；四模型（`use_primary_drafter=true`）全接受时保留 Target bonus。两种链路无候选时均生成一个正常 token。仅配置最终接受策略或中间轮数为零时保留普通 Target bonus 行为。中间修正/bonus 和中间 DFlash 使用 greedy。三种策略均属于近似策略，不保证严格投机解码的分布等价性。
 
-例如中间 verifier 已前向到 `…a,b`，预测并发布 `…a,b,c`，其中 `c` 是中间修正/bonus，尚无自己的中间 KV。Target 全接受后若再追加 `t`，下一轮 anchor 为 `t`、context 为 `…a,b,c`，4B 需要补算 `c`。关闭 Target bonus 后，anchor 为 `c`、context 为 `…a,b`；resident KV 有效时直接开始 DFlash，省去这次补算。缓存淘汰、上下文分歧等情况仍需要前向。
+例如三模型链路的中间 verifier 已前向到 `…a,b`，预测并发布 `…a,b,c`，其中 `c` 是中间修正/bonus，尚无自己的中间 KV。Target 全接受后若再追加 `t`，下一轮 anchor 为 `t`、context 为 `…a,b,c`，4B 需要补算 `c`。关闭 Target bonus 后，anchor 为 `c`、context 为 `…a,b`；resident KV 有效时直接开始 DFlash，省去这次补算。缓存淘汰、上下文分歧等情况仍需要前向。四模型先使用 Target hidden states 与 Target bonus 启动 Primary DFlash，不调用 4B 初始 proposal；之后首次中间校验本来就要执行 verifier，缺失的 4B 上下文可合并到这次前向，因此保留原 Target bonus 行为。
 
 这项调整只控制最终提交，不缩短 Target 校验的输入或原 sampler 的批量 logits 处理。全接受且不追加 bonus 时，采样数为候选数，原 `num_rejected` 会保留一个位置供下一轮 anchor 重算，维持 `computed_length = total_length - 1`。输出形状、分块采样与 logprob 契约保持不变，`multi_stage_final` 接受数统计仍包含全部已接受候选。
 

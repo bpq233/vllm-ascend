@@ -357,7 +357,7 @@ def test_multi_stage_dflash(method, use_primary_drafter, long_candidates, graph_
         assert all(row["uses_primary_drafter"] == use_primary_drafter for row in initial)
         assert all(row["target_aux_hidden_states"] == use_primary_drafter for row in initial)
         assert all(row["target_draft_model_present"] == use_primary_drafter for row in initial)
-        assert all(not row["emit_target_bonus_token"] for row in initial)
+        assert all(row["emit_target_bonus_token"] == use_primary_drafter for row in initial)
         if graph_mode:
             before = runner.model.llm_engine.collective_rpc(_target_graph_probe, kwargs={"install": True})
             assert all(
