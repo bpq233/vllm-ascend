@@ -18,6 +18,7 @@ def _pack_round_kernel(
     packet,
     candidates,
     counts,
+    eos_ids,
     limit0,
     limit1,
     limit2,
@@ -31,47 +32,69 @@ def _pack_round_kernel(
     DECISION_STRIDE: tl.constexpr,
     DECISION_COL_STRIDE: tl.constexpr,
     CAPACITY: tl.constexpr,
-    WIDTHS: tl.constexpr,
-    STRIDES: tl.constexpr,
-    OFFSETS: tl.constexpr,
-    EOS_IDS: tl.constexpr,
+    WIDTH0: tl.constexpr,
+    WIDTH1: tl.constexpr,
+    WIDTH2: tl.constexpr,
+    WIDTH3: tl.constexpr,
+    STRIDE0: tl.constexpr,
+    STRIDE1: tl.constexpr,
+    STRIDE2: tl.constexpr,
+    STRIDE3: tl.constexpr,
+    OFFSET0: tl.constexpr,
+    OFFSET1: tl.constexpr,
+    OFFSET2: tl.constexpr,
+    OFFSET3: tl.constexpr,
+    NUM_EOS: tl.constexpr,
+    EOS_BLOCK: tl.constexpr,
     INITIALIZE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     request = tl.program_id(0)
     steps = tl.arange(0, BLOCK)
     # Older Triton-Ascend binders read .dtype on every non-scalar runtime
-    # argument. Keep launch arguments flat; tuples below are constexpr only.
+    # argument, and cannot index constexpr tuples. All arguments are tensors
+    # or scalars, including compile-time widths, strides and packet offsets.
     for row in tl.static_range(NUM_ROWS):
         if request == row:
             accepted = tl.load(decisions + (BASE_ROW + row) * DECISION_STRIDE)
             replacement = tl.load(decisions + (BASE_ROW + row) * DECISION_STRIDE + DECISION_COL_STRIDE)
             if row == 0:
-                tokens = tl.load(draft0 + steps * STRIDES[row], steps < WIDTHS[row], other=0)
+                tokens = tl.load(draft0 + steps * STRIDE0, steps < WIDTH0, other=0)
                 output_row = row0
                 limit = limit0
+                width = WIDTH0
+                offset = OFFSET0
             elif row == 1:
-                tokens = tl.load(draft1 + steps * STRIDES[row], steps < WIDTHS[row], other=0)
+                tokens = tl.load(draft1 + steps * STRIDE1, steps < WIDTH1, other=0)
                 output_row = row1
                 limit = limit1
+                width = WIDTH1
+                offset = OFFSET1
             elif row == 2:
-                tokens = tl.load(draft2 + steps * STRIDES[row], steps < WIDTHS[row], other=0)
+                tokens = tl.load(draft2 + steps * STRIDE2, steps < WIDTH2, other=0)
                 output_row = row2
                 limit = limit2
+                width = WIDTH2
+                offset = OFFSET2
             else:
-                tokens = tl.load(draft3 + steps * STRIDES[row], steps < WIDTHS[row], other=0)
+                tokens = tl.load(draft3 + steps * STRIDE3, steps < WIDTH3, other=0)
                 output_row = row3
                 limit = limit3
+                width = WIDTH3
+                offset = OFFSET3
             tl.store(packet + 2 * (BASE_ROW + row), accepted)
             tl.store(packet + 2 * (BASE_ROW + row) + 1, replacement)
-            tl.store(packet + OFFSETS[row] + steps, tokens, steps < WIDTHS[row])
+            tl.store(packet + offset + steps, tokens, steps < width)
             start = 0 if INITIALIZE else tl.load(counts + output_row)
             room = limit - start
             size = tl.minimum(accepted + 1, tl.minimum(room, CAPACITY - start))
             additions = tl.where(steps < accepted, tokens, replacement)
             is_eos = tl.full((BLOCK,), False, tl.int1)
-            for eos in tl.static_range(len(EOS_IDS)):
-                is_eos = is_eos | (additions == EOS_IDS[eos])
+            if NUM_EOS > 0:
+                eos_steps = tl.arange(0, EOS_BLOCK)
+                eos = tl.load(eos_ids + eos_steps, eos_steps < NUM_EOS, other=0)
+                matches = (additions[:, None] == eos[None, :]) & (eos_steps[None, :] < NUM_EOS)
+                is_eos = tl.sum(tl.where(matches, 1, 0), 1) > 0
             first_eos = tl.min(tl.where((steps < size) & is_eos, steps + 1, BLOCK), 0)
             size = tl.minimum(size, first_eos)
             tl.store(candidates + output_row * CAPACITY + start + steps, additions, steps < size)
@@ -104,6 +127,10 @@ def pack_round(decisions, drafts, candidates, counts, limits, row_ids, eos_ids, 
             counts[index] = start + len(additions)
         return packet
     packet = torch.empty(2 * len(drafts) + sum(widths), dtype=torch.int64, device=candidates.device)
+    if not isinstance(eos_ids, torch.Tensor):
+        eos_ids = torch.tensor(eos_ids, dtype=torch.int64, device=candidates.device)
+    elif eos_ids.device != candidates.device:
+        eos_ids = eos_ids.to(candidates.device)
     offsets, offset = [], 2 * len(drafts)
     for width in widths:
         offsets.append(offset)
@@ -117,12 +144,16 @@ def pack_round(decisions, drafts, candidates, counts, limits, row_ids, eos_ids, 
         chunk_limits = [int(limits[index]) for index in rows]
         chunk_limits.extend([0] * (REQUESTS_PER_PACKET_LAUNCH - len(rows)))
         chunk_rows = list(rows) + [0] * (REQUESTS_PER_PACKET_LAUNCH - len(rows))
+        chunk_widths = list(widths[begin:end]) + [0] * (REQUESTS_PER_PACKET_LAUNCH - len(rows))
+        chunk_strides = [t.stride(0) for t in drafts[begin:end]] + [1] * (REQUESTS_PER_PACKET_LAUNCH - len(rows))
+        chunk_offsets = list(offsets[begin:end]) + [0] * (REQUESTS_PER_PACKET_LAUNCH - len(rows))
         _pack_round_kernel[(end - begin,)](
             decisions,
             *chunk,
             packet,
             candidates,
             counts,
+            eos_ids,
             *chunk_limits,
             *chunk_rows,
             BASE_ROW=begin,
@@ -130,10 +161,20 @@ def pack_round(decisions, drafts, candidates, counts, limits, row_ids, eos_ids, 
             DECISION_STRIDE=decisions.stride(0),
             DECISION_COL_STRIDE=decisions.stride(1),
             CAPACITY=candidates.shape[1],
-            WIDTHS=widths[begin:end],
-            STRIDES=tuple(t.stride(0) for t in drafts[begin:end]),
-            OFFSETS=tuple(offsets[begin:end]),
-            EOS_IDS=tuple(eos_ids),
+            WIDTH0=chunk_widths[0],
+            WIDTH1=chunk_widths[1],
+            WIDTH2=chunk_widths[2],
+            WIDTH3=chunk_widths[3],
+            STRIDE0=chunk_strides[0],
+            STRIDE1=chunk_strides[1],
+            STRIDE2=chunk_strides[2],
+            STRIDE3=chunk_strides[3],
+            OFFSET0=chunk_offsets[0],
+            OFFSET1=chunk_offsets[1],
+            OFFSET2=chunk_offsets[2],
+            OFFSET3=chunk_offsets[3],
+            NUM_EOS=eos_ids.numel(),
+            EOS_BLOCK=triton.next_power_of_2(max(1, eos_ids.numel())),
             INITIALIZE=initialize,
             BLOCK=triton.next_power_of_2(max(widths[begin:end]) + 1),
         )

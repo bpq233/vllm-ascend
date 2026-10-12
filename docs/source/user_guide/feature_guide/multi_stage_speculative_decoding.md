@@ -228,6 +228,6 @@ VLLM_USE_V2_MODEL_RUNNER=1 pytest -q \
 
 另有不加载模型的 NPU packet 核函数用例：校验零宽 Primary、请求重排、整数 token 精度、空草稿、EOS、长度限制和设备累计候选，与 CPU 参考逐项对照。CPU 回归还模拟 round kernel 的实际函数体及旧版 Triton 参数绑定器，验证掩码、strided 地址计算和启动参数；这不代表目标 Triton-Ascend 已编译或执行。
 
-旧版 Triton-Ascend 的 `mangle_type` 会对运行时 tuple 访问 `.dtype`，因此 `round_packet.py` 的 tensor、输出行号和长度限制全部展开为独立参数，仅编译常量使用 tuple。每次启动最多处理四个请求；更大组拆成多个启动，共享同一个 packet 并保持一轮一次 D2H。无需升级 Triton 或增加元数据 H2D。
+旧版 Triton-Ascend 的 `mangle_type` 会对运行时 tuple 访问 `.dtype`；所使用的编译器还可能不支持 constexpr tuple 的索引。`round_packet.py` 因此完全使用独立 tensor/标量参数，宽度、stride、offset 也分别展开为标量，不在 kernel 内索引 constexpr 容器。EOS 使用 pipeline 初始化时一次性生成的设备表，不增加每轮 H2D。每次启动最多处理四个请求；更大组拆成多个启动，共享同一个 packet 并保持一轮一次 D2H。无需升级 Triton。
 
 接口核对参考：KG `vllmascend_docs_source_userguide_featureguide_speculativedecoding_vllm_ascend`，`source_file=inference-serving/vllm-ascend/docs/source/user_guide/feature_guide/speculative_decoding.md`，score `0.923520`；独立 KV 工作流参考 KG `model-infer-kvcache`（直接加载，无 score）。中间辅助隐藏层沿用 [上游 DFlash/EAGLE3 层选择接口](https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py)。

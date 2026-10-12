@@ -44,6 +44,7 @@ def kernels():
         minimum = staticmethod(np.minimum)
         where = staticmethod(np.where)
         min = staticmethod(np.min)
+        sum = staticmethod(np.sum)
 
         def program_id(self, axis):
             return self.row
@@ -77,7 +78,7 @@ def kernels():
     )
 
 
-@pytest.mark.parametrize("eos", [[], [0], [5, 7]])
+@pytest.mark.parametrize("eos", [[], [0], [5, 7], [999, 998, 997, 996, 7]])
 @pytest.mark.parametrize("room", [0, 1, 3, 8])
 @pytest.mark.parametrize("initialize", [False, True])
 def test_actual_kernel_body_matches_reference_with_masks_strides_and_prior_rounds(kernels, eos, room, initialize):
@@ -116,6 +117,7 @@ def test_actual_kernel_body_matches_reference_with_masks_strides_and_prior_round
             addr(actual_packet),
             addr(actual),
             addr(actual_counts),
+            addr(torch.tensor(eos, dtype=torch.int64)),
             *[int(limits[index]) for index in row_ids],
             0,
             *row_ids,
@@ -125,10 +127,20 @@ def test_actual_kernel_body_matches_reference_with_masks_strides_and_prior_round
             DECISION_STRIDE=decisions.stride(0),
             DECISION_COL_STRIDE=decisions.stride(1),
             CAPACITY=9,
-            WIDTHS=(2, 0, 1),
-            STRIDES=tuple(t.stride(0) for t in drafts),
-            OFFSETS=(6, 8, 8),
-            EOS_IDS=tuple(eos),
+            WIDTH0=2,
+            WIDTH1=0,
+            WIDTH2=1,
+            WIDTH3=0,
+            STRIDE0=drafts[0].stride(0),
+            STRIDE1=drafts[1].stride(0),
+            STRIDE2=drafts[2].stride(0),
+            STRIDE3=1,
+            OFFSET0=6,
+            OFFSET1=8,
+            OFFSET2=8,
+            OFFSET3=0,
+            NUM_EOS=len(eos),
+            EOS_BLOCK=1 << (max(1, len(eos)) - 1).bit_length(),
             INITIALIZE=initialize,
             BLOCK=4,
         )
@@ -154,11 +166,14 @@ def test_launch_arguments_work_with_legacy_dtype_binder_and_chunked_batches(kern
             def launch(*args, **kwargs):
                 bound = inspect.signature(k.kernel).bind(*args, **kwargs)
                 for name, argument in bound.arguments.items():
+                    assert not isinstance(argument, (tuple, list)), f"Container launch parameter: {name}"
                     if name not in k.constexpr_args and not isinstance(argument, (int, float, bool)):
                         # Reproduce the user's Triton mangle_type contract.
                         # A tuple at this point raises the reported error.
                         assert argument.dtype == torch.int64 or argument.dtype == torch.int32
                 calls.append(grid[0])
+                for name in k.constexpr_args:
+                    assert isinstance(bound.arguments[name], (bool, int)), f"Non-scalar constexpr: {name}"
                 converted = [
                     k.Address((arg.data if isinstance(arg, DeviceTensor) else arg).numpy())
                     if isinstance(arg, (DeviceTensor, torch.Tensor))
@@ -167,9 +182,18 @@ def test_launch_arguments_work_with_legacy_dtype_binder_and_chunked_batches(kern
                 ]
                 for row in range(grid[0]):
                     k.language.row = row
-                    k.kernel(*converted, **kwargs)
+                    k.kernel(*converted, **{key: LegacyConstexpr(value) for key, value in kwargs.items()})
 
             return launch
+
+    class LegacyConstexpr(int):
+        # Reproduce the second failure in the user's compiler. Scalar
+        # arithmetic works; constexpr tuple indexing/iteration must never occur.
+        def __getitem__(self, key):
+            raise TypeError("'constexpr' object is not subscriptable")
+
+        def __iter__(self):
+            raise TypeError("'constexpr' object is not iterable")
 
     decisions = torch.tensor([[i % 3, 70 + i] for i in range(num_reqs)])
     drafts = [torch.arange(10 + i * 3, 10 + i * 3 + i % 3) for i in range(num_reqs)]
@@ -185,6 +209,8 @@ def test_launch_arguments_work_with_legacy_dtype_binder_and_chunked_batches(kern
     k.namespace["triton"] = NS(next_power_of_2=lambda value: 1 << (value - 1).bit_length())
     k.namespace["torch"] = NS(
         int64=torch.int64,
+        Tensor=torch.Tensor,
+        tensor=lambda values, dtype, device: torch.tensor(values, dtype=dtype),
         empty=lambda shape, dtype, device: torch.empty(shape, dtype=dtype),
     )
     result = k.pack(

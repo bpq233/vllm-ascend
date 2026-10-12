@@ -21,6 +21,11 @@ class IntermediatePipeline:
         self.capacity = capacity
         self.policy = AcceptancePolicy(**config.verification)
         self.eos_ids = set(eos_token_id if isinstance(eos_token_id, list) else [eos_token_id])
+        self._packet_eos_ids = torch.tensor(
+            sorted(eos for eos in self.eos_ids if eos is not None),
+            dtype=torch.int64,
+            device=getattr(backend, "device", "cpu"),
+        )
         self._decision_shapes = OrderedDict()
 
     def _decision_shape(self, logits, lengths):
@@ -200,7 +205,7 @@ class IntermediatePipeline:
                             output_counts,
                             output_limits,
                             [group[i] for i in active],
-                            sorted(eos for eos in self.eos_ids if eos is not None),
+                            self._packet_eos_ids,
                             initialize=round_id == 0,
                         )
                     else:

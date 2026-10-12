@@ -95,7 +95,7 @@ def test_fused_step_packet_matches_reference_on_npu(primary_width):
     assert actual.cpu().tolist() == expected.tolist()
 
 
-@pytest.mark.parametrize("eos_ids", [[], [5, 7]])
+@pytest.mark.parametrize("eos_ids", [[], [5, 7], [151643, 151645, 151646, 151647, 7]])
 def test_fused_round_packet_and_device_candidates_match_reference_on_npu(eos_ids):
     decisions = torch.tensor([[2, 7], [0, 4], [1, 9]])
     drafts = [torch.tensor([16777217, 5]), torch.empty(0, dtype=torch.int64), torch.tensor([8])]
