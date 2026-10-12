@@ -118,6 +118,35 @@ def test_fused_round_packet_and_device_candidates_match_reference_on_npu(eos_ids
     assert output_counts.cpu().tolist() == counts.tolist()
 
 
+@pytest.mark.parametrize("num_reqs", [1, 4, 5, 9])
+@pytest.mark.parametrize("initialize", [False, True])
+def test_flat_round_packet_launch_and_chunk_offsets_on_npu(num_reqs, initialize):
+    """Exercise the legacy binder regression and requests beyond one launch."""
+    decisions = torch.tensor([[i % 3, 70 + i] for i in range(num_reqs)])
+    drafts = [torch.arange(10 + i * 3, 10 + i * 3 + i % 3) for i in range(num_reqs)]
+    candidate = torch.zeros(num_reqs, 8, dtype=torch.int64)
+    counts = torch.full((num_reqs,), -777 if initialize else 1, dtype=torch.int32)
+    if not initialize:
+        candidate[:, 0] = 99
+    limits = [2 + i % 3 for i in range(num_reqs)]
+    row_ids = list(reversed(range(num_reqs)))
+    output, output_counts = candidate.to("npu"), counts.to("npu")
+    expected = pack_round(decisions, drafts, candidate, counts, limits, row_ids, [14, 72], initialize=initialize)
+    actual = pack_round(
+        decisions.to("npu"),
+        [t.to("npu") for t in drafts],
+        output,
+        output_counts,
+        limits,
+        row_ids,
+        [14, 72],
+        initialize=initialize,
+    )
+    assert actual.cpu().tolist() == expected.tolist()
+    assert output.cpu().tolist() == candidate.tolist()
+    assert output_counts.cpu().tolist() == counts.tolist()
+
+
 def test_deferred_final_trace_uses_existing_stream_completion_on_npu(monkeypatch):
     """Verify pinned async statistics before/after the adapter's D2H boundary."""
     verifier = FinalVerificationSampler.__new__(FinalVerificationSampler)

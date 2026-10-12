@@ -5,19 +5,32 @@
 import torch
 from vllm.triton_utils import tl, triton
 
+REQUESTS_PER_PACKET_LAUNCH = 4
+
 
 @triton.jit
 def _pack_round_kernel(
     decisions,
-    drafts,
+    draft0,
+    draft1,
+    draft2,
+    draft3,
     packet,
     candidates,
     counts,
-    limits,
+    limit0,
+    limit1,
+    limit2,
+    limit3,
+    row0,
+    row1,
+    row2,
+    row3,
+    BASE_ROW: tl.constexpr,
+    NUM_ROWS: tl.constexpr,
     DECISION_STRIDE: tl.constexpr,
     DECISION_COL_STRIDE: tl.constexpr,
     CAPACITY: tl.constexpr,
-    row_ids,
     WIDTHS: tl.constexpr,
     STRIDES: tl.constexpr,
     OFFSETS: tl.constexpr,
@@ -27,18 +40,33 @@ def _pack_round_kernel(
 ):
     request = tl.program_id(0)
     steps = tl.arange(0, BLOCK)
-    # Tensor tuples expand to kernel arguments, without a pointer-table upload.
-    for row in tl.static_range(len(drafts)):
+    # Older Triton-Ascend binders read .dtype on every non-scalar runtime
+    # argument. Keep launch arguments flat; tuples below are constexpr only.
+    for row in tl.static_range(NUM_ROWS):
         if request == row:
-            accepted = tl.load(decisions + row * DECISION_STRIDE)
-            replacement = tl.load(decisions + row * DECISION_STRIDE + DECISION_COL_STRIDE)
-            tokens = tl.load(drafts[row] + steps * STRIDES[row], steps < WIDTHS[row], other=0)
-            tl.store(packet + 2 * row, accepted)
-            tl.store(packet + 2 * row + 1, replacement)
+            accepted = tl.load(decisions + (BASE_ROW + row) * DECISION_STRIDE)
+            replacement = tl.load(decisions + (BASE_ROW + row) * DECISION_STRIDE + DECISION_COL_STRIDE)
+            if row == 0:
+                tokens = tl.load(draft0 + steps * STRIDES[row], steps < WIDTHS[row], other=0)
+                output_row = row0
+                limit = limit0
+            elif row == 1:
+                tokens = tl.load(draft1 + steps * STRIDES[row], steps < WIDTHS[row], other=0)
+                output_row = row1
+                limit = limit1
+            elif row == 2:
+                tokens = tl.load(draft2 + steps * STRIDES[row], steps < WIDTHS[row], other=0)
+                output_row = row2
+                limit = limit2
+            else:
+                tokens = tl.load(draft3 + steps * STRIDES[row], steps < WIDTHS[row], other=0)
+                output_row = row3
+                limit = limit3
+            tl.store(packet + 2 * (BASE_ROW + row), accepted)
+            tl.store(packet + 2 * (BASE_ROW + row) + 1, replacement)
             tl.store(packet + OFFSETS[row] + steps, tokens, steps < WIDTHS[row])
-            output_row = row_ids[row]
             start = 0 if INITIALIZE else tl.load(counts + output_row)
-            room = limits[row] - start
+            room = limit - start
             size = tl.minimum(accepted + 1, tl.minimum(room, CAPACITY - start))
             additions = tl.where(steps < accepted, tokens, replacement)
             is_eos = tl.full((BLOCK,), False, tl.int1)
@@ -56,8 +84,9 @@ def pack_round(decisions, drafts, candidates, counts, limits, row_ids, eos_ids, 
     The CPU controller still reads this packet once for KV identities and
     scheduling. Publication reuses candidates directly, with no candidate H2D.
     Widths depend on bounded microbatch shapes, never token contents. Output
-    row IDs and CPU length limits are scalar launch arguments, avoiding a
-    metadata H2D. Each group's first round initializes its device counts.
+    row IDs and CPU length limits are separate scalar launch arguments, avoiding
+    runtime tuple binding and metadata H2D. A launch handles up to four requests;
+    larger groups share the packet and issue bounded chunks without an extra D2H.
     """
     widths = tuple(len(t) for t in drafts)
     if candidates.device.type == "cpu":
@@ -79,22 +108,33 @@ def pack_round(decisions, drafts, candidates, counts, limits, row_ids, eos_ids, 
     for width in widths:
         offsets.append(offset)
         offset += width
-    _pack_round_kernel[(len(drafts),)](
-        decisions,
-        tuple(drafts),
-        packet,
-        candidates,
-        counts,
-        tuple(int(limits[index]) for index in row_ids),
-        decisions.stride(0),
-        decisions.stride(1),
-        candidates.shape[1],
-        tuple(row_ids),
-        widths,
-        tuple(t.stride(0) for t in drafts),
-        tuple(offsets),
-        tuple(eos_ids),
-        initialize,
-        triton.next_power_of_2(max(widths, default=0) + 1),
-    )
+    for begin in range(0, len(drafts), REQUESTS_PER_PACKET_LAUNCH):
+        end = min(begin + REQUESTS_PER_PACKET_LAUNCH, len(drafts))
+        rows = row_ids[begin:end]
+        chunk = list(drafts[begin:end])
+        # Unused pointer/scalar arguments are never read by NUM_ROWS' loop.
+        chunk.extend([packet] * (REQUESTS_PER_PACKET_LAUNCH - len(chunk)))
+        chunk_limits = [int(limits[index]) for index in rows]
+        chunk_limits.extend([0] * (REQUESTS_PER_PACKET_LAUNCH - len(rows)))
+        chunk_rows = list(rows) + [0] * (REQUESTS_PER_PACKET_LAUNCH - len(rows))
+        _pack_round_kernel[(end - begin,)](
+            decisions,
+            *chunk,
+            packet,
+            candidates,
+            counts,
+            *chunk_limits,
+            *chunk_rows,
+            BASE_ROW=begin,
+            NUM_ROWS=end - begin,
+            DECISION_STRIDE=decisions.stride(0),
+            DECISION_COL_STRIDE=decisions.stride(1),
+            CAPACITY=candidates.shape[1],
+            WIDTHS=widths[begin:end],
+            STRIDES=tuple(t.stride(0) for t in drafts[begin:end]),
+            OFFSETS=tuple(offsets[begin:end]),
+            EOS_IDS=tuple(eos_ids),
+            INITIALIZE=initialize,
+            BLOCK=triton.next_power_of_2(max(widths[begin:end]) + 1),
+        )
     return packet

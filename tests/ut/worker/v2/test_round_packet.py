@@ -3,6 +3,7 @@
 """Verify candidate publication against CPU control, including ragged rounds."""
 
 import ast
+import inspect
 import sys
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -18,8 +19,12 @@ from test_intermediate_backend import backend as backend
 def kernels():
     source = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode/multi_stage/round_packet.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
-    tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    kernel_node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_pack_round_kernel")
+    constexpr_args = {arg.arg for arg in kernel_node.args.args if arg.annotation is not None}
+    tree.body = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.Assign))]
     for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
         node.decorator_list = []
         for arg in node.args.args:
             arg.annotation = None
@@ -62,7 +67,14 @@ def kernels():
     language = Language()
     namespace = dict(torch=torch, tl=language)
     exec(compile(tree, str(source), "exec"), namespace)
-    return NS(pack=namespace["pack_round"], kernel=namespace["_pack_round_kernel"], language=language, Address=Address)
+    return NS(
+        pack=namespace["pack_round"],
+        kernel=namespace["_pack_round_kernel"],
+        namespace=namespace,
+        language=language,
+        Address=Address,
+        constexpr_args=constexpr_args,
+    )
 
 
 @pytest.mark.parametrize("eos", [[], [0], [5, 7]])
@@ -93,29 +105,93 @@ def test_actual_kernel_body_matches_reference_with_masks_strides_and_prior_round
     # masks check empty/strided draft loads and candidate write boundaries.
     # decisions uses row/column strides, so expose its full underlying storage.
     storage = torch.as_strided(decisions, (3, 4), (4, 1))
+    pointers = [
+        addr(torch.as_strided(t, (max(1, len(t) * t.stride(0)),), (1,))) if len(t) else addr(t) for t in drafts
+    ] + [addr(actual_packet)]
     for row in range(3):
         k.language.row = row
         k.kernel(
             addr(storage),
-            tuple(
-                addr(torch.as_strided(t, (max(1, len(t) * t.stride(0)),), (1,))) if len(t) else addr(t) for t in drafts
-            ),
+            *pointers,
             addr(actual_packet),
             addr(actual),
             addr(actual_counts),
-            tuple(int(limits[index]) for index in row_ids),
-            decisions.stride(0),
-            decisions.stride(1),
-            9,
-            tuple(row_ids),
-            (2, 0, 1),
-            tuple(t.stride(0) for t in drafts),
-            (6, 8, 8),
-            tuple(eos),
-            initialize,
-            4,
+            *[int(limits[index]) for index in row_ids],
+            0,
+            *row_ids,
+            0,
+            BASE_ROW=0,
+            NUM_ROWS=3,
+            DECISION_STRIDE=decisions.stride(0),
+            DECISION_COL_STRIDE=decisions.stride(1),
+            CAPACITY=9,
+            WIDTHS=(2, 0, 1),
+            STRIDES=tuple(t.stride(0) for t in drafts),
+            OFFSETS=(6, 8, 8),
+            EOS_IDS=tuple(eos),
+            INITIALIZE=initialize,
+            BLOCK=4,
         )
     assert torch.equal(actual_packet, packet)
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_counts, counts)
+
+
+@pytest.mark.parametrize("num_reqs", [1, 3, 4, 5, 9])
+@pytest.mark.parametrize("initialize", [False, True])
+def test_launch_arguments_work_with_legacy_dtype_binder_and_chunked_batches(kernels, num_reqs, initialize):
+    k = kernels
+    calls = []
+
+    class DeviceTensor:
+        device = NS(type="npu")
+
+        def __init__(self, data):
+            self.data, self.dtype, self.shape = data, data.dtype, data.shape
+
+    class LegacyLauncher:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                bound = inspect.signature(k.kernel).bind(*args, **kwargs)
+                for name, argument in bound.arguments.items():
+                    if name not in k.constexpr_args and not isinstance(argument, (int, float, bool)):
+                        # Reproduce the user's Triton mangle_type contract.
+                        # A tuple at this point raises the reported error.
+                        assert argument.dtype == torch.int64 or argument.dtype == torch.int32
+                calls.append(grid[0])
+                converted = [
+                    k.Address((arg.data if isinstance(arg, DeviceTensor) else arg).numpy())
+                    if isinstance(arg, (DeviceTensor, torch.Tensor))
+                    else arg
+                    for arg in args
+                ]
+                for row in range(grid[0]):
+                    k.language.row = row
+                    k.kernel(*converted, **kwargs)
+
+            return launch
+
+    decisions = torch.tensor([[i % 3, 70 + i] for i in range(num_reqs)])
+    drafts = [torch.arange(10 + i * 3, 10 + i * 3 + i % 3) for i in range(num_reqs)]
+    row_ids = list(reversed(range(num_reqs)))
+    limits = [2 + i % 3 for i in range(num_reqs)]
+    expected = torch.zeros(num_reqs, 8, dtype=torch.int64)
+    counts = torch.full((num_reqs,), -777 if initialize else 1, dtype=torch.int32)
+    if not initialize:
+        expected[:, 0] = 99
+    actual, actual_counts = expected.clone(), counts.clone()
+    packet = k.pack(decisions, drafts, expected, counts, limits, row_ids, [14, 72], initialize=initialize)
+    k.namespace["_pack_round_kernel"] = LegacyLauncher()
+    k.namespace["triton"] = NS(next_power_of_2=lambda value: 1 << (value - 1).bit_length())
+    k.namespace["torch"] = NS(
+        int64=torch.int64,
+        empty=lambda shape, dtype, device: torch.empty(shape, dtype=dtype),
+    )
+    result = k.pack(
+        decisions, drafts, DeviceTensor(actual), actual_counts, limits, row_ids, [14, 72], initialize=initialize
+    )
+    assert calls == [min(4, num_reqs - start) for start in range(0, num_reqs, 4)]
+    assert torch.equal(result, packet)
     assert torch.equal(actual, expected)
     assert torch.equal(actual_counts, counts)
 
