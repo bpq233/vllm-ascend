@@ -118,10 +118,20 @@ def _fit_fia_query_to_output(
     query_tokens = query.shape[0]
     output_tokens = output.shape[0]
     boundaries = attn_metadata.actual_seq_lengths_q if attn_metadata is not None else None
-    invalid_boundary = boundaries is not None and (
-        not boundaries or (boundaries[-1] != query_tokens and query_tokens not in boundaries)
-    )
     actual_tokens = getattr(attn_metadata, "num_actual_tokens", 0)
+    # Eager/piecewise forwards may retain model padding without a dummy
+    # request in the attention metadata. Only trim a suffix proven to be
+    # padding by both the real token count and the final request boundary.
+    # Full graph capture keeps its padded query shape and dummy requests.
+    untracked_padding = (
+        not _EXTRA_CTX.capturing
+        and boundaries is not None
+        and bool(boundaries)
+        and 0 < actual_tokens == boundaries[-1] < query_tokens
+    )
+    invalid_boundary = boundaries is not None and (
+        not boundaries or (boundaries[-1] != query_tokens and query_tokens not in boundaries and not untracked_padding)
+    )
     if query_tokens > output_tokens or invalid_boundary or actual_tokens > query_tokens:
         raise RuntimeError(
             "FIA input contract mismatch before KV cache update; refusing to discard query tokens. "
@@ -133,6 +143,8 @@ def _fit_fia_query_to_output(
             f"attn_state={getattr(attn_metadata, 'attn_state', None)}, capturing={_EXTRA_CTX.capturing}. "
             "Check the caller's FX output allocation and the active batch metadata."
         )
+    if untracked_padding:
+        return query[:actual_tokens], actual_tokens
     return query, query_tokens
 
 
