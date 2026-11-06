@@ -60,8 +60,48 @@ def test_fixed_weight_and_capacity_are_idempotent(configs, weight, primary):
     for _ in range(2):
         multi.prepare_multi_stage_config(cfg)
         multi.validate_multi_stage(cfg, options)
-        assert cfg.speculative_config.num_speculative_tokens == 15
+        assert cfg.speculative_config.num_speculative_tokens == 12
         assert options["final_verification"] == {"method": "standard"}
+
+
+@pytest.mark.parametrize("primary", [False, True])
+def test_fifteen_token_three_round_capacity_excludes_intermediate_bonus(configs, primary):
+    _, multi = configs
+    cfg = vllm_config()
+    options = enabled_options()
+    options["use_primary_drafter"] = primary
+    options["intermediate"]["num_speculative_tokens"] = 15
+    if primary:
+        options["primary_num_speculative_tokens"] = 15
+    else:
+        options.pop("primary_num_speculative_tokens")
+    cfg.additional_config = {"multi_stage_speculative": options}
+    for _ in range(2):
+        multi.prepare_multi_stage_config(cfg)
+        multi.validate_multi_stage(cfg, options)
+        assert cfg.speculative_config.num_speculative_tokens == 45
+
+
+@pytest.mark.parametrize("rounds,cap,expected", [(3, 100, 45), (10, 100, 100), (3, 7, 7), (3, 16, 16)])
+def test_max_generated_tokens_is_a_hard_candidate_cap(configs, rounds, cap, expected):
+    _, multi = configs
+    cfg, options = vllm_config(), enabled_options()
+    options["primary_num_speculative_tokens"] = 15
+    options["intermediate"].update(num_rounds=rounds, num_speculative_tokens=15, max_generated_tokens=cap)
+    cfg.additional_config = {"multi_stage_speculative": options}
+    for _ in range(2):
+        multi.prepare_multi_stage_config(cfg)
+        multi.validate_multi_stage(cfg, options)
+        assert cfg.speculative_config.num_speculative_tokens == expected
+
+
+@pytest.mark.parametrize("cap", [0, -1, True, 2.5, "100"])
+def test_invalid_candidate_caps_are_rejected(configs, cap):
+    proposal, _ = configs
+    options = enabled_options()
+    options["intermediate"]["max_generated_tokens"] = cap
+    with pytest.raises(ValueError, match="positive integer candidate cap"):
+        proposal.validate_proposal_sampling(vllm_config(), options)
 
 
 @pytest.mark.parametrize("policy", [None, {"method": "standard"}])

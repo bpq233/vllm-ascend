@@ -64,8 +64,9 @@ def validate_proposal_sampling(vllm_config, options):
     rounds = intermediate.get("num_rounds", 3) if isinstance(intermediate, dict) else None
     if not intermediate or type(rounds) is not int or rounds <= 0:
         raise ValueError("Proposal sampling requires an active intermediate pipeline.")
-    if intermediate.get("max_generated_tokens") is not None:
-        raise ValueError("Proposal sampling uses a preselected token budget, not max_generated_tokens stopping.")
+    cap = intermediate.get("max_generated_tokens")
+    if cap is not None and (type(cap) is not int or cap <= 0):
+        raise ValueError("Proposal sampling max_generated_tokens must be a positive integer candidate cap.")
     for name, policy in (
         ("intermediate", intermediate.get("verification")),
         ("final", options.get("final_verification")),

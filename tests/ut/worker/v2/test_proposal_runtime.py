@@ -71,6 +71,7 @@ class ToyBackend:
         self.one_hot = one_hot
         self.proposal_calls = []
         self.logit_calls = []
+        self.block_calls = []
 
     def probabilities(self, prefix):
         if self.one_hot is not None:
@@ -88,10 +89,31 @@ class ToyBackend:
         self.logit_calls.extend((req_id, tuple(prefix)) for req_id, prefix in zip(req_ids, contexts))
         return [self.probabilities(prefix).log() for prefix in contexts]
 
+    def proposal_block_logits(self, contexts, drafts, req_ids):
+        self.block_calls.extend(
+            (req_id, tuple(prefix), tuple(draft)) for req_id, prefix, draft in zip(req_ids, contexts, drafts)
+        )
+        return [
+            torch.stack(
+                self.proposal_logits(
+                    [prefix + draft[:position] for position in range(len(draft))], [req_id] * len(draft)
+                )
+            )
+            for req_id, prefix, draft in zip(req_ids, contexts, drafts)
+        ]
 
-def make_pipeline(runtime, context, backend=None, *, capacity=4, eos=None):
+
+def make_pipeline(runtime, context, backend=None, *, capacity=4, eos=None, rounds=None, candidate_cap=None):
     return runtime.proposal_pipeline.ProposalPipeline(
-        backend or ToyBackend(), NS(num_speculative_tokens=2), capacity, eos, context
+        backend or ToyBackend(),
+        NS(
+            num_speculative_tokens=2,
+            num_rounds=capacity if rounds is None else rounds,
+            max_generated_tokens=candidate_cap,
+        ),
+        capacity,
+        eos,
+        context,
     )
 
 
@@ -107,7 +129,7 @@ def test_pipeline_records_the_actual_conditional_mixture_at_every_position(runti
     assert len(tokens) == 5 and output[0].tolist() == tokens
     assert pipeline.device_output_ready
     entries = context.entries_for("a", len(prefix), tokens, prefix[-1])
-    assert backend.logit_calls == [("a", tuple(prefix + tokens[:position])) for position in range(5)]
+    assert all(("a", tuple(prefix + tokens[:position])) in backend.logit_calls for position in range(5))
     for position, entry in enumerate(entries):
         p_m = backend.probabilities(prefix + tokens[:position])
         q_d = torch.zeros(4)
@@ -144,13 +166,58 @@ def test_all_accepted_block_is_reused_until_exhaustion_then_fresh_prefix_is_draf
     assert [entry.spec_round for entry in context.ledgers["a"].entries] == [0, 0, 1, 1]
 
 
-@pytest.mark.parametrize("accept_uniform", [0.0, 0.99])
-def test_token_budget_does_not_depend_on_intermediate_acceptance(runtime, accept_uniform):
+@pytest.mark.parametrize("rounds", [1, 2, 3])
+@pytest.mark.parametrize("weight", [0.0, 1.0])
+def test_fifteen_token_blocks_stop_after_exactly_n_rounds(runtime, weight, rounds):
+    context = make_context(runtime, weight=weight)
+    backend = ToyBackend(block=[2] * 15, one_hot=0)
+    capacity = 15 * rounds
+    length = rounds if weight == 0 else capacity
+    pipeline = make_pipeline(runtime, context, backend, capacity=capacity, rounds=rounds)
+    result = pipeline.refine([[3]], [[1] * 15], [capacity], ["a"])[0]
+    assert len(result) == length
+    assert result == ([0] * rounds if weight == 0 else [1] * 15 + [2] * (15 * (rounds - 1)))
+    assert len(backend.proposal_calls) == rounds - 1
+    assert len(backend.block_calls) == rounds
+    entries = context.entries_for("a", 1, result, anchor=3)
+    primary_length = 1 if weight == 0 else 15
+    assert [entry.source for entry in entries[:primary_length]] == ["primary_dflash"] * primary_length
+    assert all(entry.source == "intermediate_dflash" for entry in entries[primary_length:])
+    for entry in entries:
+        assert entry.mixture[entry.token] == 1
+    verifier, _ = make_verifier(runtime, context, capacity=capacity)
+    target = torch.stack([entry.mixture for entry in entries] + [torch.tensor([0.0, 0.0, 0.0, 1.0])])
+    _, sampled, counts = verify(verifier, target.log(), [3, *result], list(range(length + 1)), [0, length + 1], [2])
+    assert counts.tolist() == [length + 1]
+    assert sampled[0, : length + 1].tolist() == [*result, 3]
+    assert sampled[0, length + 1 :].eq(-1).all()
+
+
+@pytest.mark.parametrize("accept_uniform,length", [(0.0, 6), (0.99, 3)])
+def test_round_count_is_fixed_while_candidate_length_follows_acceptance(runtime, accept_uniform, length):
     context = make_context(runtime, weight=0.5)
     context.uniforms = lambda req_id, stage, count: torch.tensor([accept_uniform, 0.0])
     backend = ToyBackend(block=(1, 2), one_hot=0)
-    result = make_pipeline(runtime, context, backend, capacity=7).refine([[2]], None, [5], ["a"])
-    assert len(result[0]) == len(context.ledgers["a"].entries) == 5
+    result = make_pipeline(runtime, context, backend, capacity=7, rounds=3).refine([[2]], None, [7], ["a"])
+    assert len(result[0]) == len(context.ledgers["a"].entries) == length
+    assert len(backend.proposal_calls) == len(backend.block_calls) == 3
+
+
+@pytest.mark.parametrize(
+    "rounds,cap,limit,length,calls",
+    [(3, 100, 200, 45, 3), (10, 100, 200, 100, 7), (3, 7, 200, 7, 1), (10, 100, 18, 18, 2)],
+)
+def test_candidate_hard_cap_and_request_limit_never_add_extra_rounds(runtime, rounds, cap, limit, length, calls):
+    context = make_context(runtime, weight=1.0)
+    backend = ToyBackend(block=[2] * 15)
+    capacity = rounds * 15
+    pipeline = make_pipeline(runtime, context, backend, capacity=capacity, rounds=rounds, candidate_cap=cap)
+    output = torch.full((1, capacity), -1, dtype=torch.int64)
+    tokens = pipeline.refine([[3]], [[1] * 15], [limit], ["a"], output=output)[0]
+    assert len(tokens) == len(context.ledgers["a"].entries) == length
+    assert output[0, :length].tolist() == tokens and output[0, length:].eq(0).all()
+    assert len(backend.block_calls) == calls and len(backend.proposal_calls) == calls - 1
+    assert len(backend.block_calls[-1][2]) == length - 15 * (calls - 1)
 
 
 @pytest.mark.parametrize("ignore_eos,expected_length", [(False, 1), (True, 4)])

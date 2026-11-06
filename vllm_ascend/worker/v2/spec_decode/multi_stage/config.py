@@ -60,8 +60,8 @@ class IntermediateConfig:
     # Resident KV slots can exceed the compute microbatch without enlarging
     # graph inputs. None preserves the existing KV memory allocation.
     cache_max_num_seqs: int | None = None
-    # Stop after a completed verification round produces MORE than this many
-    # candidates, including correction/bonus tokens. Never truncate that round.
+    # Exact proposal mode: hard cap on total candidates across strict rounds.
+    # Legacy approximate mode: threshold checked after a completed round.
     max_generated_tokens: int | None = None
 
     @classmethod
@@ -96,12 +96,15 @@ class IntermediateConfig:
         return result
 
 
-def candidate_capacity(primary_width, intermediate):
-    """Storage bound, including a full round's overshoot of the stop threshold."""
+def candidate_capacity(primary_width, intermediate, *, include_bonus=True):
+    """Storage bound; legacy rounds can overshoot, exact proposals obey a hard cap."""
     if intermediate.num_rounds == 0:
         return primary_width
-    first_round = primary_width + 1
-    capacity = first_round + (intermediate.num_rounds - 1) * (intermediate.num_speculative_tokens + 1)
+    bonus = int(include_bonus)
+    first_round = primary_width + bonus
+    capacity = first_round + (intermediate.num_rounds - 1) * (intermediate.num_speculative_tokens + bonus)
+    if not include_bonus and intermediate.max_generated_tokens is not None:
+        return min(capacity, intermediate.max_generated_tokens)
     if intermediate.max_generated_tokens is not None and intermediate.num_rounds > 1:
         capacity = min(
             capacity, max(first_round, intermediate.max_generated_tokens + intermediate.num_speculative_tokens + 1)
@@ -127,7 +130,7 @@ def prepare_multi_stage_config(vllm_config):
     This early step deliberately depends only on the explicit draft options.
     """
     config = (vllm_config.additional_config or {}).get("multi_stage_speculative", {})
-    validate_proposal_sampling(vllm_config, config)
+    proposal = validate_proposal_sampling(vllm_config, config)
     spec = vllm_config.speculative_config
     if spec is None or "intermediate" not in config:
         return
@@ -142,7 +145,7 @@ def prepare_multi_stage_config(vllm_config):
     _validate_draft_widths(width, intermediate)
     if config.get("use_primary_drafter", False):
         config["primary_num_speculative_tokens"] = width
-    spec.num_speculative_tokens = candidate_capacity(width, intermediate)
+    spec.num_speculative_tokens = candidate_capacity(width, intermediate, include_bonus=not proposal.enabled)
 
 
 def validate_multi_stage(vllm_config, config):
@@ -189,7 +192,7 @@ def validate_multi_stage(vllm_config, config):
         AcceptancePolicy(**intermediate.verification)
     width = initial_draft_width(config, spec.num_speculative_tokens)
     _validate_draft_widths(width, intermediate)
-    capacity = candidate_capacity(width, intermediate)
+    capacity = candidate_capacity(width, intermediate, include_bonus=not proposal.enabled)
     if capacity > MAX_DFLASH_DRAFT_TOKENS:
         if getattr(vllm_config.model_config, "use_mla", False) or getattr(vllm_config.model_config, "is_hybrid", False):
             raise ValueError("Long candidate verification currently requires a full-attention target.")

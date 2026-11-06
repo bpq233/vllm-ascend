@@ -58,6 +58,7 @@ def parser():
     cli.add_argument("--repetitions", type=positive_int, default=3)
     cli.add_argument("--tp", type=positive_int, default=1)
     cli.add_argument("--rounds", type=positive_int, default=6)
+    cli.add_argument("--max-generated-tokens", type=positive_int, help="Candidate cap for exact proposal cases")
     cli.add_argument("--draft-tokens", type=positive_int, default=4)
     cli.add_argument("--max-num-seqs", type=positive_int, default=4)
     cli.add_argument("--max-model-len", type=positive_int, default=2048)
@@ -129,6 +130,8 @@ def model_kwargs(args, case):
             "feedback_enabled": True,
             "debug": True,
         }
+        if args.max_generated_tokens is not None:
+            options["intermediate"]["max_generated_tokens"] = args.max_generated_tokens
     kwargs["speculative_config"] = {
         "model": args.primary_drafter,
         "method": "dflash",

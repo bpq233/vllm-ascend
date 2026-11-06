@@ -94,3 +94,56 @@ def test_empty_context_is_rejected_by_verifier_contract(backend):
     obj, _, _ = backend
     with pytest.raises(ValueError, match="nonempty prefix"):
         obj.proposal_logits([[]], ["request"])
+
+
+def test_block_rows_follow_teacher_forced_prefix_and_recompute_after_correction(backend):
+    obj, _, _ = backend
+    rows = obj.proposal_block_logits([[1, 2]], [[3, 4]], ["a"])[0]
+    torch.testing.assert_close(rows, torch.tensor([[2.0, 1.0], [3.0, 2.0]]), rtol=0, atol=0)
+    assert obj.cache.tokens[obj.cache.slots["a"]] == [1, 2, 3, 4]
+    obj.model.reset_mock()
+    corrected = obj.proposal_block_logits([[1, 2, 7]], [[6, 5]], ["a"])[0]
+    torch.testing.assert_close(corrected, torch.tensor([[7.0, 2.0], [6.0, 3.0]]), rtol=0, atol=0)
+    assert obj.model.call_args.kwargs["input_ids"].tolist() == [7, 6, 5]
+    assert obj.cache.tokens[obj.cache.slots["a"]] == [1, 2, 7, 6, 5]
+    torch.testing.assert_close(rows, torch.tensor([[2.0, 1.0], [3.0, 2.0]]), rtol=0, atol=0)
+
+
+def test_block_rows_own_storage_and_omit_unrecorded_intermediate_bonus(backend, monkeypatch):
+    obj, _, _ = backend
+    storage = torch.empty(3, 2)
+
+    def verify(prefixes, drafts, *, req_ids, retain_hidden):
+        assert prefixes == [[1], [2]] and drafts == [[1, 2], [3]]
+        assert req_ids == ["a", "b"] and retain_hidden is False
+        storage.copy_(torch.tensor([[1, 2], [3, 4], [9, 9]]))
+        yield storage, [3]
+        storage[:2].copy_(torch.tensor([[5, 6], [9, 9]]))
+        yield storage[:2], [2]
+        storage.fill_(99)
+
+    obj.verify_batches = verify
+    monkeypatch.setattr(torch.Tensor, "cpu", Mock(side_effect=AssertionError("Full vocabulary D2H")))
+    rows = obj.proposal_block_logits([[1], [2]], [[1, 2], [3]], ["a", "b"])
+    torch.testing.assert_close(rows[0], torch.tensor([[1.0, 2.0], [3.0, 4.0]]), rtol=0, atol=0)
+    torch.testing.assert_close(rows[1], torch.tensor([[5.0, 6.0]]), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "prefixes,drafts,ids",
+    [([], [], []), ([[1]], [[]], ["a"]), ([[1]], [], ["a"]), ([[1], [2]], [[3], [4]], ["a", "a"])],
+)
+def test_invalid_block_logit_mappings_fail_before_forward(backend, prefixes, drafts, ids):
+    obj, _, _ = backend
+    obj.verify_batches = Mock()
+    with pytest.raises(ValueError, match="Block proposal logits"):
+        obj.proposal_block_logits(prefixes, drafts, ids)
+    obj.verify_batches.assert_not_called()
+
+
+@pytest.mark.parametrize("chunks", [[], [(torch.zeros(3, 2), [2])], [(torch.zeros(1, 2), [1])]])
+def test_invalid_block_prediction_lengths_fail_closed(backend, chunks):
+    obj, _, _ = backend
+    obj.verify_batches = Mock(return_value=iter(chunks))
+    with pytest.raises(RuntimeError, match="Block proposal logits"):
+        obj.proposal_block_logits([[1]], [[2]], ["a"])

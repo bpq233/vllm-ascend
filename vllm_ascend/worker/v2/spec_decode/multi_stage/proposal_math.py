@@ -174,9 +174,10 @@ def verify_sequence(
 
     target_probabilities contains K+1 rows; proposal_probabilities and tokens
     contain K. Row i describes sampling after candidate_tokens[:i]. Candidate
-    length and each row's distribution must be fixed without inspecting that
-    row's future sampling randomness. Per-request generators prevent unrelated
-    batch composition from changing a request's random stream.
+    reachability may depend on earlier generated tokens and acceptance decisions,
+    but not on that row's not-yet-drawn sample. Each emitted correction is kept
+    and every reached row records its actual law. Per-request generators prevent
+    unrelated batch composition from changing a request's random stream.
     """
     count = candidate_tokens.numel()
     if candidate_tokens.ndim != 1 or target_probabilities.ndim != 2 or proposal_probabilities.ndim != 2:

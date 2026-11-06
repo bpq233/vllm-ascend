@@ -957,6 +957,36 @@ class IntermediateBackend:
             raise RuntimeError("Next-token proposal logits did not cover every requested prefix.")
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
 
+    @torch.inference_mode()
+    def proposal_block_logits(self, prefixes, drafts, req_ids):
+        """Own teacher-forced draft prediction rows before graph buffers replay.
+
+        A round consumes only the accepted draft prefix plus its first residual
+        correction. Rows after that correction describe an invalid suffix and
+        must be discarded, even though they were computed by this forward.
+        """
+        if (
+            not prefixes
+            or not len(prefixes) == len(drafts) == len(req_ids)
+            or len(set(req_ids)) != len(req_ids)
+            or any(not draft for draft in drafts)
+        ):
+            raise ValueError("Block proposal logits require aligned nonempty drafts and distinct request IDs.")
+        result = []
+        for logits, lengths in self.verify_batches(prefixes, drafts, req_ids=req_ids, retain_hidden=False):
+            if logits.shape[0] != sum(lengths):
+                raise RuntimeError("Block proposal logits have invalid packed prediction lengths.")
+            for rows, length in zip(logits.split(lengths), lengths):
+                index = len(result)
+                if index >= len(drafts) or length != len(drafts[index]) + 1:
+                    raise RuntimeError("Block proposal logits do not match the requested draft widths.")
+                # The last row predicts a pM-only bonus. This mode emits only
+                # sampled mixtures, so leave that row out of the round.
+                result.append(rows[:-1].clone())
+        if len(result) != len(prefixes):
+            raise RuntimeError("Block proposal logits did not cover every requested draft.")
+        return result
+
     def _warm_prefixes(self, sequences, req_ids, required):
         """Avoid pathological padding across a large gap in sparse graph gears."""
         sizes = getattr(self.cudagraph_manager, "capture_sizes", ())
