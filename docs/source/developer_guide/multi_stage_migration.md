@@ -43,7 +43,7 @@
 
 ## 验证命令与范围
 
-2026-11-06 本地结果：18 个测试文件共 **452 项测试、231 项子测试通过**。全部 38 个变更 Python 文件的 Ruff、格式和编译检查通过，仓库源码规则与三份新增 Markdown 文档检查通过。旧工作树保持原样。
+2026-11-06 初次迁移结果：18 个测试文件共 **452 项测试、231 项子测试通过**。全部 38 个变更 Python 文件的 Ruff、格式和编译检查通过，仓库源码规则与三份新增 Markdown 文档检查通过。旧工作树保持原样。
 
 在具备 CPU PyTorch 的环境中，从仓库根目录执行：
 
@@ -75,3 +75,11 @@ VLLM_USE_V2_MODEL_RUNNER=1 python -m pytest -q \
 原用户指南中的 CPU profiler 计数和性能观察来自旧实现历史记录，本次未重新测量。新版吞吐、TTFT、TPOT、NPU 内存与图资源需使用相同 prompts、采样和并发对照普通 Target/DFlash，记录设备、软件版本、TP 和上下文长度后评估。
 
 KG 检索来源与执行约束见[迁移知识核对附录](multi_stage_migration_kg.md)。
+
+## 启动错误：中间 KV layout 尚未解析
+
+用户在 NPU 上反馈 `backend._init_scratch → init_kv_cache → get_resolved_kv_cache_layout` 抛出 `KV cache layout has not been resolved yet`。中间模型在 worker 加载模型时已经分配私有 KV，而主模型的 layout 解析由 EngineCore 在 worker 模型加载完成后执行。之前的 CPU 分配替身未调用该 accessor，漏检了这一前置条件。
+
+修复在中间 attention backend 初始化后，汇总 verifier 与 secondary drafter 支持的布局，调用上游 `resolve_kv_cache_layout`，传入全部中间 KV 规格并写入私有 `KVCacheConfig.kv_cache_layout`，再分配 KV 和图资源。配置保持独立，不提前解析或覆盖 Target 的布局；上游继续处理显式布局和不兼容组合。[上游解析规则](https://github.com/vllm-project/vllm/blob/24420b7a341af37a9bc3186e6fc6062512e0aa58/vllm/v1/attention/backends/utils.py#L277)，[EngineCore 初始化顺序](https://github.com/vllm-project/vllm/blob/24420b7a341af37a9bc3186e6fc6062512e0aa58/vllm/v1/engine/core.py#L240)。
+
+回归测试的分配替身实际调用 `get_resolved_kv_cache_layout()`，覆盖未解析布局、已有布局、verifier/drafter 规格传递、Target 配置隔离，以及不兼容布局在内存分配前报错。本次修复后完整 CPU 回归结果为 **455 项测试、231 项子测试通过**，变更 Python 文件的 Ruff、格式和编译检查通过，文档检查通过。该修复仍需同步到 NPU 机器并重启验证。

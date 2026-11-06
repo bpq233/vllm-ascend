@@ -15,6 +15,7 @@ from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts, resolve_kv_cache_layout
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer, init_attn_backend, init_kv_cache
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import set_eagle3_aux_hidden_state_layers
@@ -458,6 +459,12 @@ class IntermediateBackend:
         all_groups, _, kernel_sizes = init_attn_backend(
             self.kv_cache_config, cfg, self.device, draft_layer_names=self.drafter.draft_attn_layer_names
         )
+        # This private pair allocates KV while loading weights, before the
+        # engine resolves the Target layout. Resolve its own backends/specs
+        # first, honoring upstream layout preferences and explicit overrides.
+        supported_layouts = get_supported_kv_cache_layouts(group.backend for groups in all_groups for group in groups)
+        layout = resolve_kv_cache_layout(cfg, [[layout.name for layout in supported_layouts]], specs.values())
+        self.kv_cache_config.kv_cache_layout = layout.name
         self.attn_groups = [
             [g for g in group if not set(g.layer_names).intersection(self.drafter.draft_attn_layer_names)]
             for group in all_groups
