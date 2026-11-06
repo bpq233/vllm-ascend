@@ -128,7 +128,7 @@ jobs:
           path: ${{ env.BUILD_INFO_WORK }}/build-info-bundle/
           if-no-files-found: error
       - name: Remove superseded build information artifacts
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const { owner, repo } = context.repo;
