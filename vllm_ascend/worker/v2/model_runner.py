@@ -18,6 +18,7 @@
 #
 
 import inspect
+from collections import OrderedDict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import replace
@@ -70,6 +71,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 from vllm_ascend.attention.fa_v1 import AscendFlashAttentionBackend
 from vllm_ascend.attention.flashmla import prepare_flashmla_batch_req_state
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
+from vllm_ascend.attention.spec_decode import prepare_verification_batch_req_state, uses_long_speculative_queries
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
@@ -147,6 +149,32 @@ class NPUModelRunner(GPUModelRunner):
     execute_model_state: ExecuteModelState | None
     kv_connector: KVConnector
     max_num_reqs: int
+    MAX_SPEC_METADATA_SHAPES = 16
+
+    def _invalidate_spec_metadata(self):
+        self._spec_metadata = OrderedDict()
+        self._query_metadata = None
+
+    def _copy_spec_metadata(self, name, values, out=None):
+        """Reuse immutable host metadata in the synchronous multi-stage path."""
+        if not getattr(self.speculator, "updates_computed_tokens_cpu", False):
+            return async_copy_to_gpu(values, out=out, device=self.device)
+        if not hasattr(self, "_spec_metadata"):
+            self._invalidate_spec_metadata()
+        key = (name, values.dtype.str, values.shape, values.tobytes())
+        if out is not None:
+            previous = self._query_metadata
+            if previous is not None and previous[0] is out and previous[1] == key:
+                return out
+            result = async_copy_to_gpu(values, out=out, device=self.device)
+            self._query_metadata = (out, key)
+            return result
+        if key not in self._spec_metadata:
+            self._spec_metadata[key] = async_copy_to_gpu(values, device=self.device)
+            if len(self._spec_metadata) > self.MAX_SPEC_METADATA_SHAPES:
+                self._spec_metadata.popitem(last=False)
+        self._spec_metadata.move_to_end(key)
+        return self._spec_metadata[key]
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Ascend-specific configurations
@@ -236,6 +264,10 @@ class NPUModelRunner(GPUModelRunner):
         self.speculator: Any = None
         if self.speculative_config is not None and self.is_last_pp_rank:
             self.speculator = init_speculator(self.vllm_config, self.device, self.req_states)
+            if not getattr(self.speculator, "uses_primary_drafter", True):
+                # The independent verifier/drafter owns its auxiliary layers;
+                # the Target does not load or condition that draft checkpoint.
+                self.use_aux_hidden_state_outputs = False
             # Share the update stream between the target and draft graph managers.
             self.speculator.update_stream = self.update_stream
         # AscendInputBuffers has extra `seq_lens_cpu` attribute.
@@ -248,14 +280,7 @@ class NPUModelRunner(GPUModelRunner):
 
         # Pinned D2H staging for corrected device state after spec rejection.
         # The authoritative host state is the shared NumPy/torch RequestState view.
-        self.num_computed_tokens_event = torch.npu.Event()
-        self.num_computed_tokens_stream = torch.npu.Stream()
-        self.num_computed_tokens_cpu = torch.empty(
-            self.max_num_reqs,
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=True,
-        )
+        self._init_num_computed_tokens_copy()
 
         # NOTE: In GPUModelRunner, decode_query_len is initialized in load_model(),
         # +1 is hardcoded here but not in vllm.
@@ -317,6 +342,25 @@ class NPUModelRunner(GPUModelRunner):
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
         self.model_state.prompt_logprobs_worker = self.prompt_logprobs_worker
+        options = self.ascend_config.multi_stage_speculative
+        if "final_verification" in options and self.is_last_pp_rank:
+            from vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance import AcceptancePolicy
+            from vllm_ascend.worker.v2.spec_decode.multi_stage.final_verification import FinalVerificationSampler
+
+            self.rejection_sampler = FinalVerificationSampler(
+                self.sampler,
+                self.speculative_config,
+                self.device,
+                AcceptancePolicy(**options["final_verification"]),
+                emit_bonus_token=getattr(self.speculator, "uses_primary_drafter", True),
+            )
+        if hasattr(self.speculator, "initialize_intermediate"):
+            from vllm.utils.mem_utils import DeviceMemoryProfiler
+
+            with DeviceMemoryProfiler() as memory:
+                self.speculator.initialize_intermediate(self)
+            self.model_memory_usage += memory.consumed_memory
+            self.draft_tokens_handler = self.speculator
 
     @runtime_guard_sample_tokens
     def sample_tokens(self, grammar_output):
@@ -409,6 +453,7 @@ class NPUModelRunner(GPUModelRunner):
         kv_cache_config: KVCacheConfig,
         kv_cache_allocation_context: AbstractContextManager | None = None,
     ) -> None:
+        self._invalidate_spec_metadata()
         # Match V1's physical buffer plan without mutating the scheduler's
         # logical cache configuration. Allocation must honor zero-stride aliases.
         kv_cache_config = deepcopy(kv_cache_config)
@@ -531,6 +576,8 @@ class NPUModelRunner(GPUModelRunner):
                 fill_mxfp_v_scale_cache(layer.v_cache_scale, value_scale_cache)
 
     def shutdown(self) -> None:
+        if hasattr(self.speculator, "initialize_intermediate"):
+            self.draft_tokens_handler = None
         # Drop C8 packet views before the parent collects tensors and
         # empties the allocator cache.
         entries = getattr(self, "_c8_mxfp_v_scale_caches", None)
@@ -575,6 +622,7 @@ class NPUModelRunner(GPUModelRunner):
     @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:
         """Capture decoder and multimodal encoder graphs on Ascend."""
+        self._invalidate_spec_metadata()
         if hasattr(self, "model_state") and self.model_state.supports_mm_inputs:
             encoder_runner = getattr(self.model_state, "encoder_runner", None)
             encoder_manager = getattr(encoder_runner, "cudagraph_manager", None)
@@ -606,6 +654,11 @@ class NPUModelRunner(GPUModelRunner):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ):
+        if getattr(self.speculator, "updates_computed_tokens_cpu", False):
+            stream = torch.npu.current_stream()
+            if dummy_run or getattr(self, "_spec_metadata_stream", None) != stream:
+                self._invalidate_spec_metadata()
+            self._spec_metadata_stream = stream
         self._cpp_execution_time_ms = None
         profiling_config = self.ascend_config.scheduler_config.profiling_chunk_config
         execution_start_time = _start_profiling_chunk_timing(
@@ -632,6 +685,14 @@ class NPUModelRunner(GPUModelRunner):
             skip_dp_coordination() if should_skip_allreduce_across_dp_group(self.vllm_config) else nullcontext()
         )
         profile_kwargs = {"randomize_inputs": randomize_inputs}
+        trace_verification = hasattr(self.rejection_sampler, "begin_forward")
+        if trace_verification:
+            self.rejection_sampler.begin_forward(
+                scheduler_output,
+                dummy_run,
+                proposal_timing=getattr(self.speculator, "proposal_timing", None),
+                update_stream=self.update_stream,
+            )
         forward_failed = True
         with dp_coordination_context:
             try:
@@ -645,6 +706,8 @@ class NPUModelRunner(GPUModelRunner):
                     valid_dummy_state_slots=valid_dummy_state_slots,
                     **profile_kwargs,
                 )
+                if trace_verification:
+                    self.rejection_sampler.end_forward()
                 forward_failed = False
             finally:
                 finish_execution = getattr(self.model_state, "finish_execution", None)
@@ -758,6 +821,8 @@ class NPUModelRunner(GPUModelRunner):
 
     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):
         batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)
+        if batch_state is not None and uses_long_speculative_queries(self.vllm_config):
+            batch_state = prepare_verification_batch_req_state(batch_state)
         if self._uses_flashmla and batch_state is not None:
             # The backend order must precede derived inputs and graph dispatch.
             batch_state, uniform_token_count = prepare_flashmla_batch_req_state(batch_state, uniform_token_count)
@@ -802,7 +867,7 @@ class NPUModelRunner(GPUModelRunner):
 
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
         idx_mapping_np = batch_req_state.idx_mapping_np
-        idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+        idx_mapping = self._copy_spec_metadata("idx_mapping", idx_mapping_np)
         num_reqs = len(req_ids)
 
         num_valid_tokens = num_scheduled_tokens_np
@@ -847,7 +912,7 @@ class NPUModelRunner(GPUModelRunner):
             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
-            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+            cu_num_logits = self._copy_spec_metadata("cu_num_logits", cu_num_logits_np)
 
         adaptive_verification_manager = self.adaptive_verification
         adaptive_verification_active = (
@@ -883,7 +948,7 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         query_start_loc = self.input_buffers.query_start_loc
-        async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
+        self._copy_spec_metadata("query_start_loc", query_start_loc_np, out=query_start_loc)
 
         if adaptive_verification_active:
             # vLLM main appends the admitted draft counts (a 4th element) for
@@ -1337,7 +1402,9 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         # Non-last PP stages receive rejections without owning a speculator.
-        if self.speculator is not None or self.sync_spec_pp_cpu_counts:
+        if self.sync_spec_pp_cpu_counts or (
+            self.speculator is not None and not getattr(self.speculator, "updates_computed_tokens_cpu", False)
+        ):
             self._copy_num_computed_tokens_to_cpu()
 
     def postprocess_num_computed_tokens(self, input_batch: AscendInputBatch) -> None:
@@ -1346,12 +1413,28 @@ class NPUModelRunner(GPUModelRunner):
         if self.sync_spec_pp_cpu_counts:
             self._copy_num_computed_tokens_to_cpu()
 
+    def _init_num_computed_tokens_copy(self):
+        self.num_computed_tokens_event = None
+        self.num_computed_tokens_stream = None
+        self.num_computed_tokens_cpu = None
+        # Multi-stage publishes exact progress in its existing combined D2H.
+        # Keep PP's snapshot even on stages without a local speculator.
+        if getattr(self.speculator, "updates_computed_tokens_cpu", False) or (
+            self.speculator is None and not getattr(self, "sync_spec_pp_cpu_counts", False)
+        ):
+            return
+        self.num_computed_tokens_event = torch.npu.Event()
+        self.num_computed_tokens_stream = torch.npu.Stream()
+        self.num_computed_tokens_cpu = torch.empty(self.max_num_reqs, dtype=torch.int32, device="cpu", pin_memory=True)
+
     def _copy_num_computed_tokens_to_cpu(self):
+        if getattr(self.speculator, "updates_computed_tokens_cpu", False):
+            return
         if self._can_skip_spec_cpu_length_sync():
             return
 
         # Match this D2H and event with the consumer in _update_seq_lens_cpu.
-        default_stream = torch.cuda.current_stream()
+        default_stream = torch.npu.current_stream()
         assert self.num_computed_tokens_stream is not None
         assert self.num_computed_tokens_cpu is not None
         with torch.npu.stream(self.num_computed_tokens_stream):
@@ -1368,22 +1451,28 @@ class NPUModelRunner(GPUModelRunner):
         req_ids: list[str],
     ):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        computed = self.req_states.num_computed_tokens_cpu.numpy()
 
         # Wait for and consume the snapshot only when its producer runs.
         # req_states.num_computed_tokens_cpu also backs the NumPy view used by PCP.
-        if (self.speculator is not None or self.sync_spec_pp_cpu_counts) and not self._can_skip_spec_cpu_length_sync():
+        if (
+            (self.speculator is not None or self.sync_spec_pp_cpu_counts)
+            and not getattr(self.speculator, "updates_computed_tokens_cpu", False)
+            and not self._can_skip_spec_cpu_length_sync()
+        ):
             # Blocks CPU submission until D2H completes; may stall the async pipeline.
             self.num_computed_tokens_event.synchronize()
-            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
-                req_index = self.req_states.req_id_to_index[req_id]
-                self.req_states.num_computed_tokens_cpu[req_index] = self.num_computed_tokens_cpu[req_index]
+            cached_indices = np.fromiter(
+                (self.req_states.req_id_to_index[req] for req in scheduler_output.scheduled_cached_reqs.req_ids),
+                dtype=np.intp,
+            )
+            computed[cached_indices] = self.num_computed_tokens_cpu.numpy()[cached_indices]
 
         # Without a CPU consumer, retain the upstream optimistic upper bound.
         # prepare_pos_seq_lens still reads exact rejection-corrected NPU state.
-        for i, req_id in enumerate(req_ids):  # type: ignore
-            req_index = self.req_states.req_id_to_index[req_id]
-            num_computed_tokens = self.req_states.num_computed_tokens_cpu[req_index]
-            self.input_buffers.seq_lens_cpu[i] = num_computed_tokens + num_scheduled_tokens[req_id]
+        indices = np.fromiter((self.req_states.req_id_to_index[req] for req in req_ids), dtype=np.intp)
+        scheduled = np.fromiter((num_scheduled_tokens[req] for req in req_ids), dtype=np.int32)
+        np.add(computed[indices], scheduled, out=self.input_buffers.seq_lens_cpu.numpy()[: len(req_ids)])
 
     def _pad_query_start_loc_for_fia(
         self,
@@ -1401,6 +1490,18 @@ class NPUModelRunner(GPUModelRunner):
         """
         # TODO: need refactor later, related to vllm PR #34043 this pr delete func
         # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
+        if (
+            uses_long_speculative_queries(self.vllm_config)
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and self.cudagraph_manager.cudagraph_mode == CUDAGraphMode.FULL
+        ):
+            # Multi-stage upgrades FULL_DECODE_ONLY to mixed FULL. Its original
+            # config still says decode-only, so consult the active manager.
+            num_reqs_padded = num_reqs
+            if num_tokens_padded > query_start_loc_np[num_reqs]:
+                query_start_loc_np[num_reqs + 1] = num_tokens_padded
+                num_reqs_padded += 1
+            return query_start_loc_np, num_reqs_padded
         descriptor_num_reqs = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs_padded
         query_len = uniform_query_len or self.decode_query_len
         # This checks query lengths, not request phase: short prefills can also

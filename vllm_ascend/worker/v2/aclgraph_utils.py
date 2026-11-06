@@ -37,6 +37,7 @@ from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.attention.spec_decode import uses_long_speculative_queries
 from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
@@ -62,6 +63,20 @@ def collect_sorted_captured_token_sizes(capture_descs: dict) -> list[int]:
     capture descriptors, not the raw config sizes.
     """
     return sorted({desc.num_tokens for descs in capture_descs.values() for desc in descs})
+
+
+def verification_graph_mode(cudagraph_mode):
+    # Prefix catch-up and accepted candidate lengths vary between requests.
+    # Mixed FULL descriptors retain FIA updates without a uniform-query gate.
+    if cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+        return CUDAGraphMode.FULL
+    return cudagraph_mode
+
+
+def target_graph_mode(vllm_config, cudagraph_mode):
+    if uses_long_speculative_queries(vllm_config) and not vllm_config.model_config.enforce_eager:
+        return verification_graph_mode(cudagraph_mode)
+    return cudagraph_mode
 
 
 def _get_graph_update_backend(
@@ -99,7 +114,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         super().__init__(
             vllm_config,
             device,
-            cudagraph_mode,
+            target_graph_mode(vllm_config, cudagraph_mode),
             decode_query_len,
             lora_capture_cases=lora_capture_cases,
             varlen_decode=varlen_decode,

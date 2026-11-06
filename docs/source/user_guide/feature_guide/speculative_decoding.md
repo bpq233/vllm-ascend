@@ -2,6 +2,9 @@
 
 This guide shows how to use Speculative Decoding with vLLM Ascend. Speculative decoding is a technique which improves inter-token latency in memory-bound LLM inference.
 
+For MRV2 decoding with an independent intermediate verifier and DFlash drafter, see
+the [hierarchical speculative decoding guide](multi_stage_speculative_decoding.md).
+
 ## Overview
 
 vLLM Ascend implements speculative decoding through a **proposer-verifier** architecture:

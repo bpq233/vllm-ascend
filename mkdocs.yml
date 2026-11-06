@@ -297,6 +297,7 @@ nav:
         - user_guide/feature_guide/sleep_mode.md
         - user_guide/feature_guide/runtime_guard.md
         - user_guide/feature_guide/structured_output.md
+        - user_guide/feature_guide/multi_stage_speculative_decoding.md
         - user_guide/feature_guide/lora.md
         - user_guide/feature_guide/expert_parallelism_load_balancer.md
         - user_guide/feature_guide/netloader.md
@@ -327,6 +328,7 @@ nav:
     - user_guide/release_notes.md
   - Developer Guide:
     - developer_guide/index.md
+    - developer_guide/multi_stage_migration.md
     - Contribution:
         - developer_guide/contribution/index.md
         - developer_guide/contribution/testing.md

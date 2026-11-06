@@ -1,0 +1,187 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
+
+import math
+from collections import OrderedDict
+from dataclasses import dataclass
+
+import torch
+
+
+@dataclass(frozen=True)
+class AcceptancePolicy:
+    """Approximate acceptance shared by intermediate and final verification."""
+
+    method: str = "topk"
+    top_k: int = 5
+    threshold: float = 0.5
+
+    def __post_init__(self):
+        if self.method not in ("topk", "all", "prob_ratio"):
+            raise ValueError("verification method must be 'topk', 'all', or 'prob_ratio'")
+        if type(self.top_k) is not int or self.top_k < 1:
+            raise ValueError("verification top_k must be a positive integer")
+        if type(self.threshold) not in (int, float) or not 0 <= self.threshold <= 1:
+            raise ValueError("verification threshold must be a finite number in [0, 1]")
+
+    def accept(self, logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+        if self.method == "all":
+            return (token_ids >= 0) & (token_ids < logits.shape[-1])
+        if self.method == "prob_ratio":
+            valid_tokens = (token_ids >= 0) & (token_ids < logits.shape[-1])
+            # Upstream marks placeholder drafts from unfinished prefills -1.
+            # They must reject without issuing an out-of-range device gather.
+            safe_tokens = token_ids.long().clamp(0, logits.shape[-1] - 1)
+            draft_logits = logits.gather(-1, safe_tokens.unsqueeze(-1)).squeeze(-1)
+            max_logits = logits.amax(dim=-1)
+            # p(draft) / max(p) = exp(z_draft - z_max). Compare in log space
+            # without softmax or device-to-host synchronization. Promote only
+            # the gathered/reduced rows, not the full vocabulary tensor.
+            log_threshold = math.log(self.threshold) if self.threshold > 0 else -math.inf
+            return (
+                valid_tokens
+                & torch.isfinite(draft_logits)
+                & torch.isfinite(max_logits)
+                & (draft_logits.float() - max_logits.float() > log_threshold)
+            )
+        values, top_ids = logits.topk(min(self.top_k, logits.shape[-1]), dim=-1)
+        # Masked logits must never pass just because k exceeds the allowed set.
+        return ((top_ids == token_ids.unsqueeze(-1)) & torch.isfinite(values)).any(dim=-1)
+
+
+class IntermediateDecisionRunner:
+    """Capture the vocabulary projection and acceptance, not a logits copy.
+
+    One graph per power-of-two request bucket; variable draft lengths are
+    tensor inputs. Output storage is reused and must be consumed before replay.
+    """
+
+    def __init__(self, compute_logits, policy, query_width, graph_enabled=False):
+        self.compute_logits = compute_logits
+        self.policy = policy
+        self.query_width = query_width
+        self.graph_enabled = graph_enabled
+        self.entries = {}
+        self.stream = None
+        self.pool = None
+        self.replays = 0
+        self._eager_shapes = OrderedDict()
+        self._graph_lengths = {}
+
+    def _run(self, hidden, tokens, sizes, steps):
+        starts = sizes.cumsum(0) - sizes
+        if self.policy.method == "all":
+            # Only bonus rows need a target prediction. Skip draft-row lm_head.
+            logits = self.compute_logits(hidden.index_select(0, starts + sizes - 1))
+            return torch.stack((sizes - 1, logits.argmax(-1)), dim=-1)
+        logits = self.compute_logits(hidden)
+        accepted = self.policy.accept(logits, tokens)
+        rows = (starts[:, None] + steps).clamp(max=hidden.shape[0] - 1)
+        is_draft = steps < sizes[:, None] - 1
+        stop = torch.where(is_draft & accepted[rows], self.query_width, steps).amin(dim=1)
+        replacement = logits.index_select(0, starts + stop).argmax(-1)
+        return torch.stack((stop, replacement), dim=-1)
+
+    @torch.inference_mode()
+    def __call__(self, hidden, tokens, lengths):
+        if not lengths or max(lengths) > self.query_width or sum(lengths) != hidden.shape[0]:
+            raise ValueError("Decision inputs must contain packed anchor/draft rows within the configured width.")
+        if not self.graph_enabled:
+            key = (hidden.device, tuple(lengths))
+            if key not in self._eager_shapes:
+                self._eager_shapes[key] = (
+                    torch.tensor(lengths, device=hidden.device),
+                    torch.arange(self.query_width, device=hidden.device),
+                )
+                if len(self._eager_shapes) > 16:
+                    self._eager_shapes.popitem(last=False)
+            self._eager_shapes.move_to_end(key)
+            sizes, steps = self._eager_shapes[key]
+            return self._run(hidden, tokens, sizes, steps)
+
+        from vllm.distributed.parallel_state import GraphCaptureContext, get_tp_group
+
+        from vllm_ascend.worker.v2.utils import communicator_switch
+
+        n = len(lengths)
+        bucket = 1 << (n - 1).bit_length()
+        if bucket not in self.entries:
+            self.entries[bucket] = (
+                hidden.new_zeros((bucket * self.query_width, hidden.shape[-1])),
+                torch.zeros(bucket * self.query_width, dtype=torch.int64, device=hidden.device),
+                torch.ones(bucket, dtype=torch.int64, device=hidden.device),
+                torch.arange(self.query_width, device=hidden.device),
+                None,
+                None,
+            )
+        static_hidden, static_tokens, sizes, steps, graph, output = self.entries[bucket]
+        static_hidden[: hidden.shape[0]].copy_(hidden)
+        if tokens is not None:
+            static_tokens[: tokens.numel()].copy_(tokens)
+        # Sizes are graph inputs, never graph outputs. A repeated shape can
+        # reuse their values as well as their addresses. Changed shapes still
+        # need fresh pinned storage to avoid racing an in-flight H2D.
+        shape = tuple(lengths) + (1,) * (bucket - n)
+        if self._graph_lengths.get(bucket) != shape:
+            host_sizes = torch.tensor(shape, dtype=torch.int64, pin_memory=True)
+            sizes.copy_(host_sizes, non_blocking=True)
+            self._graph_lengths[bucket] = shape
+        if graph is None:
+            if self.stream is None:
+                self.stream = torch.npu.Stream(device=hidden.device)
+                self.pool = torch.npu.graph_pool_handle()
+            current = torch.npu.current_stream()
+            self.stream.wait_stream(current)
+            with (
+                communicator_switch(),
+                get_tp_group().graph_capture(GraphCaptureContext(self.stream)),
+                torch.npu.stream(self.stream),
+            ):
+                # Warm allocation and TP communication paths before capture.
+                for _ in range(2):
+                    self._run(static_hidden, static_tokens, sizes, steps)
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph, pool=self.pool, stream=self.stream):
+                    output = self._run(static_hidden, static_tokens, sizes, steps)
+            current.wait_stream(self.stream)
+            self.entries[bucket] = static_hidden, static_tokens, sizes, steps, graph, output
+        graph.replay()
+        self.replays += 1
+        return output[:n]
+
+
+def assemble_verified_tokens(
+    logits: torch.Tensor,
+    draft_sampled: torch.Tensor,
+    target_sampled: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    num_speculative_steps: int,
+    policy: AcceptancePolicy,
+    steps: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack each accepted prefix and its target replacement/bonus, on device.
+
+    MRV2 inputs contain one context token followed by draft tokens per request;
+    each logit predicts the following token, with the final row for the bonus.
+    """
+    if steps is None:
+        steps = torch.arange(num_speculative_steps + 1, device=logits.device)
+    # MRV2 supplies int32 boundaries. Normalize once instead of implicitly
+    # promoting them again in each index/mask expression below.
+    cu_num_logits = cu_num_logits.long()
+    lengths = cu_num_logits[1:] - cu_num_logits[:-1]
+    draft_next = draft_sampled.roll(-1)
+    # Even all-policy rejects placeholder rows, without scanning vocabulary
+    # logits. MRV2 can schedule these after an incomplete/remote prefill.
+    accepted = (
+        (draft_next >= 0) & (draft_next < logits.shape[-1])
+        if policy.method == "all"
+        else policy.accept(logits, draft_next)
+    )
+    rows = (cu_num_logits[:-1, None] + steps).clamp(max=logits.shape[0] - 1)
+    is_draft = steps < lengths[:, None] - 1
+    # Bonus positions also terminate the prefix, including requests with no draft.
+    stop = torch.where(is_draft & accepted[rows], num_speculative_steps + 1, steps).amin(dim=1)
+    sampled = torch.where(steps < stop[:, None], draft_next[rows], target_sampled[rows])
+    sampled = sampled.masked_fill(steps > stop[:, None], -1)
+    return sampled.long(), (stop + 1).to(torch.int32)

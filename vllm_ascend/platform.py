@@ -416,6 +416,9 @@ class NPUPlatform(Platform):
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
         """Apply Ascend-specific defaults."""
+        from vllm_ascend.worker.v2.spec_decode.multi_stage.config import prepare_multi_stage_config
+
+        prepare_multi_stage_config(vllm_config)
 
         # TODO: Remove this memory-saving capture-size override and its ceiling
         # restoration once MC2 is no longer used.

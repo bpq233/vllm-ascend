@@ -1,0 +1,348 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
+"""Check the precomputed-context entry without importing vLLM or NPU kernels."""
+
+from enum import Enum
+from types import SimpleNamespace as NS
+from unittest.mock import Mock
+
+import numpy as np
+import pytest
+import torch
+from test_intermediate_backend import backend as backend
+from test_intermediate_backend import load_class
+
+
+class GraphMode(Enum):
+    NONE = "none"
+    FULL = "full"
+    PIECEWISE = "piecewise"
+
+
+@pytest.fixture
+def drafter():
+    def make(mode, padded_reqs=4):
+        events = []
+        prepare = Mock(side_effect=lambda *args, **kwargs: events.append("prepare"))
+        desc = NS(cg_mode=mode, num_reqs=padded_reqs, num_tokens=12)
+        dp_tokens = object()
+        dispatch = Mock(return_value=(desc, NS(num_tokens_across_dp=dp_tokens)))
+        slots = {"draft": object()}
+        build_slots = Mock(return_value=slots)
+        cls = load_class(
+            "drafter.py",
+            "IntermediateDFlashSpeculator",
+            dict(
+                AscendDFlashSpeculator=object,
+                CUDAGraphMode=GraphMode,
+                prepare_dflash_inputs=prepare,
+                dispatch_cg_and_sync_dp=dispatch,
+                build_slot_mappings_by_layer=build_slots,
+            ),
+        )
+        obj = cls()
+        obj.num_query_per_req, obj.num_speculative_steps = 3, 2
+        obj.max_num_reqs, obj.max_num_tokens, obj.max_model_len = 4, 12, 16
+        obj.draft_kv_cache_group_ids = [2, 0]
+        obj.block_tables = NS(
+            slot_mappings=torch.full((3, 12), -1, dtype=torch.long),
+            input_block_tables=[object(), object(), object()],
+            kernel_block_sizes=[4, 8, 16],
+            block_sizes=[12, 24, 48],
+            cp_rank=1,
+            cp_size=2,
+            cp_interleave=4,
+        )
+        obj.input_buffers = object()
+        obj.context_positions = object()
+        obj._context_slot_mappings = [object(), object()]
+        obj.sample_indices, obj.sample_pos, obj.sample_idx_mapping = object(), object(), object()
+        obj.temperature, obj.seeds = object(), object()
+        obj.parallel_drafting_token_id, obj.sample_from_anchor = 99, True
+        obj.dp_size, obj.dp_rank = 2, 1
+        obj.kv_cache_config = object()
+        obj.draft_tokens = torch.tensor([[7, 8], [9, 10], [-1, -1], [-1, -1]])
+        # The fast entry must never read/project context hidden states again.
+        obj.hidden_states = NS(copy_=Mock(side_effect=AssertionError("hidden copy")))
+        obj.model = NS(
+            precompute_and_store_context_kv=Mock(side_effect=AssertionError("context reprojection")),
+            combine_hidden_states=Mock(side_effect=AssertionError("aux reprojection")),
+        )
+        metadata = {"draft": object()}
+        obj.build_draft_attn_metadatas = Mock(side_effect=lambda *args: events.append("metadata") or (metadata, None))
+        obj._prepare_eplb_forward = Mock(side_effect=lambda *args: events.append("eplb"))
+        obj._generate_draft = Mock(side_effect=lambda *args: events.append("generate"))
+
+        def replay(descriptor):
+            events.append("replay")
+            obj.build_draft_attn_metadatas(descriptor.num_reqs, obj.input_batch.seq_lens_cpu_upper_bound)
+
+        obj.query_cudagraph_manager = NS(run_fullgraph=Mock(side_effect=replay))
+        batch = NS(num_reqs=2, seq_lens_np=np.array([5, 15]), seq_lens_cpu_upper_bound=torch.tensor([5, 15]))
+        inputs = (batch, torch.tensor([6, 16, 0, 0]), torch.ones(2), torch.zeros(2), object(), object())
+        return NS(
+            obj=obj,
+            inputs=inputs,
+            prepare=prepare,
+            dispatch=dispatch,
+            desc=desc,
+            dp_tokens=dp_tokens,
+            slots=slots,
+            build_slots=build_slots,
+            metadata=metadata,
+            events=events,
+        )
+
+    return make
+
+
+@pytest.mark.parametrize("mode", [GraphMode.FULL, GraphMode.NONE, GraphMode.PIECEWISE])
+def test_precomputed_entry_preserves_prepare_contract_and_real_batch(drafter, mode):
+    case = drafter(mode)
+    obj, batch = case.obj, case.inputs[0]
+    result = obj.propose_precomputed(*case.inputs)
+    assert result.tolist() == [[7, 8], [9, 10]]
+    assert result.data_ptr() == obj.draft_tokens.data_ptr()
+    assert obj.input_batch is batch
+    assert obj.draft_max_seq_len == 16  # Clamp the longest context plus query.
+    assert case.prepare.call_count == 2
+    for i, (gid, call) in enumerate(zip([2, 0], case.prepare.call_args_list)):
+        args, kwargs = call.args, call.kwargs
+        assert args[0] is obj.input_buffers
+        assert args[1].data_ptr() == obj.block_tables.slot_mappings[gid].data_ptr()
+        assert args[2] is obj.context_positions and args[3] is obj._context_slot_mappings[i]
+        assert args[4:9] == (obj.sample_indices, obj.sample_pos, obj.sample_idx_mapping, obj.temperature, obj.seeds)
+        assert args[9] is batch
+        assert args[10] is case.inputs[2] and args[11] is case.inputs[3]
+        assert args[12] is args[13] is case.inputs[1]
+        assert args[14] is case.inputs[4] and args[15] is case.inputs[5]
+        assert args[16] is obj.block_tables.input_block_tables[gid]
+        assert args[17] == obj.block_tables.kernel_block_sizes[gid]
+        assert kwargs == dict(
+            parallel_drafting_token_id=99,
+            num_query_per_req=3,
+            num_speculative_steps=2,
+            max_num_reqs=4,
+            max_num_tokens=12,
+            max_model_len=16,
+            sample_from_anchor=True,
+            cp_rank=1,
+            cp_size=2,
+            cp_interleave=4,
+            kv_cache_block_size=obj.block_tables.block_sizes[gid],
+        )
+    case.dispatch.assert_called_once_with(
+        obj.query_cudagraph_manager,
+        2,
+        6,
+        uniform_token_count=3,
+        dp_size=2,
+        dp_rank=1,
+        need_eager=False,
+    )
+    obj._prepare_eplb_forward.assert_called_once_with(6)
+    obj.model.precompute_and_store_context_kv.assert_not_called()
+    obj.model.combine_hidden_states.assert_not_called()
+    obj.hidden_states.copy_.assert_not_called()
+    obj.build_draft_attn_metadatas.assert_called_once_with(4, batch.seq_lens_cpu_upper_bound)
+    if mode == GraphMode.FULL:
+        assert case.events == ["prepare", "prepare", "eplb", "replay", "metadata"]
+        obj._generate_draft.assert_not_called()
+        case.build_slots.assert_not_called()
+        obj.query_cudagraph_manager.run_fullgraph.assert_called_once_with(case.desc)
+    else:
+        assert case.events == ["prepare", "prepare", "eplb", "metadata", "generate"]
+        obj.query_cudagraph_manager.run_fullgraph.assert_not_called()
+        assert case.build_slots.call_args.args[0].shape == (3, 12)
+        assert case.build_slots.call_args.args[1] is obj.kv_cache_config
+        obj._generate_draft.assert_called_once_with(2, 12, case.metadata, case.slots, case.dp_tokens, mode)
+
+
+def test_eager_descriptor_without_request_padding_uses_real_count(drafter):
+    case = drafter(GraphMode.NONE, padded_reqs=0)
+    case.obj.propose_precomputed(*case.inputs)
+    case.obj.build_draft_attn_metadatas.assert_called_once_with(2, case.inputs[0].seq_lens_cpu_upper_bound)
+
+
+@pytest.mark.parametrize("supports_update", [False, True])
+def test_full_graph_callback_keeps_precomputed_context_kv_and_only_refreshes_metadata(drafter, supports_update):
+    case = drafter(GraphMode.FULL)
+    case.obj.supports_decode_metadata_update = supports_update
+    case.obj._update_draft_decode_metadata = Mock()
+    metadata = object()
+
+    case.obj._prepare_graph_forward(2, metadata)
+
+    if supports_update:
+        case.obj._update_draft_decode_metadata.assert_called_once_with(metadata, 2)
+    else:
+        case.obj._update_draft_decode_metadata.assert_not_called()
+    case.obj.model.precompute_and_store_context_kv.assert_not_called()
+    case.obj.model.combine_hidden_states.assert_not_called()
+
+
+def test_backend_cached_fast_proposal_skips_verifier_metadata_and_preserves_positions(backend):
+    obj, metadata, _ = backend
+    list(obj.verify([[1, 2], [7]], [[3], [8]], req_ids=["a", "b"]))
+    obj.drafter.propose_precomputed = Mock(return_value=torch.tensor([[10, 11], [5, 6]]))
+    obj.drafter.model.precompute_and_store_context_kv.reset_mock()
+    metadata.reset_mock()
+    # Reorder requests and reject a tail: each still uses its own valid pages.
+    assert obj.propose([[7, 8, 9], [1, 2, 4]], req_ids=["b", "a"]) == [[10, 11], [5, 6]]
+    metadata.assert_not_called()
+    obj.drafter.propose.assert_not_called()
+    obj.drafter.model.precompute_and_store_context_kv.assert_not_called()
+    assert obj.model.call_count == 1
+    batch, anchors, ones, zeros, temperature, seeds = obj.drafter.propose_precomputed.call_args.args
+    assert batch.req_ids == ["b", "a"] and batch.num_reqs == 2
+    assert batch.input_ids.tolist() == [8, 2]
+    assert batch.positions.tolist() == [1, 1]
+    assert batch.query_start_loc.tolist() == [0, 1, 2]
+    assert batch.seq_lens.tolist() == [2, 2]
+    assert anchors[:2].tolist() == [9, 4]
+    assert ones.tolist() == [1, 1] and zeros.tolist() == [0, 0]
+    assert temperature is obj._proposal_temperature and seeds is obj._proposal_seeds
+    assert obj.block_tables.input_block_tables[0].tolist() == [[3, 4], [1, 2]]
+    assert obj.cache.tokens[obj.cache.slots["a"]] == [1, 2]
+    assert obj.cache.tokens[obj.cache.slots["b"]] == [7, 8]
+
+
+def test_backend_fast_entry_refreshes_context_after_prefix_mismatch(backend):
+    obj, metadata, _ = backend
+    list(obj.verify([[1, 2]], [[3]], req_ids=["a"]))
+    obj.drafter.propose_precomputed = Mock(return_value=torch.tensor([[10, 11]]))
+    obj.drafter.model.precompute_and_store_context_kv.reset_mock()
+    metadata.reset_mock()
+    assert obj.propose([[1, 9, 8]], req_ids=["a"]) == [[10, 11]]
+    metadata.assert_called_once()
+    assert obj.model.call_count == 2
+    assert obj.model.call_args.kwargs["input_ids"].tolist() == [9]
+    assert obj.model.call_args.kwargs["positions"].tolist() == [1]
+    hidden, positions, slots = obj.drafter.model.precompute_and_store_context_kv.call_args.args
+    assert hidden.tolist() == [[9, 1]] and positions.tolist() == [1] and slots.tolist() == [5]
+    assert obj.cache.tokens[obj.cache.slots["a"]] == [1, 9]
+    obj.drafter.propose_precomputed.assert_called_once()
+    obj.drafter.propose.assert_not_called()
+
+
+def test_target_rejection_to_earlier_valid_kv_does_not_require_saved_hidden(backend):
+    obj, metadata, _ = backend
+    obj.drafter.propose_precomputed = Mock(return_value=torch.tensor([[9, 10]]))
+    list(obj.verify([[1, 2]], [[3, 4]], req_ids=["a"]))
+    assert obj._context_rows[obj.cache.slots["a"]] is None
+    metadata.reset_mock()
+    obj.drafter.model.precompute_and_store_context_kv.reset_mock()
+    # The final Target rejected before the most recent verifier predictor range.
+    # Both context KV caches for token 1 remain valid; only the anchor changes.
+    assert obj.propose([[1, 7]], ["a"]) == [[9, 10]]
+    assert obj.model.call_count == 1
+    metadata.assert_not_called()
+    obj.drafter.model.precompute_and_store_context_kv.assert_not_called()
+    batch = obj.drafter.propose_precomputed.call_args.args[0]
+    assert batch.positions.tolist() == [0]
+    assert batch.input_ids.tolist() == [1]
+    assert obj.cache.tokens[obj.cache.slots["a"]] == [1]
+
+
+def test_precomputed_cache_miss_keeps_baseline_graph_dispatch_and_refreshes_kv(backend):
+    obj, metadata, _ = backend
+    obj.drafter.propose_precomputed = Mock(return_value=torch.tensor([[9, 10]]))
+    list(obj.verify([[1, 2]], [[3]], req_ids=["a"]))
+    assert obj._context_rows[obj.cache.slots["a"]] is None
+    # Changing a committed context token must still run the verifier, even
+    # though the request/slot is resident and the proposer ignores hidden rows.
+    assert obj.propose([[1, 8, 7]], ["a"]) == [[9, 10]]
+    assert obj.model.call_count == 2
+    assert obj.model.call_args.kwargs["input_ids"].tolist() == [8]
+    assert metadata.call_count == 2
+    assert obj.cache.tokens[obj.cache.slots["a"]] == [1, 8]
+
+
+def test_cached_proposal_preserves_verifier_buffers_and_uses_one_upload(backend, monkeypatch):
+    obj, _, _ = backend
+    obj.drafter.propose_precomputed = Mock(return_value=torch.tensor([[9, 10]]))
+    list(obj.verify([[1, 2]], [[3, 4]], req_ids=["a"]))
+    ids, positions = obj.input_buffers.input_ids.clone(), obj.input_buffers.positions.clone()
+    obj._forward = Mock(side_effect=AssertionError("Cached proposal rebuilt verifier inputs"))
+    uploads = []
+    original_to = torch.Tensor.to
+
+    def record(tensor, *args, **kwargs):
+        if kwargs.get("non_blocking"):
+            uploads.append((tensor.dtype, tensor.numel()))
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", record)
+    monkeypatch.setattr(torch, "index_select", Mock(side_effect=AssertionError("Repeated block table gather")))
+    assert obj.propose([[1, 2, 3, 4, 16777217]], ["a"]) == [[9, 10]]
+    assert uploads == [(torch.uint8, 32)]
+    torch.testing.assert_close(obj.input_buffers.input_ids, ids)
+    torch.testing.assert_close(obj.input_buffers.positions, positions)
+    batch, anchors, *_ = obj.drafter.propose_precomputed.call_args.args
+    assert batch.positions.tolist() == [3] and anchors.tolist() == [16777217]
+    assert batch.seq_lens.tolist() == [4] and batch.query_start_loc.tolist() == [0, 1]
+    assert batch.logits_indices.dtype == torch.int64 and batch.idx_mapping.dtype == torch.int32
+    assert batch.positions.untyped_storage().data_ptr() == anchors.untyped_storage().data_ptr()
+
+
+@pytest.mark.parametrize("path", ["cold", "cached", "mismatch"])
+@pytest.mark.parametrize("num_reqs", [1, 2])
+def test_proposal_batch_supplies_required_padded_request_count(backend, path, num_reqs):
+    obj, _, _ = backend
+    obj.drafter.propose_precomputed = Mock(return_value=torch.tensor([[9, 10], [19, 20]]))
+    ids = ["a", "b"][:num_reqs]
+    prefixes = [[1, 2, 3], [11, 12, 13]][:num_reqs]
+    if path != "cold":
+        list(obj.verify([[1, 2], [11, 12]][:num_reqs], [[3], [13]][:num_reqs], req_ids=ids))
+        prefixes = [[1, 2, 3, 4], [11, 12, 13, 14]][:num_reqs]
+        if path == "mismatch":
+            prefixes[0][1] = 8
+    obj.propose(prefixes, ids)
+    batch = obj.drafter.propose_precomputed.call_args.args[0]
+    assert batch.num_reqs_after_padding == batch.num_reqs == num_reqs
+    assert batch.num_tokens_after_padding == batch.num_tokens
+
+
+def test_cache_table_updates_on_reorder_buffer_replacement_and_stream_change(backend, monkeypatch):
+    obj, _, _ = backend
+    original = torch.index_select
+    gather = Mock(wraps=original)
+    monkeypatch.setattr(torch, "index_select", gather)
+    index = torch.tensor([0, 1])
+    obj._load_cache_tables([0, 1], index)
+    obj._load_cache_tables([0, 1], index)
+    assert gather.call_count == 1
+    obj._load_cache_tables([1, 0], index.flip(0))
+    assert gather.call_count == 2
+    assert obj.block_tables.input_block_tables[0].tolist() == [[3, 4], [1, 2]]
+    obj.block_tables.input_block_tables[0] = torch.full_like(obj.block_tables.input_block_tables[0], -9)
+    obj._load_cache_tables([1, 0], index.flip(0))
+    assert gather.call_count == 3
+    assert obj.block_tables.input_block_tables[0].tolist() == [[3, 4], [1, 2]]
+    stream = [object()]
+    monkeypatch.setattr(torch, "npu", NS(current_stream=lambda: stream[0]), raising=False)
+    obj.device = NS(type="npu")
+    obj._load_cache_tables([1, 0], index.flip(0))
+    obj._load_cache_tables([1, 0], index.flip(0))
+    assert gather.call_count == 4
+    stream[0] = object()
+    obj._load_cache_tables([1, 0], index.flip(0))
+    assert gather.call_count == 5
+
+
+def test_failed_table_update_cannot_leave_a_valid_cache_key(backend, monkeypatch):
+    obj, _, _ = backend
+    original = torch.index_select
+    obj._load_cache_tables([0], torch.tensor([0]))
+
+    def fail(source, dim, indices, **kwargs):
+        original(source, dim, indices, **kwargs)
+        raise RuntimeError("table update failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "index_select", fail)
+        with pytest.raises(RuntimeError, match="table update failed"):
+            obj._load_cache_tables([1], torch.tensor([1]))
+    assert obj._cache_table_state is None
+    obj._load_cache_tables([0], torch.tensor([0]))
+    assert obj.block_tables.input_block_tables[0][0].tolist() == [1, 2]

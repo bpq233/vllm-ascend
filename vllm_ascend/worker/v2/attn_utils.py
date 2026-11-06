@@ -70,6 +70,7 @@ from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.dsa_v41 import AscendDSAV41MetadataBuilder
 from vllm_ascend.attention.fa_v1 import AscendFlashAttentionBackend
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
+from vllm_ascend.attention.spec_decode import MAX_DECODE_QUERY_LEN, uses_long_speculative_queries
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     get_sfa_qsfa_packed_head_dim,
@@ -716,6 +717,9 @@ def build_attn_state(
     # but only one token is not hit in cache.
     elif np.all(num_scheduled_tokens == 1):
         attn_state = AscendAttentionState.DecodeOnly
+    elif uses_long_speculative_queries(vllm_config) and np.any(num_scheduled_tokens > MAX_DECODE_QUERY_LEN):
+        # Long candidates retain paged prefix KV and use causal cached prefill.
+        attn_state = AscendAttentionState.ChunkedPrefill
     # Speculative decoding or splitfuse.
     elif np.all(num_valid_tokens == 1) or vllm_config.scheduler_config.enable_chunked_prefill:
         attn_state = AscendAttentionState.ChunkedPrefill

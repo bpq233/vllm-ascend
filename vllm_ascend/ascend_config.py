@@ -586,6 +586,8 @@ class AscendConfig:
     enable_pcp_o_proj_weight_sharding: bool = True
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
     draft_window_size: int | None = None
+    # MRV2 intermediate models and optional final acceptance policy.
+    multi_stage_speculative: dict[str, Any] = dataclasses.field(default_factory=dict)
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
     # value (e.g. 4 = MXFP float8_e4m3 communication quantization) regardless of the
@@ -1903,6 +1905,13 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     # the single legitimate entry point — bypassing the factory leaves derived
     # fields at their sentinel defaults.
     new_config.derive_and_validate(vllm_config)
+    if new_config.multi_stage_speculative:
+        from vllm_ascend.worker.v2.spec_decode.multi_stage.config import validate_multi_stage
+
+        validate_multi_stage(vllm_config, new_config.multi_stage_speculative)
+        # Publish the resolved primary width after Pydantic's copy, so worker
+        # initialization derives the same capacity as the scheduler.
+        additional_config["multi_stage_speculative"] = new_config.multi_stage_speculative
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)
     new_config.xlite_graph_config._validate_preconditions(vllm_config)

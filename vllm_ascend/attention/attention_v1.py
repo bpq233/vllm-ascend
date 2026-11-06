@@ -48,6 +48,7 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     get_pcp_num_replicated_tokens,
     is_pcp_decode_sharding_enabled,
 )
+from vllm_ascend.attention.spec_decode import MAX_DECODE_QUERY_LEN, speculative_decode_threshold
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     _select_seq_lens,
@@ -71,6 +72,79 @@ SWA_INT_MAX = 2147483647
 _FIA_WORKSPACE_KEY = "npu_fused_infer_attention_score.workspace"
 _FIA_V2_WORKSPACE_KEY = "npu_fused_infer_attention_score_v2.workspace"
 _PA_WORKSPACE_KEY = "npu_paged_attention.workspace"
+
+
+def _normalize_fia_query_metadata(
+    query_tokens: int,
+    actual_seq_lengths_q: list[int],
+    actual_seq_lengths_kv,
+    block_table: torch.Tensor | None,
+):
+    """Drop graph-padding requests when the caller supplied an unpadded query."""
+    if not actual_seq_lengths_q:
+        raise RuntimeError(f"FIA query boundaries are missing for query_tokens={query_tokens}.")
+    if actual_seq_lengths_q[-1] == query_tokens:
+        return actual_seq_lengths_q, actual_seq_lengths_kv, block_table
+    if actual_seq_lengths_q[-1] < query_tokens:
+        raise RuntimeError(
+            "FIA query metadata is shorter than the query tensor: "
+            f"query_tokens={query_tokens}, actual_seq_lengths_q={actual_seq_lengths_q}."
+        )
+    try:
+        request_count = actual_seq_lengths_q.index(query_tokens) + 1
+    except ValueError as exc:
+        raise RuntimeError(
+            "FIA query does not end at a request boundary: "
+            f"query_tokens={query_tokens}, actual_seq_lengths_q={actual_seq_lengths_q}. "
+            "Cannot infer request ownership or KV lengths by truncating the metadata."
+        ) from exc
+    return (
+        actual_seq_lengths_q[:request_count],
+        actual_seq_lengths_kv[:request_count],
+        block_table[:request_count] if block_table is not None else None,
+    )
+
+
+def _fit_fia_query_to_output(
+    query: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    layer_name=None,
+    attn_metadata=None,
+    key=None,
+    value=None,
+) -> tuple[torch.Tensor, int]:
+    query_tokens = query.shape[0]
+    output_tokens = output.shape[0]
+    boundaries = attn_metadata.actual_seq_lengths_q if attn_metadata is not None else None
+    actual_tokens = getattr(attn_metadata, "num_actual_tokens", 0)
+    # Eager/piecewise forwards may retain model padding without a dummy
+    # request in the attention metadata. Only trim a suffix proven to be
+    # padding by both the real token count and the final request boundary.
+    # Full graph capture keeps its padded query shape and dummy requests.
+    untracked_padding = (
+        not _EXTRA_CTX.capturing
+        and boundaries is not None
+        and bool(boundaries)
+        and 0 < actual_tokens == boundaries[-1] < query_tokens
+    )
+    invalid_boundary = boundaries is not None and (
+        not boundaries or (boundaries[-1] != query_tokens and query_tokens not in boundaries and not untracked_padding)
+    )
+    if query_tokens > output_tokens or invalid_boundary or actual_tokens > query_tokens:
+        raise RuntimeError(
+            "FIA input contract mismatch before KV cache update; refusing to discard query tokens. "
+            f"layer={layer_name}, query_shape={tuple(query.shape)}, output_shape={tuple(output.shape)}, "
+            f"key_shape={tuple(key.shape) if key is not None else None}, "
+            f"value_shape={tuple(value.shape) if value is not None else None}, "
+            f"actual_seq_lengths_q={boundaries}, "
+            f"num_actual_tokens={actual_tokens}, "
+            f"attn_state={getattr(attn_metadata, 'attn_state', None)}, capturing={_EXTRA_CTX.capturing}. "
+            "Check the caller's FX output allocation and the active batch metadata."
+        )
+    if untracked_padding:
+        return query[:actual_tokens], actual_tokens
+    return query, query_tokens
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -271,11 +345,9 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         )
 
         self.speculative_config = vllm_config.speculative_config
-        self.decode_threshold = 1
+        self.decode_threshold = speculative_decode_threshold(vllm_config)
         if self.speculative_config:
-            spec_token_num = self.speculative_config.num_speculative_tokens
-            self.decode_threshold += spec_token_num
-            assert self.decode_threshold <= 16, (
+            assert self.decode_threshold <= MAX_DECODE_QUERY_LEN, (
                 f"decode_threshold exceeded \
                 npu_fused_infer_attention_score TND layout's limit of 16, \
                 got {self.decode_threshold}"
@@ -521,33 +593,45 @@ class FIAParamProvider:
     sliding_window: int | None
     is_draft_model: bool = False
     is_non_pa: bool = False
+    query_tokens: int | None = None
 
     def resolve(self, attn_metadata) -> dict[str, Any]:
         metadata = attn_metadata[self.layer_name]
-
-        if self.is_draft_model or not self.sliding_window:
-            return {
-                "actual_seq_lengths": metadata.actual_seq_lengths_q,
-                "actual_seq_lengths_kv": metadata.seq_lens_list,
-                "block_table": None if self.is_non_pa else metadata.block_tables,
-            }
-        else:
-            return {
-                "actual_seq_lengths": metadata.actual_seq_lengths_q,
-                "actual_seq_lengths_kv": metadata.seq_lens_list,
-            }
+        query_lengths = metadata.actual_seq_lengths_q
+        kv_lengths = metadata.seq_lens_list
+        block_table = None if self.is_non_pa else getattr(metadata, "block_tables", None)
+        if self.query_tokens is not None:
+            query_lengths, kv_lengths, block_table = _normalize_fia_query_metadata(
+                self.query_tokens, query_lengths, kv_lengths, block_table
+            )
+        params = {
+            "actual_seq_lengths": query_lengths,
+            "actual_seq_lengths_kv": kv_lengths,
+        }
+        if self.is_draft_model or not self.sliding_window or self.query_tokens is not None:
+            params["block_table"] = block_table
+        return params
 
 
 @dataclass(frozen=True, slots=True)
 class FIAV2ParamProvider:
     layer_name: str | None
+    query_tokens: int | None = None
+    is_non_pa: bool = False
 
     def resolve(self, attn_metadata) -> dict[str, Any]:
         metadata = attn_metadata[self.layer_name]
-        return {
-            "actual_seq_qlen": metadata.actual_seq_lengths_q,
-            "actual_seq_kvlen": metadata.seq_lens_list,
-        }
+        query_lengths = metadata.actual_seq_lengths_q
+        kv_lengths = metadata.seq_lens_list
+        block_table = None if self.is_non_pa else getattr(metadata, "block_tables", None)
+        if self.query_tokens is not None:
+            query_lengths, kv_lengths, block_table = _normalize_fia_query_metadata(
+                self.query_tokens, query_lengths, kv_lengths, block_table
+            )
+        params = {"actual_seq_qlen": query_lengths, "actual_seq_kvlen": kv_lengths}
+        if self.query_tokens is not None:
+            params["block_table"] = block_table
+        return params
 
 
 @dataclass(frozen=True, slots=True)
@@ -685,8 +769,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
 
-        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
-        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
+        query, num_tokens = _fit_fia_query_to_output(query, output)
+        actual_seq_lengths_q, actual_seq_lengths_kv, block_table = _normalize_fia_query_metadata(
+            num_tokens, attn_metadata.actual_seq_lengths_q, actual_seq_lengths_kv, block_table
+        )
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
         input_layout = "TND"
         attn_mask, sparse_mode, pre_tokens, next_tokens = self._get_fia_mask_params(attn_metadata, query.device)
@@ -768,6 +854,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 self.sliding_window,
                 _EXTRA_CTX.is_draft_model,
                 is_non_pa=block_table is None,
+                query_tokens=num_tokens,
             ),
         )
         return output, num_tokens
@@ -782,8 +869,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
         actual_seq_lengths_kv = attn_metadata.seq_lens
-        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
-        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
+        query, num_tokens = _fit_fia_query_to_output(query, output)
+        actual_seq_lengths_q, actual_seq_lengths_kv, block_table = _normalize_fia_query_metadata(
+            num_tokens, attn_metadata.actual_seq_lengths_q, actual_seq_lengths_kv, block_table
+        )
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
         output_view = output[: attn_metadata.num_actual_tokens]
         if block_table is None:
@@ -835,7 +924,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 "workspace": workspace,
                 "out": [output_view, softmax_lse],
             },
-            FIAV2ParamProvider(self._layer_name),
+            FIAV2ParamProvider(self._layer_name, query_tokens=num_tokens, is_non_pa=block_table is None),
         )
         return output, num_tokens
 
@@ -944,18 +1033,28 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if _EXTRA_CTX.capturing:
             if self.sinks is not None:
                 attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)
-                output[:num_tokens] = attn_output[:num_tokens]
+                if attn_output.data_ptr() != output.data_ptr():
+                    output[:num_tokens].copy_(attn_output[:num_tokens])
                 return output
             else:
                 attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output)
-                output[:num_tokens] = attn_output[:num_tokens]
+                if attn_output.data_ptr() != output.data_ptr():
+                    output[:num_tokens].copy_(attn_output[:num_tokens])
                 return output
         passed_value = value
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache
         )
-        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
-        query = query[:num_tokens]
+        query, num_tokens = _fit_fia_query_to_output(query, output)
+        actual_seq_lengths_q, actual_seq_lengths_kv, block_table = _normalize_fia_query_metadata(
+            num_tokens, attn_metadata.actual_seq_lengths_q, actual_seq_lengths_kv, block_table
+        )
+        if (
+            attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
+            and self.attn_type != AttentionType.ENCODER_DECODER
+        ):
+            actual_seq_lengths_kv = actual_seq_lengths_q
+        seq_lens_list = attn_metadata.seq_lens_list[: len(actual_seq_lengths_q)]
         if (
             attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
             and self.attn_type != AttentionType.ENCODER_DECODER
@@ -968,9 +1067,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         # Get workspace from cache or calculate it if not present.
         if self.sinks is not None:
-            actual_seq_qlen = attn_metadata.actual_seq_lengths_q
+            actual_seq_qlen = actual_seq_lengths_q
             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-                actual_seq_qlen = torch.tensor([1] * len(attn_metadata.seq_lens_list), dtype=torch.int32).cumsum(dim=0)
+                actual_seq_qlen = torch.tensor([1] * len(seq_lens_list), dtype=torch.int32).cumsum(dim=0)
             if self.sliding_window is not None:
                 sparse_mode = 4
             else:
@@ -1004,7 +1103,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     block_table=block_table,
                     input_layout="TND",
                     block_size=block_size,
-                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths=actual_seq_lengths_q,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
                     num_key_value_heads=self.num_kv_heads,
                     num_heads=self.num_heads,
@@ -1021,7 +1120,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     block_table=block_table,
                     input_layout="TND",
                     block_size=block_size,
-                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths=actual_seq_lengths_q,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
                     num_key_value_heads=self.num_kv_heads,
                     num_heads=self.num_heads,
@@ -1037,7 +1136,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     block_table=block_table,
                     input_layout="TND",
                     block_size=block_size,
-                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths=actual_seq_lengths_q,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
                     num_key_value_heads=self.num_kv_heads,
                     num_heads=self.num_heads,
@@ -1065,7 +1164,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     and attn_metadata.num_prefills > 0
                 ):
                     return self._forward_fia_chunked_prefill_split(
-                        query, key, value, key, passed_value, block_size, block_table, attn_metadata, output
+                        query,
+                        key,
+                        value,
+                        key,
+                        passed_value,
+                        block_size,
+                        block_table,
+                        attn_metadata,
+                        output,
+                        actual_seq_lengths_q,
+                        seq_lens_list,
                     )
                 attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(
                     query=query,
@@ -1075,7 +1184,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     block_table=block_table,
                     input_layout="TND",
                     block_size=block_size,
-                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths=actual_seq_lengths_q,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
                     num_key_value_heads=self.num_kv_heads,
                     num_heads=self.num_heads,
@@ -1091,7 +1200,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
 
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
-        output[:num_tokens] = attn_output[:num_tokens]
+        if attn_output.data_ptr() != output.data_ptr():
+            output[:num_tokens].copy_(attn_output[:num_tokens])
         return output
 
     def _forward_fia_chunked_prefill_split(
@@ -1105,6 +1215,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         block_table: torch.Tensor,
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
+        actual_seq_lengths_q: list[int] | None = None,
+        seq_lens_list: list[int] | None = None,
     ) -> torch.Tensor:
         """ChunkedPrefill with mixed prefill/decode: run decode and prefill in
         separate FIA calls. split_decodes_and_prefills has reordered the batch
@@ -1112,8 +1224,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
         """
         num_decodes = attn_metadata.num_decodes
         num_decode_tokens = attn_metadata.num_decode_tokens
-        actual_seq_qlen = attn_metadata.actual_seq_lengths_q
-        seq_lens_list = attn_metadata.seq_lens_list
+        actual_seq_qlen = (
+            actual_seq_lengths_q if actual_seq_lengths_q is not None else attn_metadata.actual_seq_lengths_q
+        )
+        seq_lens_list = seq_lens_list if seq_lens_list is not None else attn_metadata.seq_lens_list
         num_tokens = int(actual_seq_qlen[-1])
 
         # decode part
@@ -1374,7 +1488,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             raise NotImplementedError("fused output quantization is not yet supported for AscendAttentionBackendImpl")
 
         assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
-        num_tokens = query.shape[0]
+        query, num_tokens = _fit_fia_query_to_output(
+            query, output, layer_name=layer.layer_name, attn_metadata=attn_metadata, key=key, value=value
+        )
         if attn_metadata is None:
             return output.fill_(0)
 
@@ -1408,13 +1524,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # pooling model branch
         if attn_metadata.model_runner_type == "pooling" and not attn_metadata.causal:
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
-            output[:num_tokens] = attn_output[:num_tokens]
+            if attn_output.data_ptr() != output.data_ptr():
+                output[:num_tokens].copy_(attn_output[:num_tokens])
             return output
         if output_padded is not None:
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
         else:
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
-        output[:num_tokens] = attn_output[:num_tokens]
+        if attn_output.data_ptr() != output.data_ptr():
+            output[:num_tokens].copy_(attn_output[:num_tokens])
         return output
 
 
@@ -1445,7 +1563,9 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError("fused output quantization is not yet supported for AscendC8AttentionBackendImpl")
 
-        num_tokens = query.shape[0]
+        query, num_tokens = _fit_fia_query_to_output(
+            query, output, layer_name=layer.layer_name, attn_metadata=attn_metadata, key=key, value=value
+        )
         if attn_metadata is None:
             return output.fill_(0)
 
@@ -1460,14 +1580,16 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
             # pooling model branch
             if attn_metadata.model_runner_type == "pooling":
                 attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
-                output[:num_tokens] = attn_output[:num_tokens]
+                if attn_output.data_ptr() != output.data_ptr():
+                    output[:num_tokens].copy_(attn_output[:num_tokens])
                 return output
 
             # When `modelrunnerv2` compiles the graph, the value of `attn_metadata.attn_state` is `None`;
             # therefore, the graph-mode condition needs to be evaluated earlier.
             if _EXTRA_CTX.capturing:
                 attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output, layer)
-                output[:num_tokens] = attn_output[:num_tokens]
+                if attn_output.data_ptr() != output.data_ptr():
+                    output[:num_tokens].copy_(attn_output[:num_tokens])
                 return output
             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
                 return self._forward_c8_decode(query, attn_metadata, output, layer)
@@ -1493,13 +1615,15 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                 # pooling model branch
                 if attn_metadata.model_runner_type == "pooling":
                     attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
-                    output[:num_tokens] = attn_output[:num_tokens]
+                    if attn_output.data_ptr() != output.data_ptr():
+                        output[:num_tokens].copy_(attn_output[:num_tokens])
                     return output
                 if output_padded is not None:
                     attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
                 else:
                     attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
-                output[:num_tokens] = attn_output[:num_tokens]
+                if attn_output.data_ptr() != output.data_ptr():
+                    output[:num_tokens].copy_(attn_output[:num_tokens])
                 return output
             elif not self.is_kv_producer:
                 if key is not None and value is not None:
@@ -1508,11 +1632,13 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                 # pooling model branch
                 if attn_metadata.model_runner_type == "pooling":
                     attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
-                    output[:num_tokens] = attn_output[:num_tokens]
+                    if attn_output.data_ptr() != output.data_ptr():
+                        output[:num_tokens].copy_(attn_output[:num_tokens])
                     return output
                 if _EXTRA_CTX.capturing:
                     attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output, layer)
-                    output[:num_tokens] = attn_output[:num_tokens]
+                    if attn_output.data_ptr() != output.data_ptr():
+                        output[:num_tokens].copy_(attn_output[:num_tokens])
                     return output
                 elif attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
                     return self._forward_c8_decode(query, attn_metadata, output, layer)
@@ -1680,8 +1806,10 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         """
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_decodes = attn_metadata.num_decodes
-        actual_seq_qlen = attn_metadata.actual_seq_lengths_q
-        num_tokens = int(actual_seq_qlen[-1])  # type: ignore[index]
+        query, num_tokens = _fit_fia_query_to_output(query, output)
+        actual_seq_qlen, seq_lens_list, block_table = _normalize_fia_query_metadata(
+            num_tokens, attn_metadata.actual_seq_lengths_q, attn_metadata.seq_lens_list, attn_metadata.block_tables
+        )
 
         if num_decode_tokens > 0:
             num_block, block_size, _, _ = self.key_cache.shape  # type: ignore[attr-defined]
@@ -1697,8 +1825,8 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                 kv_v,
                 key_antiquant_scale=layer._c8_k_aq_scale_nz_bnsd,
                 value_antiquant_scale=layer._c8_v_aq_scale_nz_bnsd,
-                block_table=attn_metadata.block_tables[:num_decodes],
-                actual_seq_lengths_kv=attn_metadata.seq_lens_list[:num_decodes],
+                block_table=block_table[:num_decodes],
+                actual_seq_lengths_kv=seq_lens_list[:num_decodes],
                 num_heads=self.num_heads,
                 num_key_value_heads=self.num_kv_heads,
                 input_layout="BNSD",
@@ -1720,10 +1848,10 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
             ]
 
             all_new_prefill = True
-            for i in range(num_decodes, len(attn_metadata.seq_lens_list)):
+            for i in range(num_decodes, len(seq_lens_list)):
                 q_start = actual_seq_qlen[i - 1] if i > 0 else 0
                 qlen_i = actual_seq_qlen[i] - q_start
-                if attn_metadata.seq_lens_list[i] > qlen_i:
+                if seq_lens_list[i] > qlen_i:
                     all_new_prefill = False
                     break
 
@@ -1736,8 +1864,8 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                 paged_k = self._nz_5d_view(self.key_cache, blk_size)
                 paged_v = self._nz_5d_view(self.value_cache, blk_size)
 
-                prefill_bt = attn_metadata.block_tables[num_decodes:]
-                prefill_sl = attn_metadata.seq_lens_list[num_decodes:]
+                prefill_bt = block_table[num_decodes:]
+                prefill_sl = seq_lens_list[num_decodes:]
                 prefill_k, prefill_v = self._dequant_paged_kv_to_dense(
                     paged_k, paged_v, prefill_bt, prefill_sl, query.dtype, layer
                 )
@@ -1781,9 +1909,15 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         """
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
 
-        actual_seq_qlen = attn_metadata.actual_seq_lengths_q
-        num_tokens = int(actual_seq_qlen[-1])  # type: ignore[index]
-        query = query[:num_tokens]
+        query, num_tokens = _fit_fia_query_to_output(query, output)
+        actual_seq_qlen, actual_seq_lengths_kv, block_table = _normalize_fia_query_metadata(
+            num_tokens, attn_metadata.actual_seq_lengths_q, actual_seq_lengths_kv, block_table
+        )
+        if (
+            attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
+            and self.attn_type != AttentionType.ENCODER_DECODER
+        ):
+            actual_seq_lengths_kv = actual_seq_qlen
 
         if (
             attn_metadata.attn_state == AscendAttentionState.PrefillNoCache

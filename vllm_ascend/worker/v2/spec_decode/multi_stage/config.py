@@ -1,0 +1,237 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
+from dataclasses import dataclass, field
+
+MAX_DFLASH_DRAFT_TOKENS = 15
+
+
+def intermediate_capture_sizes(max_tokens, max_reqs, draft_width, requested=None):
+    """Sparse gears: resident models share the device's stream budget."""
+    if requested is not None:
+        if any(size > max_tokens for size in requested):
+            raise ValueError("intermediate.cudagraph_capture_sizes must fit the intermediate token buffer.")
+        sizes = set(requested)
+    else:
+        # Capture full-width batches exactly for each supported request count.
+        # Partial acceptances then pad by at most one per-request draft width,
+        # instead of jumping from a small query directly to the next x4 gear.
+        stride = draft_width + 1
+        sizes = {1, *(stride * requests for requests in range(1, max_reqs + 1) if stride * requests <= max_tokens)}
+        size = 16
+        while size < max_tokens:
+            sizes.add(size)
+            size *= 4
+    # Cover the largest secondary batch even if the verifier gears are sparse.
+    # Smaller DFlash batches pad to a captured request count.
+    sizes.update((max_reqs * (draft_width + 1), max_tokens))
+    return sorted(sizes)
+
+
+def primary_draft_width(options, final_capacity):
+    # A long final budget accumulates multiple short drafts. Do not silently
+    # turn that budget into an unsupported single DFlash query.
+    default = 4 if final_capacity > MAX_DFLASH_DRAFT_TOKENS else final_capacity
+    return options.get("primary_num_speculative_tokens", default)
+
+
+def initial_draft_width(options, final_capacity):
+    intermediate = options.get("intermediate", {})
+    if (
+        "intermediate" in options
+        and intermediate.get("num_rounds", 3) > 0
+        and not options.get("use_primary_drafter", False)
+    ):
+        return intermediate.get("num_speculative_tokens", 4)
+    return primary_draft_width(options, final_capacity)
+
+
+@dataclass
+class IntermediateConfig:
+    verifier_model: str
+    drafter_model: str
+    num_rounds: int = 3
+    num_speculative_tokens: int = 4
+    max_num_seqs: int = 4
+    max_model_len: int | None = None
+    cudagraph_capture_sizes: list[int] | None = None
+    verification: dict = field(default_factory=lambda: {"method": "topk", "top_k": 5})
+    # Resident KV slots can exceed the compute microbatch without enlarging
+    # graph inputs. None preserves the existing KV memory allocation.
+    cache_max_num_seqs: int | None = None
+    # Stop after a completed verification round produces MORE than this many
+    # candidates, including correction/bonus tokens. Never truncate that round.
+    max_generated_tokens: int | None = None
+
+    @classmethod
+    def from_dict(cls, values):
+        values = dict(values)
+        verifier = values.pop("verifier")
+        drafter = values.pop("drafter")
+        result = cls(verifier_model=verifier["model"], drafter_model=drafter["model"], **values)
+        if not result.verifier_model or not result.drafter_model:
+            raise ValueError("Both intermediate model paths are required.")
+        sizes = result.cudagraph_capture_sizes
+        if sizes is not None and (
+            not isinstance(sizes, list) or not sizes or any(type(size) is not int or size <= 0 for size in sizes)
+        ):
+            raise ValueError("intermediate.cudagraph_capture_sizes must be a nonempty list of positive integers.")
+        for name in (
+            "num_rounds",
+            "num_speculative_tokens",
+            "max_num_seqs",
+            "cache_max_num_seqs",
+            "max_model_len",
+            "max_generated_tokens",
+        ):
+            value = getattr(result, name)
+            minimum = 0 if name in ("num_rounds", "max_generated_tokens") else 1
+            if value is None and name in ("max_model_len", "cache_max_num_seqs", "max_generated_tokens"):
+                continue
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"intermediate.{name} must be an integer >= {minimum}.")
+        if result.cache_max_num_seqs is not None and result.cache_max_num_seqs < result.max_num_seqs:
+            raise ValueError("intermediate.cache_max_num_seqs must be >= intermediate.max_num_seqs.")
+        return result
+
+
+def candidate_capacity(primary_width, intermediate):
+    """Storage bound, including a full round's overshoot of the stop threshold."""
+    if intermediate.num_rounds == 0:
+        return primary_width
+    first_round = primary_width + 1
+    capacity = first_round + (intermediate.num_rounds - 1) * (intermediate.num_speculative_tokens + 1)
+    if intermediate.max_generated_tokens is not None and intermediate.num_rounds > 1:
+        capacity = min(
+            capacity, max(first_round, intermediate.max_generated_tokens + intermediate.num_speculative_tokens + 1)
+        )
+    return capacity
+
+
+def _validate_draft_widths(width, intermediate):
+    if type(width) is not int or width < 1:
+        raise ValueError("primary_num_speculative_tokens must be a positive integer.")
+    if width > MAX_DFLASH_DRAFT_TOKENS or intermediate.num_speculative_tokens > MAX_DFLASH_DRAFT_TOKENS:
+        raise ValueError(
+            f"DFlash per-round widths must be <= 15: primary_num_speculative_tokens={width}, "
+            f"intermediate.num_speculative_tokens={intermediate.num_speculative_tokens}. "
+            "Increase intermediate.num_rounds to accumulate long candidates."
+        )
+
+
+def prepare_multi_stage_config(vllm_config):
+    """Resolve capacity before upstream derives scheduler and graph defaults.
+
+    Full validation happens later, after upstream has resolved execution modes.
+    This early step deliberately depends only on the explicit draft options.
+    """
+    config = (vllm_config.additional_config or {}).get("multi_stage_speculative", {})
+    spec = vllm_config.speculative_config
+    if spec is None or "intermediate" not in config:
+        return
+    intermediate = IntermediateConfig.from_dict(config["intermediate"])
+    if intermediate.num_rounds == 0:
+        return
+    if type(config.get("use_primary_drafter", False)) is not bool:
+        raise ValueError("use_primary_drafter must be a boolean.")
+    if not config.get("use_primary_drafter", False) and "primary_num_speculative_tokens" in config:
+        raise ValueError("primary_num_speculative_tokens requires use_primary_drafter=true.")
+    width = initial_draft_width(config, spec.num_speculative_tokens)
+    _validate_draft_widths(width, intermediate)
+    if config.get("use_primary_drafter", False):
+        config["primary_num_speculative_tokens"] = width
+    spec.num_speculative_tokens = candidate_capacity(width, intermediate)
+
+
+def validate_multi_stage(vllm_config, config):
+    """Validate and derive storage before scheduler, KV and graph initialization."""
+    if not config:
+        return
+    if set(config) - {"use_primary_drafter", "primary_num_speculative_tokens", "intermediate", "final_verification"}:
+        raise ValueError("Unknown multi_stage_speculative option.")
+    if type(config.get("use_primary_drafter", False)) is not bool:
+        raise ValueError("use_primary_drafter must be a boolean.")
+    from vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance import AcceptancePolicy
+
+    if "final_verification" in config:
+        AcceptancePolicy(**config["final_verification"])
+    spec = vllm_config.speculative_config
+    if not vllm_config.use_v2_model_runner or spec is None:
+        raise ValueError("multi_stage_speculative requires MRV2 and speculative decoding.")
+    if "final_verification" in config:
+        if getattr(spec, "rejection_sample_method", "standard") != "standard":
+            raise ValueError("final_verification cannot be combined with a nonstandard rejection_sample_method.")
+        rejection = (vllm_config.additional_config or {}).get("rejection_sampler_config", {})
+        if rejection.get("enable_block_verify", False) or rejection.get("enable_entropy_verify", False):
+            raise ValueError("final_verification cannot be combined with block or entropy verification.")
+        if getattr(vllm_config, "watermark_config", None) is not None:
+            raise ValueError("final_verification does not support watermarking.")
+    # DFlash query kernels retain their original short-query contract. Only
+    # the target's extended candidates may use cached-prefill verification.
+    long_candidates = spec.num_speculative_tokens > MAX_DFLASH_DRAFT_TOKENS
+    if long_candidates and ("intermediate" not in config or config["intermediate"].get("num_rounds", 3) == 0):
+        raise ValueError("Long candidates require an active intermediate DFlash pipeline.")
+    if "intermediate" not in config:
+        if "primary_num_speculative_tokens" in config:
+            raise ValueError("primary_num_speculative_tokens requires intermediate.")
+        return
+    intermediate = IntermediateConfig.from_dict(config["intermediate"])
+    AcceptancePolicy(**intermediate.verification)
+    width = initial_draft_width(config, spec.num_speculative_tokens)
+    _validate_draft_widths(width, intermediate)
+    capacity = candidate_capacity(width, intermediate)
+    if capacity > MAX_DFLASH_DRAFT_TOKENS:
+        if getattr(vllm_config.model_config, "use_mla", False) or getattr(vllm_config.model_config, "is_hybrid", False):
+            raise ValueError("Long candidate verification currently requires a full-attention target.")
+        if vllm_config.cache_config.cache_dtype not in ("auto", "float16", "bfloat16"):
+            raise ValueError("Long candidate verification requires unquantized target KV cache.")
+    if vllm_config.scheduler_config.max_num_batched_tokens < capacity + 1:
+        raise ValueError(
+            f"max_num_batched_tokens must fit the derived candidate capacity plus its context token ({capacity + 1})."
+        )
+    if intermediate.num_rounds == 0:
+        if width != spec.num_speculative_tokens:
+            raise ValueError("With zero intermediate rounds, primary and final widths must match.")
+        return
+    if not config.get("use_primary_drafter", False) and "primary_num_speculative_tokens" in config:
+        raise ValueError("primary_num_speculative_tokens requires use_primary_drafter=true.")
+    if not spec.use_dflash():
+        raise ValueError("The intermediate pipeline requires speculative method='dflash'.")
+    architectures = getattr(getattr(spec, "draft_model_config", None), "architectures", ()) or ()
+    if set(architectures).intersection(("DFlash2DraftModel", "LiLiCorrDraftModel")):
+        raise ValueError(
+            "The intermediate pipeline requires the original DFlash architecture, not DFlash2 or LiLiCorr."
+        )
+    if "final_verification" not in config:
+        raise ValueError("Intermediate candidates require explicit final_verification: topk, all, or prob_ratio.")
+    parallel = vllm_config.parallel_config
+    if any(
+        getattr(parallel, name, 1) != 1
+        for name in (
+            "pipeline_parallel_size",
+            "data_parallel_size",
+            "prefill_context_parallel_size",
+            "decode_context_parallel_size",
+        )
+    ):
+        raise ValueError("Intermediate decoding currently supports TP only (PP/DP/CP must be 1).")
+    if vllm_config.scheduler_config.async_scheduling:
+        raise ValueError("Variable-length intermediate candidates require --no-async-scheduling.")
+    if (vllm_config.additional_config or {}).get("dynamic_spec_config", {}).get("method") is not None:
+        raise ValueError("Intermediate decoding derives its own lengths and cannot use dynamic_spec_config.")
+    if (vllm_config.additional_config or {}).get("finegrained_tp_config", {}).get("lmhead_tensor_parallel_size", 1) > 1:
+        raise ValueError("Intermediate verification does not support fine-grained lmhead tensor parallelism.")
+    if vllm_config.lora_config or vllm_config.model_config.is_multimodal_model:
+        raise ValueError("Intermediate decoding currently supports text-only models without LoRA.")
+    if getattr(vllm_config, "kv_transfer_config", None) is not None:
+        raise ValueError("Intermediate private KV caches do not support KV transfer or disaggregated prefill.")
+    if getattr(spec, "enable_adaptive_verification", False):
+        raise ValueError("Intermediate decoding cannot reuse primary adaptive-verification confidences.")
+    if getattr(spec, "num_speculative_tokens_per_batch_size", None):
+        raise ValueError(
+            "Intermediate decoding derives its own capacity; per-batch speculative limits are unsupported."
+        )
+    # Preserve the original primary width before replacing upstream's capacity.
+    # This must be idempotent when the config is initialized again in workers.
+    if config.get("use_primary_drafter", False):
+        config["primary_num_speculative_tokens"] = width
+    spec.num_speculative_tokens = capacity

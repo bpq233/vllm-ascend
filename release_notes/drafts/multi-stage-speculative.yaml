@@ -1,0 +1,5 @@
+# Draft: fill in the assigned PR number and move to fragments/<PR number>.yaml.
+pr: null
+entries:
+  - category: feature
+    text: Added hierarchical DFlash speculative decoding to Model Runner V2 with an independent intermediate verifier and drafter, configurable acceptance policies, and optional Primary drafting. Long candidate verification uses paged cached prefill with full-graph support.

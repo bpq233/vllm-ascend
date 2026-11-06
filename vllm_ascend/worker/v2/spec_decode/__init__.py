@@ -66,6 +66,17 @@ def init_speculator(
 
         return AscendDSparkSpeculator(vllm_config, device)
     if speculative_config.use_dflash():
+        options = (vllm_config.additional_config or {}).get("multi_stage_speculative", {})
+        if "intermediate" in options and options["intermediate"].get("num_rounds", 3) > 0:
+            if not options.get("use_primary_drafter", False):
+                from vllm_ascend.worker.v2.spec_decode.multi_stage.intermediate_speculator import (
+                    IntermediateOnlySpeculator,
+                )
+
+                return IntermediateOnlySpeculator(vllm_config, device)
+            from vllm_ascend.worker.v2.spec_decode.multi_stage.adapter import MultiStageDFlashSpeculator
+
+            return MultiStageDFlashSpeculator(vllm_config, device)
         if "LiLiCorrDraftModel" in speculative_config.draft_model_config.architectures:
             from vllm_ascend.worker.v2.spec_decode.lilicorr.speculator import (
                 AscendLiLiCorrSpeculator,

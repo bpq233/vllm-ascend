@@ -146,10 +146,9 @@ class AscendInputBatch(InputBatch):
             input_batch.input_ids = input_buffers.input_ids[:num_tokens_after_padding]
             input_batch.positions = input_buffers.positions[:num_tokens_after_padding]
             input_batch.is_padding = input_buffers.is_padding[:num_tokens_after_padding]
-        base_tokens = num_tokens // num_reqs
-        num_extra = num_tokens % num_reqs
-        input_buffers.seq_lens_np[: num_reqs - num_extra] = base_tokens
-        input_buffers.seq_lens_np[num_reqs - num_extra : num_reqs] = base_tokens + 1
+        # Upstream's ragged dummy queries need matching KV lengths. Rebuilding
+        # an even split changes request ownership during graph capture.
+        input_buffers.seq_lens_np[:num_reqs] = input_batch.num_scheduled_tokens
         input_buffers.seq_lens_np[num_reqs:] = 0
         seq_lens_np = input_buffers.seq_lens_np[:num_reqs]
         is_cpp_profile = input_buffers.profile_cpp
