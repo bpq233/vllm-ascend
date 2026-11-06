@@ -343,7 +343,19 @@ class NPUModelRunner(GPUModelRunner):
             self._start_dump_data()
         self.model_state.prompt_logprobs_worker = self.prompt_logprobs_worker
         options = self.ascend_config.multi_stage_speculative
-        if "final_verification" in options and self.is_last_pp_rank:
+        if (options.get("proposal_sampling") or {}).get("enabled", False) and self.is_last_pp_rank:
+            from vllm_ascend.worker.v2.spec_decode.multi_stage.proposal_sampling import ProposalSamplingContext
+            from vllm_ascend.worker.v2.spec_decode.multi_stage.proposal_verification import ProposalVerificationSampler
+
+            if getattr(self.sampler, "trace_replay_state", None) is not None:
+                raise ValueError("Proposal sampling does not support trace replay.")
+            context = ProposalSamplingContext(
+                options["proposal_sampling"], self.sampler, self.req_states, self.device, self.model_config.seed
+            )
+            self.rejection_sampler = ProposalVerificationSampler(
+                self.sampler, self.speculative_config, self.device, context
+            )
+        elif "final_verification" in options and self.is_last_pp_rank:
             from vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance import AcceptancePolicy
             from vllm_ascend.worker.v2.spec_decode.multi_stage.final_verification import FinalVerificationSampler
 
@@ -706,6 +718,9 @@ class NPUModelRunner(GPUModelRunner):
                     valid_dummy_state_slots=valid_dummy_state_slots,
                     **profile_kwargs,
                 )
+                proposal_context = getattr(self.rejection_sampler, "proposal_context", None)
+                if proposal_context is not None and not dummy_run:
+                    proposal_context.finish_step_registration()
                 if trace_verification:
                     self.rejection_sampler.end_forward()
                 forward_failed = False

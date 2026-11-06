@@ -22,6 +22,7 @@ def modules(monkeypatch):
         return module
 
     load("vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance", "acceptance.py")
+    load("vllm_ascend.worker.v2.spec_decode.multi_stage.proposal_config", "proposal_config.py")
     config = load("_intermediate_test_config", "config.py")
     pipeline = load("_intermediate_test_pipeline", "pipeline.py")
     return config, pipeline.IntermediatePipeline

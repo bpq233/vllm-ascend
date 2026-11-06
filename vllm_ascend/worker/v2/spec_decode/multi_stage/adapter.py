@@ -44,6 +44,9 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
             if getattr(scheduler_output, "pending_structured_output_tokens", False)
             else None
         )
+        context = getattr(self, "proposal_context", None)
+        if context is not None:
+            context.begin_step(scheduler_output)
         reset_ids = set(getattr(scheduler_output, "finished_req_ids", ()))
         reset_ids.update(request.req_id for request in getattr(scheduler_output, "scheduled_new_reqs", ()))
         self.reset_requests(reset_ids)
@@ -62,6 +65,9 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
         for req_id in reset_ids:
             self._host_histories.pop(req_id, None)
             retained.pop(req_id, None)
+            context = getattr(self, "proposal_context", None)
+            if context is not None:
+                context.discard(req_id)
         if reset_ids:
             current = [
                 (req_id, tokens) for req_id, tokens in zip(self.req_ids, self.candidates) if req_id not in reset_ids
@@ -137,9 +143,21 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
         backend = IntermediateBackend(runner.vllm_config, self.intermediate_config, self.device)
         backend.update_stream = runner.update_stream
         backend.load_model()
-        self.pipeline = IntermediatePipeline(
-            backend, self.intermediate_config, self.final_capacity, runner.model_config.hf_text_config.eos_token_id
-        )
+        self.proposal_context = getattr(final_verifier, "proposal_context", None)
+        if self.proposal_context is not None:
+            from vllm_ascend.worker.v2.spec_decode.multi_stage.proposal_pipeline import ProposalPipeline
+
+            self.pipeline = ProposalPipeline(
+                backend,
+                self.intermediate_config,
+                self.final_capacity,
+                runner.model_config.hf_text_config.eos_token_id,
+                self.proposal_context,
+            )
+        else:
+            self.pipeline = IntermediatePipeline(
+                backend, self.intermediate_config, self.final_capacity, runner.model_config.hf_text_config.eos_token_id
+            )
         logger.info(
             "multi_stage_init use_primary_drafter=%s primary_drafter_model=%s "
             "intermediate_verifier_model=%s secondary_drafter_model=%s "
@@ -152,7 +170,7 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
             self.intermediate_config.num_rounds,
             self.intermediate_config.max_generated_tokens,
             self.intermediate_config.num_speculative_tokens,
-            self.pipeline.policy.method,
+            self.pipeline.policy.method if self.proposal_context is None else "standard_mixture",
             runner.vllm_config.additional_config["multi_stage_speculative"]["final_verification"].get("method", "topk"),
             self.final_capacity,
         )
@@ -205,8 +223,9 @@ class MultiStageDFlashSpeculator(AscendDFlashSpeculator):
         if max_candidates is not None:
             limits = [min(limit, max_candidates) for limit in limits]
         self.pipeline.backend.cache.retain(self.req_states.req_id_to_index)
-        publish_device = getattr(self.pipeline.backend, "decision_runner", None) is not None and (
-            primary_tokens is None or all(isinstance(tokens, torch.Tensor) for tokens in primary_tokens)
+        publish_device = getattr(self, "proposal_context", None) is not None or (
+            getattr(self.pipeline.backend, "decision_runner", None) is not None
+            and (primary_tokens is None or all(isinstance(tokens, torch.Tensor) for tokens in primary_tokens))
         )
         self.candidates = self.pipeline.refine(
             prefixes,

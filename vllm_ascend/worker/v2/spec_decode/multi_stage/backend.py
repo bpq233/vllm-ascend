@@ -331,18 +331,29 @@ class IntermediateBackend:
             cfg.compilation_config.max_cudagraph_capture_size = self.max_num_tokens
         with self._context():
             self.model = get_model_loader(cfg.load_config).load_model(vllm_config=cfg, model_config=cfg.model_config)
-            self.decision_runner = IntermediateDecisionRunner(
-                self.model.compute_logits,
-                AcceptancePolicy(**self.config.verification),
-                max(
-                    self.config.num_speculative_tokens,
-                    initial_draft_width(
-                        self.parent_config.additional_config["multi_stage_speculative"],
-                        self.parent_config.speculative_config.num_speculative_tokens,
-                    ),
+            self.decision_runner = (
+                None
+                if (
+                    (
+                        (self.parent_config.additional_config or {})
+                        .get("multi_stage_speculative", {})
+                        .get("proposal_sampling")
+                        or {}
+                    ).get("enabled", False)
                 )
-                + 1,
-                graph_enabled=self.graph_enabled,
+                else IntermediateDecisionRunner(
+                    self.model.compute_logits,
+                    AcceptancePolicy(**self.config.verification),
+                    max(
+                        self.config.num_speculative_tokens,
+                        initial_draft_width(
+                            self.parent_config.additional_config["multi_stage_speculative"],
+                            self.parent_config.speculative_config.num_speculative_tokens,
+                        ),
+                    )
+                    + 1,
+                    graph_enabled=self.graph_enabled,
+                )
             )
             set_eagle3_aux_hidden_state_layers(self.model, cfg.speculative_config)
             self.drafter = IntermediateDFlashSpeculator(cfg, self.device)
@@ -407,6 +418,12 @@ class IntermediateBackend:
             captured_sizes,
         )
         capture_secondary_graphs(self.drafter)
+        if self.decision_runner is None:
+            # The exact path uses raw predictor logits and its own sampler.
+            # Capturing the old approximate vocabulary decision would waste
+            # graph resources and could accidentally use the wrong policy.
+            self.cache.retain(())
+            return
         # Capture in the same deterministic order on every TP rank. Keep
         # first-request latency and graph allocation out of the decode loop.
         requests = 1
@@ -914,6 +931,31 @@ class IntermediateBackend:
     def verify(self, prefixes, drafts, req_ids=None):
         for logits, lengths in self.verify_batches(prefixes, drafts, req_ids=req_ids):
             yield from logits.split(lengths)
+
+    @torch.inference_mode()
+    def proposal_logits(self, prefixes, req_ids):
+        """Return owned, device-resident next-token logits at each exact prefix.
+
+        An empty draft asks the verifier to recompute the final context row,
+        while retaining the equal earlier KV prefix. In particular, a previous
+        rejection cannot reuse logits from the discarded speculative suffix.
+        These are raw model logits: the proposal sampler must apply its actual
+        temperature/filtering before interpreting them as probabilities.
+        """
+        if not prefixes or len(req_ids) != len(prefixes) or len(set(req_ids)) != len(req_ids):
+            raise ValueError("Proposal logits require nonempty prefixes and one distinct request ID per prefix.")
+        chunks = []
+        for logits, lengths in self.verify_batches(
+            prefixes, [[] for _ in prefixes], req_ids=req_ids, retain_hidden=False
+        ):
+            if any(length != 1 for length in lengths) or logits.shape[0] != len(lengths):
+                raise RuntimeError("Next-token proposal logits must contain exactly one row per request.")
+            # The next microbatch may replay into the same graph output storage.
+            # Own these rows before resuming the verification generator.
+            chunks.append(logits.clone())
+        if not chunks or sum(chunk.shape[0] for chunk in chunks) != len(prefixes):
+            raise RuntimeError("Next-token proposal logits did not cover every requested prefix.")
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
 
     def _warm_prefixes(self, sequences, req_ids, required):
         """Avoid pathological padding across a large gap in sparse graph gears."""

@@ -1,0 +1,5 @@
+# Draft: assign the PR number and move to fragments/<PR number>.yaml.
+pr: null
+entries:
+  - category: feature
+    text: Added opt-in target-aligned hierarchical proposal sampling with true greedy DFlash delta proposals, probability-space mixtures, standard Target rejection sampling, and past-only adaptive mixture feedback. Includes CPU probability tests and isolated model benchmark cases; NPU performance gains are not assumed.

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 from dataclasses import dataclass, field
 
+from vllm_ascend.worker.v2.spec_decode.multi_stage.proposal_config import validate_proposal_sampling
+
 MAX_DFLASH_DRAFT_TOKENS = 15
 
 
@@ -125,6 +127,7 @@ def prepare_multi_stage_config(vllm_config):
     This early step deliberately depends only on the explicit draft options.
     """
     config = (vllm_config.additional_config or {}).get("multi_stage_speculative", {})
+    validate_proposal_sampling(vllm_config, config)
     spec = vllm_config.speculative_config
     if spec is None or "intermediate" not in config:
         return
@@ -146,13 +149,20 @@ def validate_multi_stage(vllm_config, config):
     """Validate and derive storage before scheduler, KV and graph initialization."""
     if not config:
         return
-    if set(config) - {"use_primary_drafter", "primary_num_speculative_tokens", "intermediate", "final_verification"}:
+    if set(config) - {
+        "use_primary_drafter",
+        "primary_num_speculative_tokens",
+        "intermediate",
+        "final_verification",
+        "proposal_sampling",
+    }:
         raise ValueError("Unknown multi_stage_speculative option.")
     if type(config.get("use_primary_drafter", False)) is not bool:
         raise ValueError("use_primary_drafter must be a boolean.")
+    proposal = validate_proposal_sampling(vllm_config, config)
     from vllm_ascend.worker.v2.spec_decode.multi_stage.acceptance import AcceptancePolicy
 
-    if "final_verification" in config:
+    if "final_verification" in config and not proposal.enabled:
         AcceptancePolicy(**config["final_verification"])
     spec = vllm_config.speculative_config
     if not vllm_config.use_v2_model_runner or spec is None:
@@ -175,7 +185,8 @@ def validate_multi_stage(vllm_config, config):
             raise ValueError("primary_num_speculative_tokens requires intermediate.")
         return
     intermediate = IntermediateConfig.from_dict(config["intermediate"])
-    AcceptancePolicy(**intermediate.verification)
+    if not proposal.enabled:
+        AcceptancePolicy(**intermediate.verification)
     width = initial_draft_width(config, spec.num_speculative_tokens)
     _validate_draft_widths(width, intermediate)
     capacity = candidate_capacity(width, intermediate)

@@ -1,5 +1,7 @@
 # MRV2 多级投机解码
 
+新增可选的 [Target-Aligned Proposal Sampling](target_aligned_proposal_sampling.md)，实现记录真实条件提议分布的混合采样、标准 Target 拒绝采样和历史反馈权重。默认关闭；本文继续说明原有近似验收路径。
+
 本实现已迁移至当前 MRV2 接口：请求排序在 `gather_batch_req_state` 阶段完成，`BatchReqState` 的全部逐请求数组同步重排，再生成模型输入。独立中间模型使用当前 KV 分配描述、`AscendBlockTables` 和 DFlash 物理块大小；最终采样器转发 `seq_lens_upper_bound_np`，并支持与采样输入分离的 `verify_draft_sampled`。旧版 `0.27.1` 兼容分支不再保留。
 
 迁移范围为已接通的 `topk`、`all` 和 `prob_ratio` 接受策略。旧工作树中未跟踪的 `exact_sampling.py`、四份 `test_exact*`/`test_multi_stage_exact_config.py` 及 `examples/offline_inference/multi_stage_exact_benchmark.py` 属于未完成的 exact sampling 草稿：测试引用的部分校验器和流水线接口尚未实现，不是可运行的旧版功能。它们没有接入新版生产路径；原文件仍完整保留在 `vllm-ascend-backup`。如需 exact sampling，必须先补齐逐级提案分布与残差拒绝采样，另做分布一致性验证，不能将 Top-k 或概率比阈值当成等价替代。
