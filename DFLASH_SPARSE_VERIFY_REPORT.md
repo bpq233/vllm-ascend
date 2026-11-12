@@ -1,5 +1,23 @@
 # Inter.md 实现与验证记录
 
+## 2026-11-12：修复变长草稿与调度器宽度传输的适配
+
+第二份真机日志在最终校验中报“NaN/+Inf/全 -Inf/非法候选 ID”的合并异常，
+单独该堆栈不能区分数值问题与非法 ID。核对锁定上游后确认了一个必须修复的问题：
+普通 `DraftTokensHandler` 在无结构化输出时仅传输张量宽度。稀疏多轮候选用 -1
+补齐到 K×N，沿用该处理器会把补齐槽位也调度给 Target。
+
+新增 `sparse_verify/draft_tokens.py`，仅为实验路径安装 `SparseDraftTokensHandler`，
+按每请求真实连续候选前缀上报宽度，并复用原生请求生命周期和占位计数传输。
+实际 Token 仍存于 RequestState。回归覆盖有效长度 0/1/7/17/28/60、零预算、
+不同请求及非法非连续前缀。最终校验仍严格拒绝无效数值，同时细分异常诊断并附请求信息。
+本地完整测试目录结果：**119 passed，316 subtests passed**；Ruff 检查通过。
+这些改动未证明服务器上的异常全部消除；同步后仍需真机重跑确认。
+
+需同步的运行时代码：`worker/v2/model_runner.py`，以及
+`worker/v2/spec_decode/dflash/sparse_verify/` 下的 `draft_tokens.py`（新增）、
+`decisions.py`、`sampling.py`。新增测试 `test_draft_tokens.py` 并扩充 `test_sampling.py`。
+
 ## 2026-11-12：修复首次真机反馈的 Anchor 形状错误
 
 用户提供的 Qwen3-32B、TP=2、FULL_DECODE_ONLY 日志显示，首次草稿扩展在

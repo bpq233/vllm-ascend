@@ -222,6 +222,14 @@ class TestSamplingAdapter(unittest.TestCase):
             sampling.sample_sparse_target(runner, torch.zeros(1, 1), batch, object())
         self.assertEqual(runner.model.lm_head_inputs, [])
 
+    def test_invalid_ids_and_numeric_failures_are_distinguishable(self):
+        with self.assertRaisesRegex(ValueError, r"req=r0.*invalid_id_values.*-1"):
+            self.run_sample("strict", [9, -1], [2, 3])
+        logits = greedy_logits([2, 3])
+        logits[0, 2] = float("nan")
+        with self.assertRaisesRegex(ValueError, r"req=r0.*invalid_id_values.*\[\].*nan_rows.*\[\[0\]\]"):
+            self.run_sample("strict", [9, 2], logits)
+
 
 class TestBoundedMetrics(unittest.TestCase):
     def test_detail_retention_is_bounded_but_aggregate_totals_are_lifetime(self):

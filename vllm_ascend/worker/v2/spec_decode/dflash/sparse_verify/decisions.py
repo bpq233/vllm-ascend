@@ -155,7 +155,18 @@ class FinalTargetVerifier:
             # A target with invalid numerical output cannot supply a sound
             # correction. This explicit check is outside all captured forwards.
             if bool((active & ~valid).any()):
-                raise ValueError("Target candidate logits contain NaN, +Inf, all -Inf or invalid candidate IDs")
+                invalid_ids = active & ((candidates < 0) | (candidates >= logits.shape[-1]))
+                rows = shape_logits.float()
+                issues = {
+                    "invalid_id_positions": invalid_ids.nonzero().cpu().tolist()[:8],
+                    "invalid_id_values": candidates[invalid_ids].cpu().tolist()[:8],
+                    "nan_rows": (active & torch.isnan(rows).any(dim=-1)).nonzero().cpu().tolist()[:8],
+                    "positive_inf_rows": (active & torch.isposinf(rows).any(dim=-1)).nonzero().cpu().tolist()[:8],
+                    "all_negative_inf_rows": (active & torch.isneginf(rows).all(dim=-1)).nonzero().cpu().tolist()[:8],
+                }
+                raise ValueError(
+                    "Target candidate logits contain NaN, +Inf, all -Inf or invalid candidate IDs: " + str(issues)
+                )
             if self.config.method == "strict":
                 keep = shape_logits.argmax(dim=-1) == candidates
             elif self.config.method == "topk":

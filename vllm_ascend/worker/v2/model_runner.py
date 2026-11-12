@@ -238,6 +238,10 @@ class NPUModelRunner(GPUModelRunner):
             self.speculator = init_speculator(self.vllm_config, self.device, self.req_states)
             # Share the update stream between the target and draft graph managers.
             self.speculator.update_stream = self.update_stream
+            if getattr(self.speculator, "sparse_config", None) is not None:
+                from vllm_ascend.worker.v2.spec_decode.dflash.sparse_verify.draft_tokens import SparseDraftTokensHandler
+
+                self.draft_tokens_handler = SparseDraftTokensHandler(self.device)
         # AscendInputBuffers has extra `seq_lens_cpu` attribute.
         # so reinitialize input_buffers here.
         self.input_buffers: AscendInputBuffers = AscendInputBuffers(

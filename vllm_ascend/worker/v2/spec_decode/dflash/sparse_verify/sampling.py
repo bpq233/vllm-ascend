@@ -56,7 +56,14 @@ def sample_sparse_target(runner, hidden_states, input_batch, grammar_output):
         candidates = input_batch.input_ids[indices[begin + 1 : end]].long()
         request_logits = logits[logit_row : logit_row + 1] if accept_all else logits[begin:end]
         start_time = perf_counter()
-        decision = verifier.verify(request_logits, candidates)
+        try:
+            decision = verifier.verify(request_logits, candidates)
+        except ValueError as error:
+            raise ValueError(
+                f"DFlash Target verification req={input_batch.req_ids[request]} "
+                f"method={config.final_verification.method} proposed={proposed} "
+                f"logits_shape={tuple(request_logits.shape)}: {error}"
+            ) from error
         positions = torch.arange(proposed, device=output.device)
         output[request, :proposed] = torch.where(positions < decision.accepted_length, candidates, -1).int()
         output[request].scatter_(0, decision.accepted_length.reshape(1).long(), decision.next_token.reshape(1).int())
