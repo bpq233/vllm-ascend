@@ -36,6 +36,11 @@ def init_speculator(
     """
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
+    sparse_config = (vllm_config.additional_config or {}).get("dflash_sparse_verify", {})
+    if sparse_config.get("enabled", False):
+        from vllm_ascend.worker.v2.spec_decode.dflash.sparse_verify.speculator import SparseDFlashSpeculator
+
+        return SparseDFlashSpeculator(vllm_config, device, req_states)
     if speculative_config.enforce_eager:
         vllm_config = copy.copy(vllm_config)
         vllm_config.compilation_config = copy.copy(vllm_config.compilation_config)

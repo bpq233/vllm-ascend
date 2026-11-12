@@ -4,7 +4,8 @@
 import dataclasses
 import weakref
 from collections.abc import Callable
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import patch
@@ -376,26 +377,56 @@ class GraphParams:
 _graph_params: GraphParams | None = None
 
 
+@dataclass
+class GraphParamsOwner:
+    """An extra model's graph resources, with the same lifetime as its manager.
+
+    Target and DFlash retain their existing buckets. A sparse verifier needs
+    independent event/handle/workspace lists even when token sizes coincide.
+    ContextVar scoping preserves nested calls and isolates concurrent contexts.
+    """
+
+    params: GraphParams | None = None
+
+
+_active_graph_params_owner: ContextVar[GraphParamsOwner | None] = ContextVar("acl_graph_params_owner", default=None)
+
+
+@contextmanager
+def graph_params_scope(owner: GraphParamsOwner):
+    token = _active_graph_params_owner.set(owner)
+    try:
+        yield
+    finally:
+        _active_graph_params_owner.reset(token)
+
+
 def set_graph_params(aclgraph_capture_sizes: list[int]):
     global _graph_params
-    if _graph_params is not None:
+    owner = _active_graph_params_owner.get()
+    if (owner.params if owner is not None else _graph_params) is not None:
         raise ValueError("Graph parameters have already been set!")
-    _graph_params = GraphParams(
+    params = GraphParams(
         {size: [] for size in aclgraph_capture_sizes},
         {size: None for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
     )
+    if owner is None:
+        _graph_params = params
+    else:
+        owner.params = params
 
 
 def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor):
-    global _graph_params
-    if _graph_params is not None:
-        _graph_params.workspaces[num_tokens] = workspace
+    params = get_graph_params()
+    if params is not None:
+        params.workspaces[num_tokens] = workspace
 
 
 def get_graph_params():
-    return _graph_params
+    owner = _active_graph_params_owner.get()
+    return owner.params if owner is not None else _graph_params
 
 
 _draft_graph_params: GraphParams | None = None

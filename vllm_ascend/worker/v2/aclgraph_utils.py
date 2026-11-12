@@ -143,10 +143,14 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 ):
                     prepare_engram()
             if use_updatable_graph(attn_backend):
-                return self._updatable_graph_replay(desc, attn_metadata)
+                ret = self._updatable_graph_replay(desc, attn_metadata)
             else:
                 # This will be removed once the refactoring is fully complete.
-                return self._graph_relay(attn_backend, desc, num_tokens, attn_metadata)
+                ret = self._graph_relay(attn_backend, desc, num_tokens, attn_metadata)
+            metrics = getattr(getattr(self.model_runner, "speculator", None), "sparse_metrics", None)
+            if metrics is not None:
+                metrics.record_graph("target", "replay")
+            return ret
         finally:
             if metadata is not None:
                 metadata.finish_replay()

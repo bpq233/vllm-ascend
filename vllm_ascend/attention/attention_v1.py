@@ -271,10 +271,17 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         )
 
         self.speculative_config = vllm_config.speculative_config
+        self.sparse_verify_enabled = bool(
+            (vllm_config.additional_config or {}).get("dflash_sparse_verify", {}).get("enabled", False)
+        )
         self.decode_threshold = 1
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
             self.decode_threshold += spec_token_num
+            if self.sparse_verify_enabled:
+                # Long logical verifies are split into bounded virtual FIA
+                # requests below. This threshold only classifies backend rows.
+                self.decode_threshold = min(self.decode_threshold, 16)
             assert self.decode_threshold <= 16, (
                 f"decode_threshold exceeded \
                 npu_fused_infer_attention_score TND layout's limit of 16, \
@@ -443,17 +450,43 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             num_decodes=num_decodes,
             num_prefills=num_prefills,
         )
+        query_start_loc_gpu = common_attn_metadata.query_start_loc
+        seq_lens_gpu = common_attn_metadata.seq_lens
+        max_query_len = common_attn_metadata.max_query_len
+        if self.sparse_verify_enabled and common_attn_metadata.causal and block_table is not None:
+            from vllm_ascend.worker.v2.spec_decode.dflash.sparse_verify.long_query import build_long_query_plan
+
+            starts = [0, *actual_seq_lengths_q]
+            # Native graph padding may describe a dummy row with one KV token
+            # and several padding queries. Give that null row a valid causal
+            # extent; its outputs are ignored and its slot mappings are PAD.
+            logical_lengths = [max(length, starts[i + 1] - starts[i]) for i, length in enumerate(seq_lens_list)]
+            plan = build_long_query_plan(starts, logical_lengths)
+            if plan.is_split or plan.num_virtual_requests != num_reqs_fia or logical_lengths != seq_lens_list:
+                block_table = plan.expand_block_table(block_table)
+                seq_lens = plan.seq_lens_tensor(seq_lens.device)
+                seq_lens_list = list(plan.seq_lens)
+                seq_lens_gpu = seq_lens.to(self.device, non_blocking=True)
+                actual_seq_lengths_q = list(plan.query_start_loc[1:])
+                query_start_loc = plan.query_start_tensor(self.device)
+                query_start_loc_gpu = query_start_loc
+                max_query_len = max(plan.query_lens)
+                # All queries remain in one paged causal FIA call. Its virtual
+                # rows share their request's physical pages, with each row's
+                # KV endpoint limited to historical_prefix + chunk_end.
+                attn_state = AscendAttentionState.ChunkedPrefill
+                num_decodes, num_decode_tokens, num_prefills = 0, 0, plan.num_virtual_requests
         attn_metadata = self.metadata_cls(
             num_actual_tokens=num_actual_tokens,
             num_decode_tokens=num_decode_tokens,
             block_tables=block_table,
             query_start_loc=query_start_loc,
-            query_start_loc_gpu=common_attn_metadata.query_start_loc,
-            seq_lens_gpu=common_attn_metadata.seq_lens,
+            query_start_loc_gpu=query_start_loc_gpu,
+            seq_lens_gpu=seq_lens_gpu,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
             seq_lens_list=seq_lens_list,
-            max_query_len=common_attn_metadata.max_query_len,
+            max_query_len=max_query_len,
             actual_seq_lengths_q=actual_seq_lengths_q,
             slot_mapping=slot_mapping,
             attn_mask=attn_mask,

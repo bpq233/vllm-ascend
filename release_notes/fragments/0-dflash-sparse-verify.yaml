@@ -1,0 +1,8 @@
+# Local change: replace 0 with the assigned PR number before submission.
+pr: 0
+entries:
+  - category: feature
+    text: >-
+      Added an opt-in experimental sparse-layer multi-round DFlash path for dense Qwen3,
+      with fixed or confidence-based rounds and four final Target acceptance policies.
+      Real NPU validation is pending; approximate policies do not preserve greedy Target output.

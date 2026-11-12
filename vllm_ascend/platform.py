@@ -600,6 +600,12 @@ class NPUPlatform(Platform):
                         config.compress_ratios = list(ratios)
 
         _validate_model_runner_config(vllm_config)
+        if (vllm_config.additional_config or {}).get("dflash_sparse_verify") is not None:
+            from vllm_ascend.worker.v2.spec_decode.dflash.sparse_verify.integration import (
+                configure_sparse_verification,
+            )
+
+            configure_sparse_verification(vllm_config)
         cls._validate_indexer_pp_config(vllm_config)
 
         _validate_pcp_dcp_config(vllm_config)

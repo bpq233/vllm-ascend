@@ -342,6 +342,21 @@ class NPUModelRunner(GPUModelRunner):
         self._finalize_dump_data()
         return output
 
+    def add_requests(self, scheduler_output):
+        sparse_config = getattr(self.speculator, "sparse_config", None)
+        if sparse_config is not None:
+            from vllm_ascend.worker.v2.spec_decode.dflash.sparse_verify.integration import validate_sparse_sampling
+
+            for request in scheduler_output.scheduled_new_reqs:
+                validate_sparse_sampling(sparse_config, request.sampling_params)
+                self.speculator.request_sampling[request.req_id] = request.sampling_params
+        return super().add_requests(scheduler_output)
+
+    def _remove_request(self, req_id):
+        if getattr(self.speculator, "sparse_config", None) is not None:
+            self.speculator.request_sampling.pop(req_id, None)
+        return super()._remove_request(req_id)
+
     def pool(self):
         output = super().pool()
         # Pooling models never go through sample_tokens() in the v2
@@ -588,8 +603,13 @@ class NPUModelRunner(GPUModelRunner):
             if "profile_only" not in inspect.signature(GPUModelRunner.capture_model).parameters:
                 if profile_only:
                     raise NotImplementedError("Graph memory profiling is unavailable in this vLLM version.")
-                return super().capture_model()
-            return super().capture_model(profile_only=profile_only)
+                memory = super().capture_model()
+            else:
+                memory = super().capture_model(profile_only=profile_only)
+        sparse_metrics = getattr(self.speculator, "sparse_metrics", None)
+        if sparse_metrics is not None and self.cudagraph_manager.graphs:
+            sparse_metrics.record_graph("target", "capture")
+        return memory
 
     # runtime_guard_step must stay INNER (below @torch.inference_mode()) so the
     # wave sync keeps running inside the inference-mode context.
@@ -633,6 +653,13 @@ class NPUModelRunner(GPUModelRunner):
         )
         profile_kwargs = {"randomize_inputs": randomize_inputs}
         forward_failed = True
+        sparse_metrics = getattr(self.speculator, "sparse_metrics", None)
+        measure_sparse_target = (
+            sparse_metrics is not None and sparse_metrics.enabled and not dummy_run and not is_profile
+        )
+        if measure_sparse_target:
+            self._sparse_target_events = (torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True))
+            self._sparse_target_events[0].record()
         with dp_coordination_context:
             try:
                 output = super().execute_model(
@@ -650,6 +677,8 @@ class NPUModelRunner(GPUModelRunner):
                 finish_execution = getattr(self.model_state, "finish_execution", None)
                 if finish_execution is not None:
                     finish_execution(failed=forward_failed)
+        if measure_sparse_target:
+            self._sparse_target_events[1].record()
         if not dummy_run and not is_profile:
             self._maybe_send_draft_kv(scheduler_output)
         self.model_state.kvpp_is_dummy_run = False
@@ -870,7 +899,8 @@ class NPUModelRunner(GPUModelRunner):
         # Some attention backends like FA3 require query_start_loc to be non-decreasing.
         query_start_loc_np[num_reqs + 1 :] = num_tokens
 
-        if batch_desc.cg_mode == CUDAGraphMode.FULL and not adaptive_verification_manager:
+        sparse_varlen = getattr(self.speculator, "sparse_config", None) is not None
+        if batch_desc.cg_mode == CUDAGraphMode.FULL and not adaptive_verification_manager and not sparse_varlen:
             # This is only required for vllm-ascend.
             query_start_loc_np, num_reqs_padded = self._pad_query_start_loc_for_fia(
                 num_tokens_after_padding,
@@ -900,7 +930,7 @@ class NPUModelRunner(GPUModelRunner):
                 query_start_loc_np[: num_reqs + 1] = query_start_loc[: num_reqs + 1].cpu().numpy()
                 query_start_loc_np[num_reqs + 1 :] = int(query_start_loc_np[num_reqs])
 
-        if self.use_fia and adaptive_verification_manager:
+        if (self.use_fia and adaptive_verification_manager) or sparse_varlen:
             if batch_desc.cg_mode == CUDAGraphMode.FULL:
                 query_start_loc_np, num_reqs_padded = self._pad_adaptive_query_start_loc_for_fia(
                     num_tokens_after_padding,
@@ -1073,6 +1103,10 @@ class NPUModelRunner(GPUModelRunner):
         """Override GPUModelRunner.sample for lmhead TP: every rank must feed
         compute_logits the same row count — pad up to ``_lmhead_tp_max_num_logits()``
         and trim back; prompt_logprobs stays unsupported (same as V1)."""
+        if getattr(self.speculator, "sparse_config", None) is not None:
+            from vllm_ascend.worker.v2.spec_decode.dflash.sparse_verify.sampling import sample_sparse_target
+
+            return sample_sparse_target(self, hidden_states, input_batch, grammar_output)
         if not lmhead_tp_enable():
             return super().sample(hidden_states, input_batch, grammar_output)
 
@@ -1500,7 +1534,8 @@ def graph_manager_wrapper(model_runner):
             decode_query_len,
             model_runner,
             lora_capture_cases=lora_capture_cases,
-            varlen_decode=varlen_decode,
+            varlen_decode=varlen_decode
+            or getattr(getattr(model_runner, "speculator", None), "sparse_config", None) is not None,
             ubatch_runner=ubatch_runner,
         )
 

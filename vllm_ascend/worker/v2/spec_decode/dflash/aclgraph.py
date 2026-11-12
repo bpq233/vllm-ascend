@@ -100,16 +100,25 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         if all(backend is AscendFlashAttentionBackend for backend in self.speculator.attn_backends.values()):
             # Length preparation and FlashAttn tiling run inside the graph,
             # reading the draft's persistent device buffers on every replay.
-            return super().run_fullgraph(desc)
+            ret = super().run_fullgraph(desc)
+            self._record_sparse_replay()
+            return ret
         draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
             desc.num_reqs,
             self.speculator.input_batch.seq_lens_cpu_upper_bound,
         )
         if use_updatable_graph(attn_backend):
-            return self._updatable_graph_replay(desc, draft_attn_metadatas)
+            ret = self._updatable_graph_replay(desc, draft_attn_metadatas)
         else:
             # This will be removed once the refactoring is fully complete.
-            return self._graph_replay(desc, attn_backend, num_tokens, draft_attn_metadatas)
+            ret = self._graph_replay(desc, attn_backend, num_tokens, draft_attn_metadatas)
+        self._record_sparse_replay()
+        return ret
+
+    def _record_sparse_replay(self):
+        metrics = getattr(self.speculator, "sparse_metrics", None)
+        if metrics is not None:
+            metrics.record_graph("dflash", "replay")
 
     def _graph_replay(self, desc, attn_backend, num_tokens, draft_attn_metadatas):
         self.update_stream.wait_stream(torch.npu.current_stream())
