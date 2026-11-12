@@ -1,5 +1,20 @@
 # Inter.md 实现与验证记录
 
+## 2026-11-12：修复首次真机反馈的 Anchor 形状错误
+
+用户提供的 Qwen3-32B、TP=2、FULL_DECODE_ONLY 日志显示，首次草稿扩展在
+`int(anchors[row])` 处触发 TypeError。当前上游 RequestState 将 `last_sampled_tokens`
+存成 `[max_num_reqs, 1]`，原代码误按一维处理，`.tolist()` 返回嵌套列表。
+
+`sparse_verify/speculator.py` 现在将二维单列转换为一维视图，同时兼容已有一维输入；
+其他形状明确报错。内部各轮使用本地副本更新 Anchor，不修改 Target 请求状态。
+新增 `test_speculator.py` 执行生产 propose 方法和真实多轮控制器，覆盖双请求、两轮、
+固定/置信度模式。已确认旧版本复现同一 TypeError，修复后完整目录 **115 passed，
+314 subtests passed**，Ruff 与 diff 检查通过。服务器修复后的 NPU 重跑尚未执行。
+
+日志中的 `Sparse Target forward used NONE ... prefill=True` 属于 FULL_DECODE_ONLY
+对 Prefill 的回退提示，不是本次退出原因；不能据此认定 Decode 图重放已成功。
+
 日期：2026-11-12。工作目录：`vllm-ascend`。
 
 已实际修改原始代码，新增默认关闭的稀疏层多轮 DFlash 实验路径。

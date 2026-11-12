@@ -147,6 +147,14 @@ class SparseDFlashSpeculator(AscendDFlashSpeculator):
         if aux_hidden_states is None or len(aux_hidden_states) != len(self.sparse_model.aux_layer_ids):
             raise ValueError("Target auxiliary features do not match the loaded DFlash checkpoint")
         count = input_batch.num_reqs
+        # RequestState stores one anchor per state as [max_num_reqs, 1] on
+        # current vLLM. Native DFlash kernels read that storage as a flat token
+        # vector. Use the same view for host selection and inner-round updates;
+        # otherwise tolist() produces nested lists and int(anchors[row]) fails.
+        if last_sampled.ndim == 2 and last_sampled.shape[1] == 1:
+            last_sampled = last_sampled[:, 0]
+        elif last_sampled.ndim != 1:
+            raise ValueError("DFlash last_sampled must have shape [requests] or [requests, 1]")
         # Explicit control dependencies outside all captured forwards. The first
         # version prioritizes correct prefix/cache state over host submission rate.
         rejected = num_rejected[:count].cpu().tolist()
