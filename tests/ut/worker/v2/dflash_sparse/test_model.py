@@ -137,6 +137,18 @@ def make_sparse(target=None, selected=(0, 2, 3), aux=(1, 3, 4)):
 
 
 @torch.inference_mode()
+def test_prefix_features_equal_same_layers_of_full_target():
+    target, prefix, _ = make_sparse(selected=(0, 1, 2), aux=(1, 2, 3))
+    tokens, positions = torch.tensor([3, 8, 1, 9, 11]), torch.arange(5)
+    actual_logits, prefix_features = prefix.forward_logits(tokens, positions)
+    expected_logits, _ = target.reference(tokens, positions, selected=(0, 1, 2), aux=(1, 2, 3))
+    _, target_features = target.reference(tokens, positions, aux=(1, 2, 3))
+    torch.testing.assert_close(actual_logits, expected_logits)
+    for actual, expected in zip(prefix_features, target_features):
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@torch.inference_mode()
 def test_all_layers_equal_full_target_logits_and_hidden_states():
     target, sparse, _ = make_sparse(selected=(0, 1, 2, 3), aux=(0, 1, 3, 4))
     tokens, positions = torch.tensor([3, 8, 1, 9, 11]), torch.arange(5)

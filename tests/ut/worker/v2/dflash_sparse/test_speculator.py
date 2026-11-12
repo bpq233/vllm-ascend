@@ -21,7 +21,7 @@ def load_speculator():
     package.__path__ = [str(directory)]
     sys.modules[name] = package
     modules = {}
-    for leaf in ("config", "decisions", "controller"):
+    for leaf in ("config", "decisions", "controller", "selection"):
         spec = importlib.util.spec_from_file_location(f"{name}.{leaf}", directory / f"{leaf}.py")
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
@@ -30,8 +30,17 @@ def load_speculator():
     tree = ast.parse((directory / "speculator.py").read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SparseDFlashSpeculator")
     propose = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "propose")
+    load_model = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "load_model")
 
     class NativeDraft:
+        def load_model(self, target):
+            self.native_load_snapshot = (
+                tuple(target.model.aux_hidden_state_layers),
+                tuple(
+                    self.vllm_config.speculative_config.draft_model_config.hf_config.eagle_aux_hidden_state_layer_ids
+                ),
+            )
+
         def propose(self, batch, metadata, slots, hidden, aux, sampled, rejected, last_sampled, *args, **kwargs):
             # Native input prep indexes last_sampled storage by request-state
             # offset; require the CPU view to agree with that flat layout.
@@ -50,12 +59,17 @@ def load_speculator():
         "FeatureBundle": modules["controller"].FeatureBundle,
         "SparseForwardOutput": modules["controller"].SparseForwardOutput,
         "single_request_batch": prepare_batch,
+        "select_prefix_layers": modules["selection"].select_prefix_layers,
+        "select_prefix_aux_layers": modules["selection"].select_prefix_aux_layers,
+        "SparseTargetVerifier": lambda target, selected, aux, registry: SimpleNamespace(
+            selected_layers=selected, aux_layer_ids=aux
+        ),
     }
     actual = ast.ClassDef(
         name=cls.name,
         bases=[ast.Name(id="NativeDraft", ctx=ast.Load())],
         keywords=[],
-        body=[propose],
+        body=[propose, load_model],
         decorator_list=[],
     )
     exec(
@@ -79,6 +93,29 @@ class SparseRunner:
 
 
 class TestSpeculatorAnchors(unittest.TestCase):
+    def test_prefix_captures_configured_before_native_draft_load(self):
+        cls, modules = load_speculator()
+        for n, expected in ((12, (1, 6, 12)), (32, (1, 16, 31))):
+            with self.subTest(n=n):
+                obj = cls()
+                obj.sparse_config = modules["config"].SparseVerifyConfig(enabled=True, num_intermediate_layers=n)
+                hf_config = SimpleNamespace(dflash_config={"target_layer_ids": [0, 15, 30]})
+                obj.vllm_config = SimpleNamespace(
+                    speculative_config=SimpleNamespace(draft_model_config=SimpleNamespace(hf_config=hf_config)),
+                    compilation_config=SimpleNamespace(static_forward_context={}),
+                )
+                obj.num_speculative_steps, obj.total_candidates = 7, 28
+                target = SimpleNamespace(
+                    model=SimpleNamespace(layers=list(range(32)), aux_hidden_state_layers=(1, 16, 31))
+                )
+                target.set_aux_hidden_state_layers = lambda ids, target=target: setattr(
+                    target.model, "aux_hidden_state_layers", ids
+                )
+                obj.load_model(target)
+                self.assertEqual(obj.sparse_model.selected_layers, tuple(range(n)))
+                self.assertEqual(obj.native_load_snapshot, (expected, expected))
+                self.assertEqual(hf_config.dflash_config["target_layer_ids"], [0, 15, 30])
+
     def run_proposal(self, column, mode="fixed"):
         cls, modules = load_speculator()
         speculator = cls()

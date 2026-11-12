@@ -1,8 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Select a fixed, uniformly spaced subset without dropping feature layers."""
+"""Layer selection helpers for the contiguous Target-prefix verifier."""
 
 from collections.abc import Iterable
+
+
+def select_prefix_layers(total_layers: int, num_layers: int) -> tuple[int, ...]:
+    """Execute the first N original layers in order, without internal skips."""
+    if type(total_layers) is not int or type(num_layers) is not int:
+        raise TypeError("total_layers and num_layers must be integers")
+    if not 1 <= num_layers <= total_layers:
+        raise ValueError("require 1 <= num_layers <= total_layers")
+    return tuple(range(num_layers))
+
+
+def select_prefix_aux_layers(total_layers: int, num_layers: int, checkpoint_captures: Iterable[int]) -> tuple[int, ...]:
+    """Keep the feature channel count, remapping deep captures into layers 1..N.
+
+    Capture c is the residual stream after original layer c-1. Existing capture
+    boundaries are retained if all are inside the prefix; otherwise select the
+    same number of unique boundaries uniformly from its first to last layer.
+    A single feature uses the final prefix layer. Feature channels remain in
+    the Target collector's increasing layer order.
+    """
+    select_prefix_layers(total_layers, num_layers)
+    captures = tuple(checkpoint_captures)
+    required_layers_from_aux_capture(total_layers, captures)
+    count = len(captures)
+    if count == 0:
+        raise ValueError("DFlash requires configured auxiliary feature layers")
+    if count > num_layers:
+        raise ValueError(f"prefix has {num_layers} layers but DFlash requires {count} distinct feature layers")
+    if all(1 <= layer <= num_layers for layer in captures):
+        return tuple(sorted(captures))
+    if count == 1:
+        return (num_layers,)
+    return tuple(1 + i * (num_layers - 1) // (count - 1) for i in range(count))
 
 
 def _layer_ids(values: Iterable[int], total_layers: int, name: str) -> tuple[int, ...]:

@@ -27,6 +27,28 @@ decisions = importlib.import_module(f"{PACKAGE_NAME}.decisions")
 metrics = importlib.import_module(f"{PACKAGE_NAME}.metrics")
 
 
+class TestPrefixSelection(unittest.TestCase):
+    def test_contiguous_prefix_and_remapped_features(self):
+        self.assertEqual(selection.select_prefix_layers(32, 12), tuple(range(12)))
+        self.assertEqual(selection.select_prefix_aux_layers(32, 12, (1, 16, 31)), (1, 6, 12))
+        self.assertEqual(selection.select_prefix_aux_layers(32, 32, (1, 16, 31)), (1, 16, 31))
+        self.assertEqual(selection.select_prefix_aux_layers(32, 12, (1, 4, 10)), (1, 4, 10))
+        self.assertEqual(selection.select_prefix_aux_layers(32, 12, (31,)), (12,))
+
+    def test_prefix_feature_count_and_bounds(self):
+        for n, count in itertools.product(range(1, 33), range(1, 6)):
+            captures = tuple(range(32 - count + 1, 33))
+            with self.subTest(n=n, count=count):
+                if count > n:
+                    with self.assertRaises(ValueError):
+                        selection.select_prefix_aux_layers(32, n, captures)
+                else:
+                    actual = selection.select_prefix_aux_layers(32, n, captures)
+                    self.assertEqual(len(actual), count)
+                    self.assertEqual(actual, tuple(sorted(set(actual))))
+                    self.assertTrue(all(1 <= c <= n for c in actual))
+
+
 def ratio_logits(ratios):
     """Candidate ID 1 has the requested probability ratio to ID 0."""
     return torch.tensor([[0.0, math.log(ratio)] for ratio in ratios], dtype=torch.float32)

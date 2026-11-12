@@ -17,7 +17,7 @@ from .integration import draft_block_config
 from .metrics import RoundMetrics, SparseVerificationMetrics
 from .model import SparseTargetVerifier
 from .runtime import SparseForwardRunner, private_block_tables, single_request_batch
-from .selection import required_layers_from_aux_capture, select_sparse_layers
+from .selection import select_prefix_aux_layers, select_prefix_layers
 
 
 class SparseDFlashSpeculator(AscendDFlashSpeculator):
@@ -40,15 +40,30 @@ class SparseDFlashSpeculator(AscendDFlashSpeculator):
         target_inner = target_model.model
         # Upstream has already configured the target's actual capture boundaries.
         # Preserve its output order (Qwen's forward walks original layer order).
-        aux_ids = tuple(sorted(target_inner.aux_hidden_state_layers))
-        if not aux_ids:
-            raise ValueError("DFlash checkpoint has no configured Target auxiliary hidden-state layers")
+        checkpoint_aux_ids = tuple(sorted(target_inner.aux_hidden_state_layers))
         total_layers = len(target_inner.layers)
-        selected = select_sparse_layers(
-            total_layers,
-            self.sparse_config.num_intermediate_layers,
-            required_layers_from_aux_capture(total_layers, aux_ids),
+        selected = select_prefix_layers(total_layers, self.sparse_config.num_intermediate_layers)
+        aux_ids = select_prefix_aux_layers(total_layers, len(selected), checkpoint_aux_ids)
+        # Configure BOTH collectors before draft loading or graph capture. The
+        # draft's FC and aux staging keep the checkpoint channel count, while
+        # initial Target features and subsequent prefix features use the same
+        # new layer boundaries and ordering.
+        target_model.set_aux_hidden_state_layers(aux_ids)
+        self.vllm_config.speculative_config.draft_model_config.hf_config.eagle_aux_hidden_state_layer_ids = list(
+            aux_ids
         )
+        logger.info(
+            "DFlash prefix verifier: first_n_layers=%s checkpoint_aux_capture_ids=%s effective_aux_capture_ids=%s",
+            len(selected),
+            checkpoint_aux_ids,
+            aux_ids,
+        )
+        if aux_ids != checkpoint_aux_ids:
+            logger.warning(
+                "DFlash feature layers were remapped into the first %s Target layers; "
+                "feature channel count is preserved but checkpoint feature semantics have changed.",
+                len(selected),
+            )
         self.sparse_model = SparseTargetVerifier(
             target_model, selected, aux_ids, self.vllm_config.compilation_config.static_forward_context
         )

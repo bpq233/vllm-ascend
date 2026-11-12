@@ -1,7 +1,9 @@
 # Experimental sparse-layer multi-round DFlash
 
-This opt-in experiment reuses a dense Qwen3 Target's weights for a sparse causal
-verifier. It alternates original parallel DFlash proposals and sparse verification,
+This opt-in experiment reuses the first N consecutive layers of a dense Qwen3
+Target for a causal prefix verifier. There are no skipped layers inside that
+prefix. The legacy `dflash_sparse_verify` configuration name is retained.
+It alternates original parallel DFlash proposals and prefix verification,
 then submits the accumulated candidates to the normal scheduler for one logical
 complete Target verification. Intermediate acceptance never commits output tokens.
 
@@ -52,7 +54,7 @@ print(outputs[0].outputs[0].text)
 | --- | --- |
 | `enabled` | Defaults to false; ordinary DFlash uses its existing class. |
 | `mode` | `fixed` uses sparse argmax; `confidence` uses two thresholds. |
-| `num_intermediate_layers` | Exact selected layer count; must include all required feature layers. |
+| `num_intermediate_layers` | N: execute original layers 0 through N-1. Must accommodate the checkpoint's feature count. |
 | `num_rounds` | Fixed round limit or confidence-mode maximum; zero-accept rounds consume the limit. |
 | `threshold_high`, `threshold_low` | Confidence requires `0 <= low < high <= 1`; fixed mode ignores their values. |
 | `feature_source` | `sparse` uses newly computed approximate features. `target` hands off to Target when true features do not cover the new prefix. |
@@ -83,22 +85,29 @@ owners before upstream KV memory profiling. The scheduler accounts for those
 additional cache tensors. Target, sparse verifier and DFlash have separate KV data.
 Gathered block-table buffers and their cached device pointer arrays are also private.
 
-The loaded Target's actual auxiliary capture boundaries are authoritative.
-Upstream converts DFlash post-layer `target_layer_ids` to capture boundaries with
-`+1`; boundary c greater than zero requires original Transformer layer c minus 1.
-Boundary zero denotes embeddings. Features retain the Target collector's order.
-Selection preserves required layers and minimizes squared gaps over the remaining
-positions, including the model boundaries, with deterministic tie breaking.
+The loaded Target's auxiliary capture boundaries determine the checkpoint's
+feature count. A capture boundary c denotes the output after original layer c-1.
+The verifier always executes layers `[0, ..., N-1]`. If all original feature
+boundaries lie within `[1, N]`, keep them. Otherwise select the same number of
+distinct feature boundaries uniformly from the first through the Nth layer.
+A checkpoint with a single feature uses the Nth layer. N smaller than the
+feature count raises an error; no features are silently dropped or repeated.
 
-For example, the tested synthetic case L=32, M=12 and required layers `[0, 15, 30]`
-selects `[0, 2, 4, 6, 9, 12, 15, 18, 21, 24, 27, 30]`. This is a test fixture,
-not a claim about a checkpoint that was unavailable locally. Actual selections
-are logged at model loading. M=L executes every original layer.
+For example, with L=32, N=12 and original capture boundaries `[1, 16, 31]`, execute
+layers `[0, 1, ..., 11]` and capture `[1, 6, 12]` (zero-based layers `[0, 5, 11]`).
+Both Target and prefix collectors are updated before draft loading or graph
+capture. Feature count, width and increasing channel order remain unchanged.
+The DFlash FC weights are not retrained: remapped channels change its checkpoint
+feature semantics, which is explicitly logged. N=L preserves original valid
+feature boundaries and executes every original layer.
 
 Each round labels features with source, layer order, tensor shape, token identity
 and absolute position interval. The initial round consumes true Target states.
 Further sparse rounds consume states strictly before the new anchor; rejected
-states are excluded. Sparse states are approximations of full Target features.
+states are excluded. For identical tokens and positions, these states should
+match the same early layers of full Target, subject to numerical tolerance.
+The prefix's final logits still apply the original final RMSNorm and LM Head
+at an early exit, and need not match full Target or improve acceptance rates.
 Sparse KV suffix invalidation uses actual sequence endpoints: subsequent calls
 overwrite from the anchor and cannot attend the stale rejected suffix.
 
