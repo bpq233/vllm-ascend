@@ -1,0 +1,5 @@
+# Local development placeholder; rename and set pr when a PR is assigned.
+pr: 0
+entries:
+  - category: feature
+    text: Added opt-in eager greedy DFlash feedback observation and online token bias calibration configured through additional_config.dflash_calib_config, with optional benchmark tooling.

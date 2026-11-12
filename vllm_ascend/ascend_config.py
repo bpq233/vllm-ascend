@@ -31,6 +31,7 @@ from vllm.utils.math_utils import cdiv
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.device_config import is_950
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
+from vllm_ascend.dflash_config import DFlashCalibrationConfig
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -537,6 +538,15 @@ class AscendConfig:
                 "method": null,
                 "method_params": {}
             },
+            "dflash_calib_config": {
+                "mode": "off",
+                "top_k": 16,
+                "alpha": 0.1,
+                "lambda": 0.3,
+                "clip_value": 2.0,
+                "min_observations": 5,
+                "output": "dflash_feedback"
+            },
             "sparse_kv_offload_config": {
                 "enabled": false,
                 "topk_buffer_size": -1,
@@ -637,6 +647,8 @@ class AscendConfig:
     finegrained_tp_config: FinegrainedTPConfig = dataclasses.field(default_factory=lambda: FinegrainedTPConfig())
     scheduler_config: SchedulerConfig = dataclasses.field(default_factory=lambda: SchedulerConfig())
     dynamic_spec_config: DynamicSpecConfig = dataclasses.field(default_factory=lambda: DynamicSpecConfig())
+    # Optional eager-only DFlash feedback experiment; all settings live here.
+    dflash_calib_config: DFlashCalibrationConfig = dataclasses.field(default_factory=DFlashCalibrationConfig)
     # Still factory-injected: construction depends on vllm_config.
     sparse_kv_offload_config: Any = dataclasses.field(kw_only=True)
     kvpp_config: KVPPConfig = dataclasses.field(default_factory=KVPPConfig, kw_only=True)

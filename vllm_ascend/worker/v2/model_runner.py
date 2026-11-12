@@ -1069,10 +1069,23 @@ class NPUModelRunner(GPUModelRunner):
         ``max_num_reqs * decode_query_len``); drift desyncs and hangs."""
         return lmhead_tp_max_num_logits(self.max_num_reqs, self.decode_query_len)
 
+    def _remove_request(self, req_id):
+        calibrator = getattr(self.speculator, "feedback_calibrator", None)
+        if calibrator is not None:
+            calibrator.pending.pop(req_id, None)
+            calibrator.steps.pop(req_id, None)
+        return super()._remove_request(req_id)
+
     def sample(self, hidden_states, input_batch, grammar_output):
         """Override GPUModelRunner.sample for lmhead TP: every rank must feed
         compute_logits the same row count — pad up to ``_lmhead_tp_max_num_logits()``
         and trim back; prompt_logprobs stays unsupported (same as V1)."""
+        if getattr(self.speculator, "feedback_calibrator", None) is not None:
+            from vllm_ascend.worker.v2.spec_decode.dflash.feedback_calibrator import sample_with_feedback
+
+            return sample_with_feedback(
+                self, hidden_states, input_batch, grammar_output, legacy_rejection=vllm_version_is("0.32.0")
+            )
         if not lmhead_tp_enable():
             return super().sample(hidden_states, input_batch, grammar_output)
 

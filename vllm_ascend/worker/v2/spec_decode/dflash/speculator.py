@@ -15,6 +15,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ops.triton.spec_decode.prepare_dflash_inputs import prepare_dflash_inputs_triton
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
@@ -187,6 +188,55 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         self._lmhead_tp_validate_draft_sampling()
+        self.feedback_calibrator = None
+        feedback_config = get_ascend_config().dflash_calib_config
+        if feedback_config.mode != "off":
+            # Lazy import: off allocates no feedback tensors or files.
+            from vllm_ascend.worker.v2.spec_decode.dflash.feedback_calibrator import (
+                FeedbackCalibrator,
+            )
+
+            parallel = vllm_config.parallel_config
+            if (
+                type(self) is not AscendDFlashSpeculator
+                or not vllm_config.model_config.enforce_eager
+                or not self.speculative_config.enforce_eager
+                or vllm_config.scheduler_config.async_scheduling
+                or any(
+                    getattr(parallel, field, 1) != 1
+                    for field in (
+                        "tensor_parallel_size",
+                        "pipeline_parallel_size",
+                        "data_parallel_size",
+                        "prefill_context_parallel_size",
+                        "decode_context_parallel_size",
+                    )
+                )
+                or self.speculative_config.draft_sample_method != "greedy"
+                or self.speculative_config.rejection_sample_method != "standard"
+                or self.enable_adaptive_verification
+                or self.use_local_argmax_reduction
+                or getattr(vllm_config, "watermark_config", None) is not None
+                or vllm_config.model_config.get_vocab_size() != self.vocab_size
+            ):
+                raise ValueError(
+                    "DFlash feedback MVP requires plain DFlash, identical vocabularies, "
+                    "single rank, synchronous eager greedy standard verification without watermarking/local argmax"
+                )
+            self.feedback_calibrator = FeedbackCalibrator(feedback_config)
+
+    def sample_draft(self, *args, **kwargs):
+        if self.feedback_calibrator is None or getattr(self, "_feedback_dummy", False):
+            return super().sample_draft(*args, **kwargs)
+        hidden_states, positions = args[:2]
+        if args[6] is not None:
+            raise ValueError("DFlash feedback requires greedy draft sampling")
+        logits = self.model.compute_logits(hidden_states)
+        count = len(self.input_batch.req_ids)
+        width = self.num_speculative_steps
+        return self.feedback_calibrator.propose(
+            logits.view(count, width, -1), self.input_batch.req_ids, (positions + 1).view(count, width)
+        ).reshape(-1)
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         if self.speculative_config.enforce_eager:
@@ -260,6 +310,7 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
         self.input_batch = input_batch
+        self._feedback_dummy = dummy_run or is_profile
         sync_state = dp_sync_state
         if dummy_run and skip_attn_for_dummy_run:
             # Profiling runs the draft with its own query token count, which
