@@ -183,6 +183,14 @@ report the first rejected candidate's `candidate_token_id`, `candidate_logit`,
 The rejection index is zero-based within the current draft block. These values
 come from the verifier's prediction row for that candidate, before softmax;
 they are not the DFlash proposal logits. All-accepted rounds have no rejection record.
+`DFlash M/L comparison` pairs each recorded M rejection with the subsequent L
+prediction at the same absolute position and candidate ID, and prints both layer
+counts, candidate/max logits, relative confidence, maximum-token agreement and
+candidate-logit difference. Pending records are request-local and released when
+consumed or when the request ends. A discarded candidate is marked
+`not_submitted_to_target`; a changed candidate is marked `candidate_changed`.
+Accept-all reports that candidate logits were not computed instead of running
+extra LM-head work for a comparison. No extra Target forward is introduced.
 Counts refer to sampled proposals before the engine applies final stop-string or
 generation-length truncation. Event timings include the corresponding worker
 submission's transfers and kernels; controller `host_records` are separately

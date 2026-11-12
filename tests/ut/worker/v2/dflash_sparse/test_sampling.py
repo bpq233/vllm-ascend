@@ -243,6 +243,39 @@ class TestSamplingAdapter(unittest.TestCase):
         self.assertEqual(details["max_logit"], 10.0)
         self.assertEqual(details["logit_gap"], 20.0)
 
+    def test_m_l_comparison_uses_same_token_position_and_retires_pending_record(self):
+        runner = make_runner("strict", greedy_logits([2, 3, 4]))
+        runner.speculator.sparse_model = SimpleNamespace(selected_layers=tuple(range(12)))
+        runner.speculator.target_num_layers = 32
+        runner.speculator.pending_rejection_comparisons = {
+            "r0": [
+                {
+                    "round": 0,
+                    "rejection": {
+                        "candidate_position": 51,
+                        "candidate_token_id": 2,
+                        "candidate_logit": -6.0,
+                        "max_token_id": 7,
+                        "max_logit": 10.0,
+                        "logit_gap": 16.0,
+                        "confidence": 1.125e-7,
+                    },
+                }
+            ]
+        }
+        batch = make_batch([9, 2, 3], [0, 3])
+        batch.positions = torch.tensor([50, 51, 52])
+        with patch.object(sampling, "logger") as logger:
+            output, _, _ = sampling.sample_sparse_target(runner, torch.arange(3).float()[:, None], batch, None)
+        calls = [c.args for c in logger.info.call_args_list if c.args[0].startswith("DFlash M/L comparison")]
+        self.assertEqual(len(calls), 1)
+        _, req, m, total, details = calls[0]
+        self.assertEqual((req, m, total), ("r0", 12, 32))
+        self.assertEqual(details["L"]["candidate_logit"], 10.0)
+        self.assertEqual(details["L"]["confidence"], 1.0)
+        self.assertEqual(output.sampled_token_ids[0, :3].tolist(), [2, 3, 4])
+        self.assertEqual(runner.speculator.pending_rejection_comparisons, {})
+
 
 class TestBoundedMetrics(unittest.TestCase):
     def test_detail_retention_is_bounded_but_aggregate_totals_are_lifetime(self):

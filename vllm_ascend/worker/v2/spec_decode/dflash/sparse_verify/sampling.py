@@ -8,6 +8,7 @@ import torch
 from vllm.logger import logger
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
+from .comparison import compare_rejections
 from .decisions import FinalTargetVerifier, rejection_logits
 from .metrics import FinalMetrics
 
@@ -70,6 +71,20 @@ def sample_sparse_target(runner, hidden_states, input_batch, grammar_output):
         num_sampled[request] = decision.accepted_length + 1
         num_rejected[request] = proposed - decision.accepted_length
         if config.enable_metrics:
+            pending = getattr(speculator, "pending_rejection_comparisons", {})
+            comparison_records = pending.pop(input_batch.req_ids[request], [])
+            if comparison_records:
+                candidate_positions = input_batch.positions[indices[begin + 1 : end]]
+                for comparison in compare_rejections(
+                    comparison_records, request_logits, candidates, candidate_positions, bonus_only=accept_all
+                ):
+                    logger.info(
+                        "DFlash M/L comparison req=%s M_layers=%s L_layers=%s details=%s",
+                        input_batch.req_ids[request],
+                        len(speculator.sparse_model.selected_layers),
+                        speculator.target_num_layers,
+                        comparison,
+                    )
             accepted = int(decision.accepted_length.item())
             rejected_at = int(decision.first_rejection.item())
             if rejected_at >= 0:

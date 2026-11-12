@@ -359,6 +359,7 @@ class NPUModelRunner(GPUModelRunner):
     def _remove_request(self, req_id):
         if getattr(self.speculator, "sparse_config", None) is not None:
             self.speculator.request_sampling.pop(req_id, None)
+            self.speculator.pending_rejection_comparisons.pop(req_id, None)
         return super()._remove_request(req_id)
 
     def pool(self):

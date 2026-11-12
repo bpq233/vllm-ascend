@@ -35,6 +35,7 @@ class SparseDFlashSpeculator(AscendDFlashSpeculator):
         )
         self.sparse_cudagraph_manager = None
         self.request_sampling = {}
+        self.pending_rejection_comparisons = {}
 
     def load_model(self, target_model):
         target_inner = target_model.model
@@ -42,6 +43,7 @@ class SparseDFlashSpeculator(AscendDFlashSpeculator):
         # Preserve its output order (Qwen's forward walks original layer order).
         checkpoint_aux_ids = tuple(sorted(target_inner.aux_hidden_state_layers))
         total_layers = len(target_inner.layers)
+        self.target_num_layers = total_layers
         selected = select_prefix_layers(total_layers, self.sparse_config.num_intermediate_layers)
         aux_ids = select_prefix_aux_layers(total_layers, len(selected), checkpoint_aux_ids)
         # Configure BOTH collectors before draft loading or graph capture. The
@@ -318,6 +320,11 @@ class SparseDFlashSpeculator(AscendDFlashSpeculator):
             )
             result[row, : proposal.tokens.numel()] = proposal.tokens
             if self.sparse_config.enable_metrics:
+                self.pending_rejection_comparisons[req_id] = [
+                    {"round": record.round_index, "rejection": record.rejection}
+                    for record in proposal.rounds
+                    if record.rejection is not None
+                ]
                 for record in proposal.rounds:
                     if record.rejection is not None:
                         logger.info(
