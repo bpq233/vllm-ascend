@@ -33,6 +33,24 @@ class FinalDecision:
     confidence: torch.Tensor
 
 
+def rejection_logits(logits: torch.Tensor, candidate_token_id: int) -> dict[str, int | float]:
+    """Small host diagnostic for one rejected row; call outside graph capture."""
+    row = logits.detach().float()
+    maximum, maximum_id = row.max(dim=-1)
+    candidate = row[candidate_token_id]
+    candidate_value, maximum_value, confidence = (
+        torch.stack((candidate, maximum, torch.exp(candidate - maximum))).cpu().tolist()
+    )
+    return {
+        "candidate_token_id": candidate_token_id,
+        "candidate_logit": candidate_value,
+        "max_token_id": int(maximum_id.item()),
+        "max_logit": maximum_value,
+        "logit_gap": maximum_value - candidate_value,
+        "confidence": confidence,
+    }
+
+
 def _inputs(
     logits: torch.Tensor, candidates: torch.Tensor, lengths: torch.Tensor | None
 ) -> tuple[torch.Tensor, torch.Tensor]:

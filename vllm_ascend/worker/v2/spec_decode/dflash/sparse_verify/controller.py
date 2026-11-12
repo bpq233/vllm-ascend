@@ -17,7 +17,7 @@ from typing import Literal
 import torch
 
 from .config import SparseVerifyConfig
-from .decisions import ConfidenceDecision
+from .decisions import ConfidenceDecision, rejection_logits
 
 
 @dataclass(frozen=True)
@@ -140,6 +140,7 @@ class RoundRecord:
     dflash_seconds: float
     sparse_seconds: float
     total_seconds: float
+    rejection: dict[str, int | float] | None = None
 
 
 @dataclass(frozen=True)
@@ -305,6 +306,12 @@ class MultiRoundDFlashController:
                     draft_end - round_start,
                     sparse_end - draft_end,
                     perf_counter() - round_start,
+                    {
+                        "candidate_position": anchor_position + 1 + rejected_at,
+                        **rejection_logits(output.candidate_logits[rejected_at], proposed_ids[rejected_at]),
+                    }
+                    if self.config.enable_metrics and rejected_at >= 0
+                    else None,
                 )
             )
             temporary_accepted += accepted

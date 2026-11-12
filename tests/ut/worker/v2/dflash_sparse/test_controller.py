@@ -130,6 +130,25 @@ class TestMultiRoundController(unittest.TestCase):
         self.assertTrue(torch.equal(second_features.token_ids, callbacks.verify_calls[0].input_ids[:2]))
         self.assertEqual(callbacks.draft_calls[1].anchor_token, int(result.tokens[1]))
 
+    def test_rejected_row_reports_candidate_and_maximum_logits(self):
+        callbacks = FakeCallbacks([[1, 1, 0.7, 1, 1, 1, 1]])
+        result = self.run_controller(callbacks, mode="confidence", rounds=1)
+        details = result.rounds[0].rejection
+        candidate = int(callbacks.verify_calls[0].input_ids[3])
+        self.assertEqual(details["candidate_token_id"], candidate)
+        self.assertEqual(details["candidate_position"], 6)
+        self.assertEqual(details["max_token_id"], (candidate + 1) % 32)
+        self.assertAlmostEqual(details["candidate_logit"], math.log(0.7), places=6)
+        self.assertEqual(details["max_logit"], 0.0)
+        self.assertAlmostEqual(math.exp(-details["logit_gap"]), details["confidence"], places=6)
+
+    def test_no_rejection_details_for_all_accept_or_disabled_metrics(self):
+        accepted = self.run_controller(FakeCallbacks(), rounds=1)
+        self.assertIsNone(accepted.rounds[0].rejection)
+        rejected = self.run_controller(FakeCallbacks([[0.1] * 7]), mode="confidence", rounds=1, enable_metrics=False)
+        self.assertEqual(rejected.rounds[0].first_rejection, 0)
+        self.assertIsNone(rejected.rounds[0].rejection)
+
     def test_low_threshold_hands_entire_pending_block_to_target(self):
         callbacks = FakeCallbacks([[1] * 7, [1, 1, 0.2, 1, 1, 1, 1]])
         result = self.run_controller(callbacks, mode="confidence")

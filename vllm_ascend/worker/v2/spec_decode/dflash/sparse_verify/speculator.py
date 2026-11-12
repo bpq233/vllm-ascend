@@ -304,6 +304,14 @@ class SparseDFlashSpeculator(AscendDFlashSpeculator):
             result[row, : proposal.tokens.numel()] = proposal.tokens
             if self.sparse_config.enable_metrics:
                 for record in proposal.rounds:
+                    if record.rejection is not None:
+                        logger.info(
+                            "DFlash sparse rejection req=%s round=%s first_rejection=%s details=%s",
+                            req_id,
+                            record.round_index,
+                            record.first_rejection,
+                            record.rejection,
+                        )
                     events = round_events[record.round_index]
                     events[3].synchronize()
                     dflash_seconds = events[0].elapsed_time(events[1]) / 1000

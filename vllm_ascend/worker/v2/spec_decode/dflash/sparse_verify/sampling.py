@@ -8,7 +8,7 @@ import torch
 from vllm.logger import logger
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
-from .decisions import FinalTargetVerifier
+from .decisions import FinalTargetVerifier, rejection_logits
 from .metrics import FinalMetrics
 
 
@@ -71,6 +71,14 @@ def sample_sparse_target(runner, hidden_states, input_batch, grammar_output):
         num_rejected[request] = proposed - decision.accepted_length
         if config.enable_metrics:
             accepted = int(decision.accepted_length.item())
+            rejected_at = int(decision.first_rejection.item())
+            if rejected_at >= 0:
+                logger.info(
+                    "DFlash Target rejection req=%s first_rejection=%s details=%s",
+                    input_batch.req_ids[request],
+                    rejected_at,
+                    rejection_logits(request_logits[rejected_at], int(candidates[rejected_at].item())),
+                )
             strict_accepted = None
             if not accept_all:
                 strict_mask = request_logits[:-1].argmax(dim=-1) == candidates

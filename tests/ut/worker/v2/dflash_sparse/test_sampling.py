@@ -230,6 +230,19 @@ class TestSamplingAdapter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"req=r0.*invalid_id_values.*\[\].*nan_rows.*\[\[0\]\]"):
             self.run_sample("strict", [9, 2], logits)
 
+    def test_target_rejection_logs_actual_rejected_prediction_row(self):
+        with patch.object(sampling, "logger") as logger:
+            self.run_sample("strict", [9, 2, 3], [2, 8, 4])
+        calls = [call.args for call in logger.info.call_args_list if call.args[0].startswith("DFlash Target rejection")]
+        self.assertEqual(len(calls), 1)
+        _, request_id, rejection_index, details = calls[0]
+        self.assertEqual((request_id, rejection_index), ("r0", 1))
+        self.assertEqual(details["candidate_token_id"], 3)
+        self.assertEqual(details["candidate_logit"], -10.0)
+        self.assertEqual(details["max_token_id"], 8)
+        self.assertEqual(details["max_logit"], 10.0)
+        self.assertEqual(details["logit_gap"], 20.0)
+
 
 class TestBoundedMetrics(unittest.TestCase):
     def test_detail_retention_is_bounded_but_aggregate_totals_are_lifetime(self):

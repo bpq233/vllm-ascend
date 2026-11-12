@@ -167,6 +167,13 @@ raw case JSON/logs as well as output agreement and throughput/TPOT comparisons.
 Approximate-policy output agreement is a quality measurement, not losslessness.
 
 Metrics retain at most 2048 detail records per kind and separate cumulative counts.
+With `enable_metrics=true`, `DFlash sparse rejection` and `DFlash Target rejection`
+report the first rejected candidate's `candidate_token_id`, `candidate_logit`,
+`max_token_id`, `max_logit`, `logit_gap` (maximum minus candidate), and relative
+`confidence`. Sparse records also include the absolute `candidate_position`.
+The rejection index is zero-based within the current draft block. These values
+come from the verifier's prediction row for that candidate, before softmax;
+they are not the DFlash proposal logits. All-accepted rounds have no rejection record.
 Counts refer to sampled proposals before the engine applies final stop-string or
 generation-length truncation. Event timings include the corresponding worker
 submission's transfers and kernels; controller `host_records` are separately
