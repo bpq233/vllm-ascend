@@ -58,8 +58,9 @@ class SlimVerifierTestWorker:
 
 @pytest.mark.parametrize("tp_size", [1, 2])
 @pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "graph"])
+@pytest.mark.parametrize("acceptance_strategy", ["top1", "probability_ratio"])
 @wait_until_npu_memory_free()
-def test_slim_verifier_npu(tp_size, enforce_eager, monkeypatch):
+def test_slim_verifier_npu(tp_size, enforce_eager, acceptance_strategy, monkeypatch):
     if not hasattr(torch, "npu") or torch.npu.device_count() < tp_size:
         pytest.skip(f"Requires {tp_size} actual Ascend NPUs")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
@@ -83,7 +84,13 @@ def test_slim_verifier_npu(tp_size, enforce_eager, monkeypatch):
     )
     baseline = None
     for mode in ("disabled", "full", "reduced"):
-        config = {"enabled": mode != "disabled", "log_interval": 1, "profile_latency": True}
+        config = {
+            "enabled": mode != "disabled",
+            "log_interval": 1,
+            "profile_latency": True,
+            "acceptance_strategy": acceptance_strategy,
+            "probability_ratio_threshold": 0.5,
+        }
         config.update({"skip_layers": []} if mode == "full" else {"keep_layers": [0]})
         with VllmRunner(MODEL, additional_config={"slim_verifier_eval": config}, **settings) as runner:
             if mode != "disabled":
@@ -104,4 +111,5 @@ def test_slim_verifier_npu(tp_size, enforce_eager, monkeypatch):
                     if probe["metrics"] is not None:
                         assert probe["metrics"]["blocks"] > 0
                         assert probe["metrics"]["draft_tokens"] > 0
+                        assert probe["metrics"]["slim_acceptance_strategy"] == acceptance_strategy
                         assert probe["metrics"]["slim_replay_ms_per_block"] > 0

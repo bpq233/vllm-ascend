@@ -105,6 +105,8 @@ def test_slim_config_survives_platform_initialization(config_factory, enabled):
             "log_interval": 100,
             "top_k": 5,
             "profile_latency": False,
+            "acceptance_strategy": "probability_ratio",
+            "probability_ratio_threshold": 0.7,
         },
         "enable_cpu_binding": False,
     }
@@ -118,6 +120,8 @@ def test_slim_config_survives_platform_initialization(config_factory, enabled):
     assert (slim is not None) == enabled
     if enabled:
         assert slim.keep_layers == (0, 4, 8, 12)
+        assert slim.acceptance_strategy == "probability_ratio"
+        assert slim.probability_ratio_threshold == 0.7
 
 
 def test_unrelated_unknown_config_is_still_rejected(config_factory):

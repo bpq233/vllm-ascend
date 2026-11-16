@@ -1,6 +1,6 @@
 # VIA-SD 第一阶段：Slim Verifier 影子校验
 
-本功能从当前 Target 的原始权重构建减层校验路径，对已经执行的同一批 Draft Token 进行额外的 Top-1 诊断。结果只进入统计模块，不回传给采样器、调度器或 Draft Model。不实现分级接受、概率接受修正、重新生成、Target 回退或 DIMR 搜索。
+本功能从当前 Target 的原始权重构建减层校验路径，对已经执行的同一批 Draft Token 进行额外的影子诊断。Slim 支持 Top-1 匹配或概率比阈值策略，Target 诊断仍使用 Top-1 匹配。结果只进入统计模块，不回传给采样器、调度器或 Draft Model。不实现分级接受、实际采样接受修正、重新生成、Target 回退或 DIMR 搜索。
 
 ## 支持范围
 
@@ -28,6 +28,8 @@ additional_config = {
         "log_interval": 100,
         "top_k": 5,
         "profile_latency": False,
+        "acceptance_strategy": "probability_ratio",
+        "probability_ratio_threshold": 0.5,
     }
 }
 ```
@@ -36,12 +38,25 @@ additional_config = {
 
 `log_interval` 是非空 Verification Block 数量，不是请求数、Token 数或 Scheduler Step 数。`top_k` 自动取不超过词表大小的值。`profile_latency` 默认关闭；开启时使用 NPU Event，且在每个 Block 完成后同步结束 Event，适用于实验测量。
 
+`acceptance_strategy` 默认是 `"top1"`，保持原有行为。设为 `"probability_ratio"` 时，对每个草稿 Token x，Slim 根据下式生成影子接受掩码：
+
+```text
+q(max) = 同一预测位置整个全局词表中的最大概率
+accept(x) = q(x) / q(max) > probability_ratio_threshold
+```
+
+阈值可配置为 `[0, 1]` 内的有限数，默认 `0.5`（仅作为实验初值），只在概率比策略下生效。按严格 `>` 比较，等于阈值时拒绝。`q` 是原始模型 Logits 在温度 1 下的 Softmax 分布，不应用实际采样的 Temperature、Top-K/Top-P、Penalty 或 Grammar。
+
+Softmax 归一化项会约掉，概率比等于 `exp(logit[x] - max(logits))`。实现直接比较 Logit 差与 `log(threshold)`，避免极小概率先算 Softmax 再相除造成下溢。阈值为 0 时接受正概率候选，精确零概率候选仍拒绝；阈值为 1 时全部拒绝，包括最高概率候选。比值本身可在 `last_results` 中检查，但 FP32 下极小比值仍可能显示为 0，接受判断以稳定的 log 空间比较为准。
+
+Top-1 策略选用确定性 Argmax；概率比策略下，与最高 Logit 并列的候选比值都是 1。即使保留全部层使两模型的 Logits 一致，选择不同判定策略后，两套影子接受率仍可能不同。两种策略都只统计当前相同上下文下的候选，连续接受长度仍在第一个拒绝处停止。
+
 启动示例（替换模型路径，按实际 Target 层数选择索引）：
 
 ```bash
 VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /path/to/target \
   --speculative-config '{"method":"draft_model","model":"/path/to/draft","num_speculative_tokens":3}' \
-  --additional-config '{"slim_verifier_eval":{"enabled":true,"keep_layers":[0,4,8,12],"log_interval":100,"top_k":5}}'
+  --additional-config '{"slim_verifier_eval":{"enabled":true,"keep_layers":[0,4,8,12],"log_interval":100,"top_k":5,"acceptance_strategy":"probability_ratio","probability_ratio_threshold":0.5}}'
 ```
 
 原有 `speculative_config` 的配置方式保持不变。例如已有 n-gram、EAGLE 或其他提案方式时，继续使用其原有配置，只添加 `slim_verifier_eval`。日志启动时打印实际总层数、保留层、跳过层和保留比例。
@@ -73,29 +88,32 @@ Target 诊断 Logits 从这次正常 Target Forward 的 Hidden States 额外调�
 
 ## 指标定义
 
-每条日志固定标识 **Top-1 Diagnostic**。即使推理使用随机采样，以下指标也只是原始模型分布的 Top-1 对照，不是实际概率接受率。
+默认策略的日志标识为 **Top-1 Diagnostic**。概率比策略标识为 **Shadow Diagnostic**，明确打印 `Target: top1`、`Slim: probability_ratio` 和严格阈值。即使推理使用随机采样，以下指标也是影子诊断结果，不是原有概率拒绝采样的实际接受率。
 
-设 B 为窗口/累计非空 Block 数，N 为其有效 Draft 总数。对每个模型计算匹配掩码 `argmax(logits_i) == draft_i`，p 为遇到第一个不匹配前的连续长度：
+设 B 为窗口/累计非空 Block 数，N 为其有效 Draft 总数。Target 接受掩码为 `argmax(target_logits_i) == draft_i`；Slim 接受掩码由所选策略产生，另外始终计算 Slim 的 Top-1 匹配掩码。各模型的 p 为其接受掩码遇到第一个拒绝前的连续长度：
 
 | 日志字段 | 计算方式 |
 | --- | --- |
 | `blocks` / `draft_tokens` | B / N |
 | `*_avg_accepted_length` | Σp / B |
 | `*_prefix_acceptance_rate` | Σp / N |
-| `*_token_match_rate` | 全部位置的匹配数量 / N，包含首次不匹配之后的位置 |
-| `*_full_block_acceptance_rate` | 全部 Draft 匹配的 Block 数 / B |
+| `*_token_match_rate` | 全部位置 Top-1 匹配数量 / N，包含首次不匹配之后的位置；Slim 此项始终是 Top-1 指标 |
+| `slim_token_acceptance_rate` | 全部位置被 Slim 所选策略接受的数量 / N；与 Top-1 匹配率分开 |
+| `*_full_block_acceptance_rate` | 按各自策略接受全部 Draft 的 Block 数 / B |
 | `*_avg_draft_logprob` | Σ(logit[draft] − logsumexp(logits)) / N |
 | `*_avg_top1_confidence` | Σexp(max(logits) − logsumexp(logits)) / N |
 | `*_avg_draft_rank` | Σ(1 + 严格高于 Draft Logit 的候选数量) / N；并列取相同名次 |
 | `prediction_agreement_rate` | 两模型 Top-1 ID 相同的位置数 / N |
-| `decision_agreement_rate` | 两匹配掩码相同的位置数 / N |
-| `slim_only_rate` | Slim 匹配、Target 不匹配的位置数 / N |
-| `target_only_rate` | Target 匹配、Slim 不匹配的位置数 / N |
+| `decision_agreement_rate` | Target Top-1 接受掩码与 Slim 所选策略接受掩码相同的位置数 / N |
+| `slim_only_rate` | Slim 策略接受、Target Top-1 拒绝的位置数 / N |
+| `target_only_rate` | Target Top-1 接受、Slim 策略拒绝的位置数 / N |
 | `mean_logprob_gap` | Target 平均 Draft LogProb − Slim 平均 Draft LogProb |
 | `top_k_overlap` | Σ(两模型 Top-K 集合交集大小 / K) / N |
 | `slim_replay_ms_per_block` | NPU Event 测得的减层历史 Forward + Slim LM Head 毫秒数 / 被计时 Block 数 |
+| `slim_acceptance_strategy` | 当前 Slim 判定策略名称 |
+| `probability_ratio_threshold` | 概率比策略使用的阈值，仅该策略输出 |
 
-`*` 分别为 `target` 和 `slim`。分母为 0 的空统计只返回 Block/Token 数，不输出伪造的平均值。窗口到达 `log_interval` 时同时输出 Window 和 Cumulative，随后只清空窗口。计数和概率在设备侧累积，到日志边界才回传紧凑汇总。主 Rank 的 `last_results` 保存最近 Batch 的 Request ID、预测位置、两套预测及匹配掩码，仅供实验检查。
+`*` 分别为 `target` 和 `slim`。分母为 0 的空统计只返回 Block/Token 数，不输出伪造的平均值。窗口到达 `log_interval` 时同时输出 Window 和 Cumulative，随后只清空窗口。计数和概率在设备侧累积，到日志边界才回传紧凑汇总。主 Rank 的 `last_results` 保存最近 Batch 的 Request ID、预测位置、两套预测和接受掩码，另有 `slim_top1_match_mask`、策略名称以及概率比策略下的 `slim_probability_ratios`，仅供实验检查。
 
 没有输出 Target Verify Time、JS Divergence 或 Logit Margin，因为本阶段未测量这些量。`SlimVerifierEval.flush()` 可输出尾部不足一个窗口的数据；下面的 NPU 测试通过 Worker RPC 在实验结束时调用它。
 
@@ -107,7 +125,7 @@ CPU 测试使用真实 PyTorch 张量和独立的 Attention 矩阵参考，不�
 python -m pytest --confcutdir=tests/ut/slim_verifier tests/ut/slim_verifier -q
 ```
 
-覆盖：全层 Logits 一致性、真实跳层、零层消融、参数存储共享、Target KV 保护、配置校验、连续前缀和 Token 匹配区别、概率与 Rank、窗口/累计、跨请求变长/槽位映射、Padding/Bonus 排除、实际位置对齐、RNG/输入保护、非主 TP Rank 参加全部计算、全词表宽度检查，以及原采样结果对象保持不变。
+覆盖：全层 Logits 一致性、真实跳层、零层消融、参数存储共享、Target KV 保护、配置校验、连续前缀和 Token 匹配区别、概率与 Rank、窗口/累计、跨请求变长/槽位映射、Padding/Bonus 排除、实际位置对齐、RNG/输入保护、非主 TP Rank 参加全部计算、全词表宽度检查，以及原采样结果对象保持不变。概率比测试还覆盖与 Softmax 比值的一致性、严格阈值边界、0/1 阈值、并列最大值、下溢、大幅平移 Logits、策略接受率与 Top-1 匹配率分离及日志标识。
 
 真实 NPU 测试入口：
 
@@ -115,9 +133,9 @@ python -m pytest --confcutdir=tests/ut/slim_verifier tests/ut/slim_verifier -q
 python -m pytest tests/manual/test_slim_verifier_npu.py -v -s
 ```
 
-该测试使用 Qwen3-0.6B Target 和同检查点 Draft，分别测试 TP=1/2、Eager/Graph、关闭/保留全部层/只保留第 0 层；检查真实全词表 Logits 的 BF16 数值误差、真实执行层、非空周期指标和 NPU Event 时间，并比较最终生成 Token ID 序列。还包括变长 Prompt、Chunked Prefill、Prefix Cache 和第二轮请求槽位复用。需要当前仓库匹配的 vLLM、CANN、torch_npu、检查点与相应数量的 NPU。
+该测试使用 Qwen3-0.6B Target 和同检查点 Draft，分别测试 TP=1/2、Eager/Graph、两种 Slim 判定策略、关闭/保留全部层/只保留第 0 层；检查真实全词表 Logits 的 BF16 数值误差、真实执行层、非空周期指标和 NPU Event 时间，并比较最终生成 Token ID 序列。还包括变长 Prompt、Chunked Prefill、Prefix Cache 和第二轮请求槽位复用。需要当前仓库匹配的 vLLM、CANN、torch_npu、检查点与相应数量的 NPU。
 
-当前 Windows 环境使用 Python 3.11.9、PyTorch 2.10.0+cpu 运行上述测试，**32 项通过**。初始化回归执行实际 `init_ascend_config()` 函数体，使用轻量依赖替身和真实 Pydantic 严格校验，覆盖配置开启/关闭以及其他未知项仍被拒绝。新增代码通过 Ruff 检查、格式检查、Python 编译检查，文档通过 PyMarkdown，发布说明通过 YAML 解析；差异通过 `git diff --check`。当前机器没有 NPU/torch_npu，未运行完整仓库的 NPU/vLLM 测试或全量 `format.sh ci`。上述真实 NPU 测试尚未执行，不能将 CPU 的简化 Decoder 合约测试当作真实模型/NPU 验证。
+当前 Windows 环境使用 Python 3.11.9、PyTorch 2.10.0+cpu 运行上述测试，**50 项通过**。初始化回归执行实际 `init_ascend_config()` 函数体，使用轻量依赖替身和真实 Pydantic 严格校验，覆盖配置开启/关闭以及其他未知项仍被拒绝；新策略和阈值也沿此入口验证。新增代码通过 Ruff 检查、格式检查、Python 编译检查，文档通过 PyMarkdown，发布说明通过 YAML 解析；差异通过 `git diff --check`。当前机器没有 NPU/torch_npu，未运行完整仓库的 NPU/vLLM 测试或全量 `format.sh ci`。上述真实 NPU 测试尚未执行，不能将 CPU 的简化 Decoder 合约测试当作真实模型/NPU 验证。
 
 ## 开销与限制
 

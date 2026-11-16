@@ -1,8 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+
+
+def validate_acceptance_strategy(strategy: str, threshold: float) -> None:
+    if strategy not in ("top1", "probability_ratio"):
+        raise ValueError("acceptance_strategy must be 'top1' or 'probability_ratio'")
+    if type(threshold) not in (int, float) or not 0 <= threshold <= 1 or not math.isfinite(threshold):
+        raise ValueError("probability_ratio_threshold must be a finite number in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -13,6 +21,8 @@ class SlimVerifierConfig:
     log_interval: int = 100
     top_k: int = 5
     profile_latency: bool = False
+    acceptance_strategy: str = "top1"
+    probability_ratio_threshold: float = 0.5
 
     def __post_init__(self):
         if any(type(i) is not int or i < 0 for i in self.keep_layers) or len(set(self.keep_layers)) != len(
@@ -26,6 +36,7 @@ class SlimVerifierConfig:
             raise ValueError("top_k must be a positive integer")
         if type(self.profile_latency) is not bool:
             raise ValueError("profile_latency must be a boolean")
+        validate_acceptance_strategy(self.acceptance_strategy, self.probability_ratio_threshold)
 
     @classmethod
     def from_additional_config(cls, additional_config: Mapping | None, num_layers: int):
@@ -37,7 +48,16 @@ class SlimVerifierConfig:
             raise ValueError("slim_verifier_eval.enabled must be a boolean")
         if not enabled:
             return None
-        unknown = raw.keys() - {"enabled", "keep_layers", "skip_layers", "log_interval", "top_k", "profile_latency"}
+        unknown = raw.keys() - {
+            "enabled",
+            "keep_layers",
+            "skip_layers",
+            "log_interval",
+            "top_k",
+            "profile_latency",
+            "acceptance_strategy",
+            "probability_ratio_threshold",
+        }
         if unknown:
             raise ValueError(f"Unknown slim_verifier_eval options: {sorted(unknown)}")
         if ("keep_layers" in raw) == ("skip_layers" in raw):
@@ -56,7 +76,14 @@ class SlimVerifierConfig:
                 raise ValueError(f"{key} must be a positive integer")
         if type(raw.get("profile_latency", False)) is not bool:
             raise ValueError("profile_latency must be a boolean")
-        return cls(tuple(keep), raw.get("log_interval", 100), raw.get("top_k", 5), raw.get("profile_latency", False))
+        return cls(
+            keep_layers=tuple(keep),
+            log_interval=raw.get("log_interval", 100),
+            top_k=raw.get("top_k", 5),
+            profile_latency=raw.get("profile_latency", False),
+            acceptance_strategy=raw.get("acceptance_strategy", "top1"),
+            probability_ratio_threshold=raw.get("probability_ratio_threshold", 0.5),
+        )
 
 
 def slim_verifier_enabled(additional_config: Mapping | None) -> bool:

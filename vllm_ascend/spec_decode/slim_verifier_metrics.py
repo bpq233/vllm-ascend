@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
 import logging
+import math
 from dataclasses import dataclass
 
 import torch
+
+from vllm_ascend.spec_decode.slim_verifier_config import validate_acceptance_strategy
 
 COUNTER_NAMES = (
     "target_prefix",
@@ -17,6 +20,7 @@ COUNTER_NAMES = (
     "decision_agreement",
     "slim_only",
     "target_only",
+    "slim_accepted",
 )
 SUM_NAMES = (
     "target_logprob",
@@ -40,16 +44,33 @@ class VerificationResult:
     slim_accept_mask: torch.Tensor
     request_id: str | None = None
     prediction_positions: torch.Tensor | None = None
+    slim_top1_match_mask: torch.Tensor | None = None
+    slim_probability_ratios: torch.Tensor | None = None
+    slim_acceptance_strategy: str = "top1"
 
 
 class SlimVerifierMetrics:
     """Device-side window/cumulative reductions; copy only at log boundaries."""
 
-    def __init__(self, log_interval: int = 100, top_k: int = 5, logger=None):
+    def __init__(
+        self,
+        log_interval: int = 100,
+        top_k: int = 5,
+        logger=None,
+        *,
+        acceptance_strategy: str = "top1",
+        probability_ratio_threshold: float = 0.5,
+    ):
         if log_interval <= 0 or top_k <= 0:
             raise ValueError("log_interval and top_k must be positive")
         self.log_interval = log_interval
         self.top_k = top_k
+        validate_acceptance_strategy(acceptance_strategy, probability_ratio_threshold)
+        self.acceptance_strategy = acceptance_strategy
+        self.probability_ratio_threshold = probability_ratio_threshold
+        self.log_probability_ratio_threshold = (
+            math.log(probability_ratio_threshold) if probability_ratio_threshold > 0 else -math.inf
+        )
         self.logger = logger or logging.getLogger(__name__)
         self.blocks = self.tokens = self.window_blocks = self.window_tokens = 0
         self.counts = self.sums = self.window_counts = self.window_sums = None
@@ -66,7 +87,20 @@ class SlimVerifierMetrics:
         target = target_logits.float()
         slim = slim_logits.float()
         target_pred, slim_pred = target.argmax(-1), slim.argmax(-1)
-        target_mask, slim_mask = target_pred.eq(draft_tokens), slim_pred.eq(draft_tokens)
+        target_mask, slim_top1_mask = target_pred.eq(draft_tokens), slim_pred.eq(draft_tokens)
+        target_draft = target.gather(1, draft_tokens.long().unsqueeze(1)).squeeze(1)
+        slim_draft = slim.gather(1, draft_tokens.long().unsqueeze(1)).squeeze(1)
+        target_max, slim_max = target.max(-1).values, slim.max(-1).values
+        slim_ratios = None
+        if self.acceptance_strategy == "probability_ratio":
+            # Softmax normalizers cancel: q(x)/q(max) = exp(z_x - z_max).
+            # Compare in log space, with a STRICT boundary. Finite, very small
+            # probabilities still pass threshold=0 even if exp underflows.
+            log_ratios = slim_draft - slim_max
+            slim_mask = torch.isfinite(log_ratios) & (log_ratios > self.log_probability_ratio_threshold)
+            slim_ratios = log_ratios.exp()
+        else:
+            slim_mask = slim_top1_mask
         # cumprod stops counting at the FIRST mismatch, unlike sum(mask).
         target_prefix = target_mask.long().cumprod(0).sum()
         slim_prefix = slim_mask.long().cumprod(0).sum()
@@ -75,17 +109,16 @@ class SlimVerifierMetrics:
                 target_prefix,
                 slim_prefix,
                 target_mask.sum(),
-                slim_mask.sum(),
+                slim_top1_mask.sum(),
                 target_mask.all().long(),
                 slim_mask.all().long(),
                 target_pred.eq(slim_pred).sum(),
                 target_mask.eq(slim_mask).sum(),
                 (slim_mask & ~target_mask).sum(),
                 (target_mask & ~slim_mask).sum(),
+                slim_mask.sum(),
             )
         )
-        target_draft = target.gather(1, draft_tokens.long().unsqueeze(1)).squeeze(1)
-        slim_draft = slim.gather(1, draft_tokens.long().unsqueeze(1)).squeeze(1)
         target_lse, slim_lse = target.logsumexp(-1), slim.logsumexp(-1)
         k = min(self.top_k, target.shape[1])
         target_top = target.topk(k, dim=-1).indices
@@ -95,8 +128,8 @@ class SlimVerifierMetrics:
             (
                 (target_draft - target_lse).sum(),
                 (slim_draft - slim_lse).sum(),
-                (target.max(-1).values - target_lse).exp().sum(),
-                (slim.max(-1).values - slim_lse).exp().sum(),
+                (target_max - target_lse).exp().sum(),
+                (slim_max - slim_lse).exp().sum(),
                 (1 + (target > target_draft.unsqueeze(1)).sum(-1)).float().sum(),
                 (1 + (slim > slim_draft.unsqueeze(1)).sum(-1)).float().sum(),
                 overlap,
@@ -120,14 +153,26 @@ class SlimVerifierMetrics:
             self.window_timed_blocks += 1
         if self.window_blocks == self.log_interval:
             self.flush()
-        return VerificationResult(draft_tokens, target_pred, slim_pred, target_mask, slim_mask)
+        return VerificationResult(
+            draft_tokens,
+            target_pred,
+            slim_pred,
+            target_mask,
+            slim_mask,
+            slim_top1_match_mask=slim_top1_mask,
+            slim_probability_ratios=slim_ratios,
+            slim_acceptance_strategy=self.acceptance_strategy,
+        )
 
-    def snapshot(self, cumulative: bool = True) -> dict[str, float | int]:
+    def snapshot(self, cumulative: bool = True) -> dict[str, float | int | str]:
         blocks = self.blocks if cumulative else self.window_blocks
         tokens = self.tokens if cumulative else self.window_tokens
         result = {"blocks": blocks, "draft_tokens": tokens}
         if blocks == 0:
             return result
+        result["slim_acceptance_strategy"] = self.acceptance_strategy
+        if self.acceptance_strategy == "probability_ratio":
+            result["probability_ratio_threshold"] = self.probability_ratio_threshold
         counts = self.counts if cumulative else self.window_counts
         sums = self.sums if cumulative else self.window_sums
         # A compact copy at the window boundary; no per-token scalar reads.
@@ -147,6 +192,7 @@ class SlimVerifierMetrics:
             )
         for key in ("prediction_agreement", "decision_agreement", "slim_only", "target_only"):
             result[f"{key}_rate"] = c[key] / tokens
+        result["slim_token_acceptance_rate"] = c["slim_accepted"] / tokens
         result["mean_logprob_gap"] = (s["target_logprob"] - s["slim_logprob"]) / tokens
         result["top_k_overlap"] = s["top_k_overlap"] / tokens
         timed = self.timed_blocks if cumulative else self.window_timed_blocks
@@ -159,7 +205,14 @@ class SlimVerifierMetrics:
         """Also callable by experiments to publish a final partial window."""
         if self.window_blocks == 0:
             return
-        self.logger.info("[SlimVerifier] Top-1 Diagnostic (raw model logits; not sampling acceptance)")
+        if self.acceptance_strategy == "top1":
+            self.logger.info("[SlimVerifier] Top-1 Diagnostic (raw model logits; not sampling acceptance)")
+        else:
+            self.logger.info(
+                "[SlimVerifier] Shadow Diagnostic (Target: top1; Slim: probability_ratio; "
+                "q(x)/q(max) > %s; raw model logits; not sampling acceptance)",
+                self.probability_ratio_threshold,
+            )
         self.logger.info("[SlimVerifier] Window: %s", self.snapshot(cumulative=False))
         self.logger.info("[SlimVerifier] Cumulative: %s", self.snapshot())
         self.window_blocks = self.window_tokens = self.window_timed_blocks = 0

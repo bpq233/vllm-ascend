@@ -372,12 +372,22 @@ def test_worker_initialization_uses_actual_layers_and_rejects_unsupported_modes(
         quant_config=None,
         cache_config=SimpleNamespace(cache_dtype="auto"),
         model_config=SimpleNamespace(enable_prompt_embeds=False, enable_sleep_mode=False),
-        additional_config={"slim_verifier_eval": {"enabled": True, "keep_layers": [3, 0]}},
+        additional_config={
+            "slim_verifier_eval": {
+                "enabled": True,
+                "keep_layers": [3, 0],
+                "acceptance_strategy": "probability_ratio",
+                "probability_ratio_threshold": 0.7,
+            }
+        },
     )
     runner = SimpleNamespace(vllm_config=vc, get_model=lambda: target)
     with caplog.at_level(logging.INFO):
         hook = SlimVerifierEval(runner)
     assert hook.config.keep_layers == (0, 3)
+    assert hook.metrics.acceptance_strategy == "probability_ratio"
+    assert hook.metrics.probability_ratio_threshold == 0.7
+    assert "q(x)/q(max) > 0.7" in caplog.text
     assert "Target layers: 4" in caplog.text
     vc.parallel_config.pipeline_parallel_size = 2
     with pytest.raises(NotImplementedError, match="pipeline_parallel_size"):

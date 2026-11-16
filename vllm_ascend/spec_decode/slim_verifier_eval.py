@@ -54,7 +54,15 @@ class SlimVerifierEval:
         self.vocab_size = target.config.vocab_size
         self.primary_rank = get_tensor_model_parallel_rank() == 0
         self.metrics = (
-            SlimVerifierMetrics(self.config.log_interval, self.config.top_k, logger) if self.primary_rank else None
+            SlimVerifierMetrics(
+                self.config.log_interval,
+                self.config.top_k,
+                logger,
+                acceptance_strategy=self.config.acceptance_strategy,
+                probability_ratio_threshold=self.config.probability_ratio_threshold,
+            )
+            if self.primary_rank
+            else None
         )
         self.last_results = []
         self.context = lambda n: set_ascend_forward_context(
@@ -63,7 +71,14 @@ class SlimVerifierEval:
         if self.primary_rank:
             count = len(target.model.layers)
             kept = self.config.keep_layers
-            logger.info("[SlimVerifier] Enabled (full-history replay; Top-1 Diagnostic only)")
+            logger.info("[SlimVerifier] Enabled (full-history replay; shadow diagnostics only)")
+            logger.info("[SlimVerifier] Target acceptance: Top-1 Diagnostic")
+            logger.info("[SlimVerifier] Slim acceptance strategy: %s", self.config.acceptance_strategy)
+            if self.config.acceptance_strategy == "probability_ratio":
+                logger.info(
+                    "[SlimVerifier] Strict acceptance: q(x)/q(max) > %s",
+                    self.config.probability_ratio_threshold,
+                )
             logger.info("[SlimVerifier] Target layers: %d", count)
             logger.info("[SlimVerifier] Kept layers: %s", list(kept))
             logger.info("[SlimVerifier] Skipped layers: %s", [i for i in range(count) if i not in kept])
