@@ -1830,6 +1830,10 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     _NON_USER_INPUT_KEYS = {
         # control-flow flag (singleton/cache refresh), not a configuration field
         "refresh",
+        # Consumed directly by the model runner after target model loading.
+        # Preserve it on VllmConfig.additional_config, but do not expand it
+        # into AscendConfig, whose Pydantic schema forbids unknown fields.
+        "slim_verifier_eval",
         # Upstream-injected by EngineArgs for the generic GDN/KDA prefill
         # backend selector; Ascend supports only the triton value (FLA kernels
         # run via triton-ascend), and the triton default applies either way

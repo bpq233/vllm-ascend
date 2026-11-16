@@ -18,6 +18,8 @@
 
 默认不启用。关闭时不创建 Verifier、独立 KV 或统计状态，也不额外执行 Forward。
 
+`slim_verifier_eval` 保留在 `VllmConfig.additional_config` 中，由 Runner 读取；`init_ascend_config()` 会在构造严格校验的 `AscendConfig` 前过滤该键。初版漏掉这一过滤，即使下方嵌套写法正确，也会在启动时出现 `VllmConfig / slim_verifier_eval / Unexpected keyword argument`。Pydantic 将内部构造错误包装为外层 `VllmConfig` 错误，因此该消息不能证明调用方把键传到了顶层。遇到此错误需同步更新 `vllm_ascend/ascend_config.py` 的过滤逻辑，无需修改上游 `VllmConfig` 接口。
+
 ```python
 additional_config = {
     "slim_verifier_eval": {
@@ -115,7 +117,7 @@ python -m pytest tests/manual/test_slim_verifier_npu.py -v -s
 
 该测试使用 Qwen3-0.6B Target 和同检查点 Draft，分别测试 TP=1/2、Eager/Graph、关闭/保留全部层/只保留第 0 层；检查真实全词表 Logits 的 BF16 数值误差、真实执行层、非空周期指标和 NPU Event 时间，并比较最终生成 Token ID 序列。还包括变长 Prompt、Chunked Prefill、Prefix Cache 和第二轮请求槽位复用。需要当前仓库匹配的 vLLM、CANN、torch_npu、检查点与相应数量的 NPU。
 
-当前 Windows 环境使用 Python 3.11.9、PyTorch 2.10.0+cpu 运行上述测试，**29 项通过**。新增代码通过 Ruff 检查、格式检查、Python 编译检查，文档通过 PyMarkdown，发布说明通过 YAML 解析；差异通过 `git diff --check`。当前机器没有 NPU/torch_npu，未运行完整仓库的 NPU/vLLM 测试或全量 `format.sh ci`。上述真实 NPU 测试尚未执行，不能将 CPU 的简化 Decoder 合约测试当作真实模型/NPU 验证。
+当前 Windows 环境使用 Python 3.11.9、PyTorch 2.10.0+cpu 运行上述测试，**32 项通过**。初始化回归执行实际 `init_ascend_config()` 函数体，使用轻量依赖替身和真实 Pydantic 严格校验，覆盖配置开启/关闭以及其他未知项仍被拒绝。新增代码通过 Ruff 检查、格式检查、Python 编译检查，文档通过 PyMarkdown，发布说明通过 YAML 解析；差异通过 `git diff --check`。当前机器没有 NPU/torch_npu，未运行完整仓库的 NPU/vLLM 测试或全量 `format.sh ci`。上述真实 NPU 测试尚未执行，不能将 CPU 的简化 Decoder 合约测试当作真实模型/NPU 验证。
 
 ## 开销与限制
 

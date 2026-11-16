@@ -464,6 +464,23 @@ class TestAscendConfig(TestBase):
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_preserves_slim_verifier_options(self, mock_fix_incompatible_config):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                clear_ascend_config()
+                test_vllm_config = VllmConfig()
+                slim_options = {"enabled": enabled, "keep_layers": [0, 4, 8, 12]}
+                test_vllm_config.additional_config = {
+                    "slim_verifier_eval": slim_options,
+                    "mega_moe_max_tokens": 32768,
+                }
+                ascend_config = init_ascend_config(test_vllm_config)
+                self.assertIs(test_vllm_config.additional_config["slim_verifier_eval"], slim_options)
+                self.assertEqual(ascend_config.mega_moe_max_tokens, 32768)
+                self.assertFalse(hasattr(ascend_config, "slim_verifier_eval"))
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_init_ascend_config_with_additional_config(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {
