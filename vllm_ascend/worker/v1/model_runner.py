@@ -384,6 +384,10 @@ class NPUModelRunner(GPUModelRunner):
     supports_standardized_shared_kv_backing = True
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        from vllm_ascend.spec_decode.slim_verifier_config import slim_verifier_enabled
+
+        if slim_verifier_enabled(vllm_config.additional_config):
+            raise NotImplementedError("Slim Verifier evaluation requires Model Runner V2")
         self.decoder_replay: AscendDecoderReplayLayers | None = None
         self._decoder_replay_common_metadata: AscendCommonAttentionMetadata | None = None
         # Must be set before super().__init__() because parent init may call

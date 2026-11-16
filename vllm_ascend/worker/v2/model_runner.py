@@ -101,6 +101,7 @@ from vllm_ascend.observability.runtime_guard.hooks import (
 )
 from vllm_ascend.observability.runtime_guard.processor import RuntimeGuardProcessor
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
+from vllm_ascend.spec_decode.slim_verifier_config import slim_verifier_enabled
 from vllm_ascend.utils import (
     is_c8_mxfp_kv_quant,
     is_deepseek_v41,
@@ -317,6 +318,10 @@ class NPUModelRunner(GPUModelRunner):
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
         self.model_state.prompt_logprobs_worker = self.prompt_logprobs_worker
+        if slim_verifier_enabled(self.vllm_config.additional_config):
+            from vllm_ascend.spec_decode.slim_verifier_eval import SlimVerifierEval
+
+            self.slim_verifier_eval = SlimVerifierEval(self)
 
     @runtime_guard_sample_tokens
     def sample_tokens(self, grammar_output):
@@ -1074,7 +1079,11 @@ class NPUModelRunner(GPUModelRunner):
         compute_logits the same row count — pad up to ``_lmhead_tp_max_num_logits()``
         and trim back; prompt_logprobs stays unsupported (same as V1)."""
         if not lmhead_tp_enable():
-            return super().sample(hidden_states, input_batch, grammar_output)
+            output = super().sample(hidden_states, input_batch, grammar_output)
+            shadow = getattr(self, "slim_verifier_eval", None)
+            if shadow is not None:
+                shadow.evaluate(self, hidden_states, input_batch)
+            return output
 
         num_logits = input_batch.logits_indices.shape[0]
         capacity = self._lmhead_tp_max_num_logits()

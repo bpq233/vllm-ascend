@@ -1,0 +1,93 @@
+diff --git a/vllm_ascend/worker/v2/spec_decode/dflash/feedback_calibrator.py b/vllm_ascend/worker/v2/spec_decode/dflash/feedback_calibrator.py
+index cf64c7b38..a99a6b4f0 100644
+--- a/vllm_ascend/worker/v2/spec_decode/dflash/feedback_calibrator.py
++++ b/vllm_ascend/worker/v2/spec_decode/dflash/feedback_calibrator.py
+@@ -17,6 +17,46 @@ import torch
+ from vllm_ascend.dflash_config import DFlashCalibrationConfig as FeedbackConfig
+ 
+ 
++def validate_feedback_runtime(vllm_config, speculator, expected_type):
++    """Report every incompatible setting instead of a misleading catch-all."""
++    errors = []
++    if type(speculator) is not expected_type:
++        actual = f"{type(speculator).__module__}.{type(speculator).__qualname__}"
++        errors.append(f"speculator={actual} (required: plain {expected_type.__name__}; variants are unsupported)")
++
++    def require(path, actual, expected):
++        if actual != expected:
++            errors.append(f"{path}={actual!r} (required: {expected!r})")
++
++    require("model_config.enforce_eager", vllm_config.model_config.enforce_eager, True)
++    require("speculative_config.enforce_eager", speculator.speculative_config.enforce_eager, True)
++    # None is unresolved/default, not an explicit async enablement. The prior
++    # guard also rejected only truthy values; retain that behavior here.
++    if vllm_config.scheduler_config.async_scheduling:
++        require("scheduler_config.async_scheduling", vllm_config.scheduler_config.async_scheduling, False)
++    for field in (
++        "tensor_parallel_size",
++        "pipeline_parallel_size",
++        "data_parallel_size",
++        "prefill_context_parallel_size",
++        "decode_context_parallel_size",
++    ):
++        require(f"parallel_config.{field}", getattr(vllm_config.parallel_config, field, 1), 1)
++    require("speculative_config.draft_sample_method", speculator.speculative_config.draft_sample_method, "greedy")
++    require(
++        "speculative_config.rejection_sample_method", speculator.speculative_config.rejection_sample_method, "standard"
++    )
++    require("speculative_config.enable_adaptive_verification", speculator.enable_adaptive_verification, False)
++    require("speculative_config.use_local_argmax_reduction", speculator.use_local_argmax_reduction, False)
++    if getattr(vllm_config, "watermark_config", None) is not None:
++        errors.append("watermark_config is configured (required: None)")
++    target_vocab = vllm_config.model_config.get_vocab_size()
++    if target_vocab != speculator.vocab_size:
++        errors.append(f"vocab_size: target={target_vocab}, draft={speculator.vocab_size} (required: identical)")
++    if errors:
++        raise ValueError("Unsupported DFlash feedback configuration:\n  - " + "\n  - ".join(errors))
++
++
+ class FeedbackCalibrator:
+     def __init__(self, config: FeedbackConfig):
+         self.config = config
+diff --git a/vllm_ascend/worker/v2/spec_decode/dflash/speculator.py b/vllm_ascend/worker/v2/spec_decode/dflash/speculator.py
+index b05f56ebe..a7c7afdbe 100644
+--- a/vllm_ascend/worker/v2/spec_decode/dflash/speculator.py
++++ b/vllm_ascend/worker/v2/spec_decode/dflash/speculator.py
+@@ -194,35 +194,10 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
+             # Lazy import: off allocates no feedback tensors or files.
+             from vllm_ascend.worker.v2.spec_decode.dflash.feedback_calibrator import (
+                 FeedbackCalibrator,
++                validate_feedback_runtime,
+             )
+ 
+-            parallel = vllm_config.parallel_config
+-            if (
+-                type(self) is not AscendDFlashSpeculator
+-                or not vllm_config.model_config.enforce_eager
+-                or not self.speculative_config.enforce_eager
+-                or vllm_config.scheduler_config.async_scheduling
+-                or any(
+-                    getattr(parallel, field, 1) != 1
+-                    for field in (
+-                        "tensor_parallel_size",
+-                        "pipeline_parallel_size",
+-                        "data_parallel_size",
+-                        "prefill_context_parallel_size",
+-                        "decode_context_parallel_size",
+-                    )
+-                )
+-                or self.speculative_config.draft_sample_method != "greedy"
+-                or self.speculative_config.rejection_sample_method != "standard"
+-                or self.enable_adaptive_verification
+-                or self.use_local_argmax_reduction
+-                or getattr(vllm_config, "watermark_config", None) is not None
+-                or vllm_config.model_config.get_vocab_size() != self.vocab_size
+-            ):
+-                raise ValueError(
+-                    "DFlash feedback MVP requires plain DFlash, identical vocabularies, "
+-                    "single rank, synchronous eager greedy standard verification without watermarking/local argmax"
+-                )
++            validate_feedback_runtime(vllm_config, self, AscendDFlashSpeculator)
+             self.feedback_calibrator = FeedbackCalibrator(feedback_config)
+ 
+     def sample_draft(self, *args, **kwargs):
