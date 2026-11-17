@@ -29,12 +29,33 @@ class SlimVerifierTestWorker:
         return True
 
     def install_slim_probe(self, check_full_logits):
+        from vllm_ascend.spec_decode.slim_verifier_cache import TargetPrefixKV
+
         shadow = self.model_runner.slim_verifier_eval
         self.slim_calls = []
         for index, layer in zip(shadow.config.keep_layers, shadow.verifier.layers):
             layer.register_forward_pre_hook(lambda module, args, i=index: self.slim_calls.append(i))
         assert shadow.verifier.embedding is self.model_runner.model.model.embed_tokens
         assert shadow.verifier.norm is self.model_runner.model.model.norm
+        original_logits = shadow.verifier.logits
+
+        def check_cache_and_logits(ids, positions, **kwargs):
+            prefix = kwargs.get("prefix_kv_provider")
+            if prefix is None:
+                return original_logits(ids, positions, **kwargs)
+            # Include the Target's already-written CURRENT query, not only its
+            # historical prefix. Snapshot just the live request, not the pool.
+            read_cache = TargetPrefixKV(
+                self.model_runner, shadow.verifier.target, prefix.request_index, prefix.prefix_length + ids.numel()
+            )
+            before = {i: read_cache(i) for i in shadow.config.keep_layers}
+            result = original_logits(ids, positions, **kwargs)
+            for index, saved in before.items():
+                for actual, expected in zip(read_cache(index), saved):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            return result
+
+        shadow.verifier.logits = check_cache_and_logits
         if shadow.metrics is not None and check_full_logits:
             original_record = shadow.metrics.record
 
@@ -59,8 +80,9 @@ class SlimVerifierTestWorker:
 @pytest.mark.parametrize("tp_size", [1, 2])
 @pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "graph"])
 @pytest.mark.parametrize("acceptance_strategy", ["top1", "probability_ratio"])
+@pytest.mark.parametrize("kv_source", ["target", "replay"])
 @wait_until_npu_memory_free()
-def test_slim_verifier_npu(tp_size, enforce_eager, acceptance_strategy, monkeypatch):
+def test_slim_verifier_npu(tp_size, enforce_eager, acceptance_strategy, kv_source, monkeypatch):
     if not hasattr(torch, "npu") or torch.npu.device_count() < tp_size:
         pytest.skip(f"Requires {tp_size} actual Ascend NPUs")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
@@ -90,6 +112,7 @@ def test_slim_verifier_npu(tp_size, enforce_eager, acceptance_strategy, monkeypa
             "profile_latency": True,
             "acceptance_strategy": acceptance_strategy,
             "probability_ratio_threshold": 0.5,
+            "kv_source": kv_source,
         }
         config.update({"skip_layers": []} if mode == "full" else {"keep_layers": [0]})
         with VllmRunner(MODEL, additional_config={"slim_verifier_eval": config}, **settings) as runner:

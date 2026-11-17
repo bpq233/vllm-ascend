@@ -23,6 +23,7 @@ class SlimVerifierConfig:
     profile_latency: bool = False
     acceptance_strategy: str = "top1"
     probability_ratio_threshold: float = 0.5
+    kv_source: str = "target"
 
     def __post_init__(self):
         if any(type(i) is not int or i < 0 for i in self.keep_layers) or len(set(self.keep_layers)) != len(
@@ -37,6 +38,8 @@ class SlimVerifierConfig:
         if type(self.profile_latency) is not bool:
             raise ValueError("profile_latency must be a boolean")
         validate_acceptance_strategy(self.acceptance_strategy, self.probability_ratio_threshold)
+        if self.kv_source not in ("target", "replay"):
+            raise ValueError("kv_source must be 'target' or 'replay'")
 
     @classmethod
     def from_additional_config(cls, additional_config: Mapping | None, num_layers: int):
@@ -57,6 +60,7 @@ class SlimVerifierConfig:
             "profile_latency",
             "acceptance_strategy",
             "probability_ratio_threshold",
+            "kv_source",
         }
         if unknown:
             raise ValueError(f"Unknown slim_verifier_eval options: {sorted(unknown)}")
@@ -83,6 +87,7 @@ class SlimVerifierConfig:
             profile_latency=raw.get("profile_latency", False),
             acceptance_strategy=raw.get("acceptance_strategy", "top1"),
             probability_ratio_threshold=raw.get("probability_ratio_threshold", 0.5),
+            kv_source=raw.get("kv_source", "target"),
         )
 
 

@@ -21,6 +21,8 @@ COUNTER_NAMES = (
     "slim_only",
     "target_only",
     "slim_accepted",
+    "target_first",
+    "slim_first",
 )
 SUM_NAMES = (
     "target_logprob",
@@ -30,6 +32,7 @@ SUM_NAMES = (
     "target_rank",
     "slim_rank",
     "top_k_overlap",
+    "logits_mean_abs_diff",
 )
 
 
@@ -74,6 +77,7 @@ class SlimVerifierMetrics:
         self.logger = logger or logging.getLogger(__name__)
         self.blocks = self.tokens = self.window_blocks = self.window_tokens = 0
         self.counts = self.sums = self.window_counts = self.window_sums = None
+        self.max_logits_diff = self.window_max_logits_diff = None
         self.slim_ms = self.window_slim_ms = 0.0
         self.timed_blocks = self.window_timed_blocks = 0
 
@@ -117,6 +121,8 @@ class SlimVerifierMetrics:
                 (slim_mask & ~target_mask).sum(),
                 (target_mask & ~slim_mask).sum(),
                 slim_mask.sum(),
+                target_mask[0].long(),
+                slim_mask[0].long(),
             )
         )
         target_lse, slim_lse = target.logsumexp(-1), slim.logsumexp(-1)
@@ -124,6 +130,9 @@ class SlimVerifierMetrics:
         target_top = target.topk(k, dim=-1).indices
         slim_top = slim.topk(k, dim=-1).indices
         overlap = (target_top.unsqueeze(-1) == slim_top.unsqueeze(-2)).any(-1).float().sum() / k
+        # Identical masked entries (-inf, -inf) contribute zero, not NaN.
+        logits_diff = torch.where(target == slim, 0.0, (target - slim).abs())
+        max_logits_diff = logits_diff.max()
         sums = torch.stack(
             (
                 (target_draft - target_lse).sum(),
@@ -133,11 +142,16 @@ class SlimVerifierMetrics:
                 (1 + (target > target_draft.unsqueeze(1)).sum(-1)).float().sum(),
                 (1 + (slim > slim_draft.unsqueeze(1)).sum(-1)).float().sum(),
                 overlap,
+                logits_diff.mean(-1).sum(),
             )
         )
         if self.counts is None:
             self.counts, self.sums = torch.zeros_like(counts), torch.zeros_like(sums)
             self.window_counts, self.window_sums = torch.zeros_like(counts), torch.zeros_like(sums)
+            self.max_logits_diff = torch.zeros_like(max_logits_diff)
+            self.window_max_logits_diff = torch.zeros_like(max_logits_diff)
+        self.max_logits_diff = torch.maximum(self.max_logits_diff, max_logits_diff)
+        self.window_max_logits_diff = torch.maximum(self.window_max_logits_diff, max_logits_diff)
         self.counts += counts
         self.sums += sums
         self.window_counts += counts
@@ -185,6 +199,7 @@ class SlimVerifierMetrics:
                     f"{model}_prefix_acceptance_rate": c[f"{model}_prefix"] / tokens,
                     f"{model}_token_match_rate": c[f"{model}_matches"] / tokens,
                     f"{model}_full_block_acceptance_rate": c[f"{model}_full"] / blocks,
+                    f"{model}_first_token_acceptance_rate": c[f"{model}_first"] / blocks,
                     f"{model}_avg_draft_logprob": s[f"{model}_logprob"] / tokens,
                     f"{model}_avg_top1_confidence": s[f"{model}_confidence"] / tokens,
                     f"{model}_avg_draft_rank": s[f"{model}_rank"] / tokens,
@@ -195,6 +210,9 @@ class SlimVerifierMetrics:
         result["slim_token_acceptance_rate"] = c["slim_accepted"] / tokens
         result["mean_logprob_gap"] = (s["target_logprob"] - s["slim_logprob"]) / tokens
         result["top_k_overlap"] = s["top_k_overlap"] / tokens
+        result["target_slim_logits_mean_abs_diff"] = s["logits_mean_abs_diff"] / tokens
+        maximum = self.max_logits_diff if cumulative else self.window_max_logits_diff
+        result["target_slim_logits_max_abs_diff"] = maximum.cpu().item()
         timed = self.timed_blocks if cumulative else self.window_timed_blocks
         if timed:
             result["slim_replay_ms_per_block"] = (self.slim_ms if cumulative else self.window_slim_ms) / timed
@@ -219,3 +237,4 @@ class SlimVerifierMetrics:
         self.window_slim_ms = 0.0
         self.window_counts.zero_()
         self.window_sums.zero_()
+        self.window_max_logits_diff.zero_()

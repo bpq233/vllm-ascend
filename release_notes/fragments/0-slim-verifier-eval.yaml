@@ -2,4 +2,4 @@
 pr: 0
 entries:
   - category: feature
-    text: Added opt-in Slim Verifier shadow evaluation for dense Qwen2/Qwen3 targets on Model Runner V2, with shared weights, full-history replay and window/cumulative diagnostics using Top-1 matching or configurable draft-to-maximum probability ratios. Shadow results do not participate in speculative sampling decisions.
+    text: Added opt-in Slim Verifier shadow evaluation for dense Qwen2/Qwen3 targets on Model Runner V2, with shared weights and read-only Target prefix KV by default (kv_source=target). The reduced model computes only the current query; full-history replay remains available with kv_source=replay. Window/cumulative diagnostics support Top-1 matching or configurable probability ratios, first-token acceptance, and logit differences. Shadow results do not participate in speculative sampling decisions.

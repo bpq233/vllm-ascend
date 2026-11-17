@@ -4,6 +4,7 @@
 import torch
 
 from vllm_ascend.spec_decode.slim_verifier import SlimVerifier
+from vllm_ascend.spec_decode.slim_verifier_cache import TargetPrefixKV
 from vllm_ascend.spec_decode.slim_verifier_config import SlimVerifierConfig
 from vllm_ascend.spec_decode.slim_verifier_metrics import SlimVerifierMetrics
 
@@ -11,9 +12,8 @@ from vllm_ascend.spec_decode.slim_verifier_metrics import SlimVerifierMetrics
 class SlimVerifierEval:
     """MRV2 shadow hook. Reads executed inputs; never returns sampling decisions.
 
-    Full histories come from MRV2's existing committed token store plus the
-    current *executed* query. Neither speculative proposals for the next step
-    nor optimistic CPU computed-token counters are used as history.
+    By default, read Target KV strictly before the current executed query and
+    run only that query through Slim. Full-history replay remains an A/B option.
     """
 
     def __init__(self, runner):
@@ -71,7 +71,7 @@ class SlimVerifierEval:
         if self.primary_rank:
             count = len(target.model.layers)
             kept = self.config.keep_layers
-            logger.info("[SlimVerifier] Enabled (full-history replay; shadow diagnostics only)")
+            logger.info("[SlimVerifier] Enabled (kv_source=%s; shadow diagnostics only)", self.config.kv_source)
             logger.info("[SlimVerifier] Target acceptance: Top-1 Diagnostic")
             logger.info("[SlimVerifier] Slim acceptance strategy: %s", self.config.acceptance_strategy)
             if self.config.acceptance_strategy == "probability_ratio":
@@ -114,15 +114,26 @@ class SlimVerifierEval:
             if n >= query_end - query_start:
                 raise ValueError("Verification query must contain the conditioning token and all draft tokens")
             prefix_len = prefix_lengths[req]
-            state_index = int(batch.idx_mapping_np[req])
-            committed = runner.req_states.all_token_ids.gpu[state_index, :prefix_len]
-            # Current input includes the conditioning token and exact scheduled
-            # drafts. Unused slots, other requests, and graph padding are excluded.
-            history = torch.cat((committed, batch.input_ids[query_start:query_end])).long()
             indices = batch.logits_indices[int(cu[req]) : int(cu[req]) + n].long()
             positions = batch.positions[indices].long()
             draft_tokens = batch.input_ids[indices + 1].long()
-            with self.context(history.numel()):
+            # The Target has already written this query's K/V. Only read cache
+            # positions strictly BEFORE its start; all query K/V must be Slim's.
+            query = batch.input_ids[query_start:query_end].long()
+            if self.config.kv_source == "target":
+                inputs = query
+                prediction_positions = positions - prefix_len
+                forward_kwargs = {
+                    "position_offset": prefix_len,
+                    "prefix_kv_provider": TargetPrefixKV(runner, self.verifier.target, req, prefix_len),
+                }
+            else:
+                state_index = int(batch.idx_mapping_np[req])
+                committed = runner.req_states.all_token_ids.gpu[state_index, :prefix_len]
+                inputs = torch.cat((committed, query)).long()
+                prediction_positions = positions
+                forward_kwargs = {}
+            with self.context(inputs.numel()):
                 target_logits = self.verifier.target.compute_logits(hidden_states[indices])
                 start_event = end_event = None
                 if self.config.profile_latency:
@@ -131,7 +142,7 @@ class SlimVerifierEval:
                     start_event = torch.npu.Event(enable_timing=True)
                     end_event = torch.npu.Event(enable_timing=True)
                     start_event.record()
-                slim_logits = self.verifier.logits(history, positions)
+                slim_logits = self.verifier.logits(inputs, prediction_positions, **forward_kwargs)
                 slim_ms = None
                 if end_event is not None:
                     end_event.record()

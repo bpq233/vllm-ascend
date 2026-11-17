@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
+from collections.abc import Callable
 from copy import copy
 
 import torch
@@ -9,12 +10,15 @@ from torch import nn
 
 from vllm_ascend.spec_decode.slim_verifier_config import SlimVerifierConfig
 
+PrefixKVProvider = Callable[[int], tuple[torch.Tensor, torch.Tensor]]
+
 
 class ReplayAttention(nn.Module):
-    """One unpadded request, with private ephemeral K/V from the full history.
+    """One unpadded query, optionally attending to a read-only Target prefix.
 
     This leaf deliberately has no access to an Attention instance, its backend,
-    static forward-context registration, or its paged KV. All other operations
+    static forward-context registration, or its paged KV. A caller can supply
+    gathered prefix K/V; all query K/V are private. All other operations
     (including Q/K normalization and RoPE) remain the target's operations.
     """
 
@@ -24,18 +28,46 @@ class ReplayAttention(nn.Module):
         self.num_kv_heads = attention.num_kv_heads
         self.head_dim = attention.head_dim
         self.scale = attention.scaling
+        self.prefix_kv: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         length = query.shape[0]
         q = query.reshape(length, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
-        k = key.reshape(length, self.num_kv_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
-        v = value.reshape(length, self.num_kv_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+        k = key.reshape(length, self.num_kv_heads, self.head_dim)
+        v = value.reshape(length, self.num_kv_heads, self.head_dim)
+        prefix_length = 0
+        if self.prefix_kv is not None:
+            prefix_k, prefix_v = self.prefix_kv
+            if (
+                prefix_k.ndim != 3
+                or prefix_k.shape != prefix_v.shape
+                or prefix_k.shape[1:] != (self.num_kv_heads, self.head_dim)
+                or prefix_k.dtype != k.dtype
+                or prefix_v.dtype != v.dtype
+                or prefix_k.device != k.device
+                or prefix_v.device != v.device
+            ):
+                raise ValueError("Prefix K/V must match the query's local KV heads, dtype and device")
+            prefix_length = prefix_k.shape[0]
+            k = torch.cat((prefix_k, k), dim=0)
+            v = torch.cat((prefix_v, v), dim=0)
+        k = k.transpose(0, 1).unsqueeze(0)
+        v = v.transpose(0, 1).unsqueeze(0)
         # Explicit GQA expansion also works on torch_npu versions whose SDPA
         # does not expose enable_gqa. There are no random/dropout operations.
         repeats = self.num_heads // self.num_kv_heads
         k = k.repeat_interleave(repeats, dim=1)
         v = v.repeat_interleave(repeats, dim=1)
-        output = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True, scale=self.scale)
+        # SDPA's non-square is_causal mask is upper-left aligned. The query
+        # starts AFTER the prefix, so it needs an explicitly offset mask.
+        mask = None
+        if prefix_length:
+            rows = torch.arange(length, device=q.device)[:, None] + prefix_length
+            columns = torch.arange(prefix_length + length, device=q.device)[None, :]
+            mask = columns <= rows
+        output = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=mask is None, scale=self.scale
+        )
         return output.squeeze(0).transpose(0, 1).reshape(length, -1)
 
 
@@ -47,6 +79,8 @@ def _module_view(module: nn.Module) -> nn.Module:
     """
     view = copy(module)
     for name, attr in vars(module).items():
+        if name in ("forward", "_forward_method") and callable(attr) and getattr(attr, "__self__", None) is not module:
+            raise NotImplementedError("Slim Verifier cannot safely copy closure-wrapped forwards (e.g. CPU offload)")
         if isinstance(attr, (dict, set)):
             # Includes module/parameter maps and hook registries. Registering an
             # instrumentation hook on a view must not register it on the target.
@@ -57,10 +91,10 @@ def _module_view(module: nn.Module) -> nn.Module:
 
 
 class SlimVerifier:
-    """Shared-weight Qwen2/Qwen3 dense decoder with an isolated replay path.
+    """Shared-weight Qwen2/Qwen3 dense decoder with an isolated shadow path.
 
     A separate module *view* is needed only for the selected decoder and
-    self-attention containers so their Attention leaf can be cacheless. This
+    self-attention containers so their Attention leaf never writes Target KV. This
     does not copy weights, initialize modules, or modify the target layer list
     or target forward. Final norm and embedding are the original instances.
     """
@@ -97,18 +131,44 @@ class SlimVerifier:
             self.layers.append(layer)
 
     @torch.inference_mode()
-    def hidden_states(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def hidden_states(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        position_offset: int = 0,
+        prefix_kv_provider: PrefixKVProvider | None = None,
+    ) -> torch.Tensor:
         if input_ids.ndim != 1 or input_ids.numel() == 0:
-            raise ValueError("Replay expects one nonempty, unpadded complete token history")
-        positions = torch.arange(input_ids.shape[0], device=input_ids.device, dtype=torch.int64)
+            raise ValueError("Slim Verifier expects one nonempty, unpadded token sequence")
+        if position_offset < 0 or (position_offset and prefix_kv_provider is None):
+            raise ValueError("A nonnegative position offset and its prefix K/V are required")
+        positions = torch.arange(input_ids.shape[0], device=input_ids.device, dtype=torch.int64) + position_offset
         hidden = self.embedding(input_ids)
         residual = None
-        for layer in self.layers:
-            hidden, residual = layer(positions=positions, hidden_states=hidden, residual=residual)
+        for original_index, layer in zip(self.config.keep_layers, self.layers):
+            attention = layer.self_attn.attn
+            try:
+                if prefix_kv_provider is not None:
+                    attention.prefix_kv = prefix_kv_provider(original_index)
+                    if any(kv.shape[0] != position_offset for kv in attention.prefix_kv):
+                        raise ValueError("Prefix K/V length must equal the query's absolute position offset")
+                hidden, residual = layer(positions=positions, hidden_states=hidden, residual=residual)
+            finally:
+                # No persistent Slim cache; release each layer's gathered prefix
+                # immediately, including on a failed forward.
+                attention.prefix_kv = None
         return self.norm(hidden) if residual is None else self.norm(hidden, residual)[0]
 
     @torch.inference_mode()
-    def logits(self, input_ids: torch.Tensor, prediction_positions: torch.Tensor) -> torch.Tensor | None:
-        # Only candidate-prediction rows go through the shared global LM head.
-        hidden = self.hidden_states(input_ids)
+    def logits(
+        self,
+        input_ids: torch.Tensor,
+        prediction_positions: torch.Tensor,
+        *,
+        position_offset: int = 0,
+        prefix_kv_provider: PrefixKVProvider | None = None,
+    ) -> torch.Tensor | None:
+        # prediction_positions index input_ids locally, independent of the
+        # absolute RoPE offset. Only these rows go through the shared LM head.
+        hidden = self.hidden_states(input_ids, position_offset=position_offset, prefix_kv_provider=prefix_kv_provider)
         return self.target.compute_logits(hidden[prediction_positions])

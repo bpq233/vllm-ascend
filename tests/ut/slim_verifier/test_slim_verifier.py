@@ -276,9 +276,9 @@ def test_metrics_windows_empty_and_ties(caplog):
     assert m.window_blocks == 0 and m.snapshot()["blocks"] == 3
 
 
-def make_hook(target, kept=(0, 1, 2, 3)):
+def make_hook(target, kept=(0, 1, 2, 3), kv_source="replay"):
     hook = SlimVerifierEval.__new__(SlimVerifierEval)
-    hook.config = SlimVerifierConfig(kept)
+    hook.config = SlimVerifierConfig(kept, kv_source=kv_source)
     hook.verifier = SlimVerifier(target, hook.config)
     hook.vocab_size = 11
     hook.metrics = SlimVerifierMetrics()
