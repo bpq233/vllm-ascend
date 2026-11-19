@@ -105,7 +105,7 @@ def test_slim_verifier_npu(tp_size, enforce_eager, acceptance_strategy, kv_sourc
         worker_extension_cls=f"{__name__}.SlimVerifierTestWorker",
     )
     baseline = None
-    for mode in ("disabled", "full", "reduced"):
+    for mode in ("disabled", "full", "reduced", "attention", "mlp"):
         config = {
             "enabled": mode != "disabled",
             "log_interval": 1,
@@ -114,7 +114,14 @@ def test_slim_verifier_npu(tp_size, enforce_eager, acceptance_strategy, kv_sourc
             "probability_ratio_threshold": 0.5,
             "kv_source": kv_source,
         }
-        config.update({"skip_layers": []} if mode == "full" else {"keep_layers": [0]})
+        selection = {
+            "full": {"skip_layers": []},
+            "reduced": {"keep_layers": [0]},
+            "disabled": {"keep_layers": [0]},
+            "attention": {"skip_attention_layers": [0]},
+            "mlp": {"skip_mlp_layers": [0]},
+        }
+        config.update(selection[mode])
         with VllmRunner(MODEL, additional_config={"slim_verifier_eval": config}, **settings) as runner:
             if mode != "disabled":
                 runner.model.collective_rpc("install_slim_probe", args=(mode == "full",))
@@ -136,3 +143,48 @@ def test_slim_verifier_npu(tp_size, enforce_eager, acceptance_strategy, kv_sourc
                         assert probe["metrics"]["draft_tokens"] > 0
                         assert probe["metrics"]["slim_acceptance_strategy"] == acceptance_strategy
                         assert probe["metrics"]["slim_replay_ms_per_block"] > 0
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+@wait_until_npu_memory_free()
+def test_slim_verifier_audit_npu(tp_size, monkeypatch):
+    if not hasattr(torch, "npu") or torch.npu.device_count() < tp_size:
+        pytest.skip(f"Requires {tp_size} actual Ascend NPUs")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    with VllmRunner(
+        MODEL,
+        tensor_parallel_size=tp_size,
+        dtype="bfloat16",
+        enforce_eager=True,
+        max_model_len=128,
+        max_num_batched_tokens=128,
+        max_num_seqs=1,
+        enable_prefix_caching=False,
+        enable_chunked_prefill=False,
+        gpu_memory_utilization=0.6,
+        worker_extension_cls="vllm_ascend.spec_decode.slim_verifier_audit.SlimVerifierAuditWorker",
+    ) as runner:
+        reports = runner.model.collective_rpc(
+            "audit_slim_layers",
+            kwargs={
+                "token_batches": [[1, 4, 2, 7, 9, 3, 11, 5]],
+                "validation_token_batches": [[2, 3, 8, 6, 1, 9, 5]],
+                "draft_length": 3,
+                "ablations": False,
+                "mask": {"skip_mlp_layers": [1]},
+                "search_scope": "attention",
+                "search_skip_count": 1,
+                "max_evaluations": 3,
+                "compare_kv_refresh": True,
+            },
+            timeout=600,
+        )
+        report = next(r for r in reports if r is not None)
+        assert report["reference_mismatch_count"] == 0
+        assert report["search"]["completed"]
+        for selected in report["selected_masks"].values():
+            assert selected["candidate_additional_config"] is not None
+            assert selected["held_out_evaluated"]
+            assert selected["numerical_reference_checks_passed"]
+            assert selected["target_kv_refreshed_each_position"]["reference_checks_passed"]

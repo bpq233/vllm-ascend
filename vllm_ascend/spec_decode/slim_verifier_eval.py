@@ -82,7 +82,14 @@ class SlimVerifierEval:
             logger.info("[SlimVerifier] Target layers: %d", count)
             logger.info("[SlimVerifier] Kept layers: %s", list(kept))
             logger.info("[SlimVerifier] Skipped layers: %s", [i for i in range(count) if i not in kept])
-            logger.info("[SlimVerifier] Keep ratio: %.4f", len(kept) / count)
+            logger.info("[SlimVerifier] Whole-layer keep ratio: %.4f", len(kept) / count)
+            logger.info("[SlimVerifier] Skipped attention branches: %s", list(self.config.skip_attention_layers))
+            logger.info("[SlimVerifier] Skipped MLP branches: %s", list(self.config.skip_mlp_layers))
+            logger.info(
+                "[SlimVerifier] Executed attention branches: %d; MLP branches: %d",
+                len(kept) - len(self.config.skip_attention_layers),
+                len(kept) - len(self.config.skip_mlp_layers),
+            )
 
     @torch.inference_mode()
     def evaluate(self, runner, hidden_states, batch) -> None:

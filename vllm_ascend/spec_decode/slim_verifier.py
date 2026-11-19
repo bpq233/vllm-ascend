@@ -90,6 +90,40 @@ def _module_view(module: nn.Module) -> nn.Module:
     return view
 
 
+class SublayerDecoder(nn.Module):
+    """Qwen fused-residual contract with independently bypassed residual branches.
+
+    Skipping attention also skips its input norm; skipping MLP also skips its
+    post-attention norm. The logical state remains hidden + residual, and each
+    unexecuted branch contributes exactly zero without clearing the residual.
+    """
+
+    def __init__(self, layer, skip_attention: bool, skip_mlp: bool):
+        super().__init__()
+        self.self_attn = layer.self_attn
+        self.input_layernorm = layer.input_layernorm
+        self.post_attention_layernorm = layer.post_attention_layernorm
+        self.mlp = layer.mlp
+        self.skip_attention, self.skip_mlp = skip_attention, skip_mlp
+
+    def forward(self, positions, hidden_states, residual):
+        if not self.skip_attention:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        if not self.skip_mlp:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
+
+
 class SlimVerifier:
     """Shared-weight Qwen2/Qwen3 dense decoder with an isolated shadow path.
 
@@ -128,6 +162,8 @@ class SlimVerifier:
             attention = _module_view(original.self_attn)
             attention.attn = ReplayAttention(original.self_attn)
             layer.self_attn = attention
+            if index in config.skip_attention_layers or index in config.skip_mlp_layers:
+                layer = SublayerDecoder(layer, index in config.skip_attention_layers, index in config.skip_mlp_layers)
             self.layers.append(layer)
 
     @torch.inference_mode()
@@ -148,7 +184,7 @@ class SlimVerifier:
         for original_index, layer in zip(self.config.keep_layers, self.layers):
             attention = layer.self_attn.attn
             try:
-                if prefix_kv_provider is not None:
+                if prefix_kv_provider is not None and original_index not in self.config.skip_attention_layers:
                     attention.prefix_kv = prefix_kv_provider(original_index)
                     if any(kv.shape[0] != position_offset for kv in attention.prefix_kv):
                         raise ValueError("Prefix K/V length must equal the query's absolute position offset")

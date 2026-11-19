@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm_ascend.spec_decode.slim_verifier_config import validate_acceptance_strategy
+from vllm_ascend.spec_decode.slim_verifier_positions import PositionMetrics
 
 COUNTER_NAMES = (
     "target_prefix",
@@ -80,6 +81,7 @@ class SlimVerifierMetrics:
         self.max_logits_diff = self.window_max_logits_diff = None
         self.slim_ms = self.window_slim_ms = 0.0
         self.timed_blocks = self.window_timed_blocks = 0
+        self.positions = PositionMetrics()
 
     @torch.inference_mode()
     def record(self, draft_tokens, target_logits, slim_logits, slim_ms: float | None = None) -> VerificationResult:
@@ -126,6 +128,13 @@ class SlimVerifierMetrics:
             )
         )
         target_lse, slim_lse = target.logsumexp(-1), slim.logsumexp(-1)
+        self.positions.record(
+            target_mask,
+            slim_mask,
+            target_pred.eq(slim_pred),
+            target - target_lse[:, None],
+            slim - slim_lse[:, None],
+        )
         k = min(self.top_k, target.shape[1])
         target_top = target.topk(k, dim=-1).indices
         slim_top = slim.topk(k, dim=-1).indices
@@ -178,7 +187,7 @@ class SlimVerifierMetrics:
             slim_acceptance_strategy=self.acceptance_strategy,
         )
 
-    def snapshot(self, cumulative: bool = True) -> dict[str, float | int | str]:
+    def snapshot(self, cumulative: bool = True) -> dict:
         blocks = self.blocks if cumulative else self.window_blocks
         tokens = self.tokens if cumulative else self.window_tokens
         result = {"blocks": blocks, "draft_tokens": tokens}
@@ -213,6 +222,7 @@ class SlimVerifierMetrics:
         result["target_slim_logits_mean_abs_diff"] = s["logits_mean_abs_diff"] / tokens
         maximum = self.max_logits_diff if cumulative else self.window_max_logits_diff
         result["target_slim_logits_max_abs_diff"] = maximum.cpu().item()
+        result.update(self.positions.snapshot(blocks, cumulative))
         timed = self.timed_blocks if cumulative else self.window_timed_blocks
         if timed:
             result["slim_replay_ms_per_block"] = (self.slim_ms if cumulative else self.window_slim_ms) / timed
@@ -238,3 +248,4 @@ class SlimVerifierMetrics:
         self.window_counts.zero_()
         self.window_sums.zero_()
         self.window_max_logits_diff.zero_()
+        self.positions.reset_window()

@@ -37,6 +37,8 @@ additional_config = {
 
 `keep_layers` 使用 Target 的 0-based 编号，校验范围来自加载模型的 `len(target.model.layers)`，随后按升序执行。重复、越界、负数、布尔编号以及未知配置项均报错。也可用 `skip_layers` 指定补集；两者只能提供一个。保留全部层可写 `skip_layers: []`；`keep_layers: []` 是仅 Embedding → Final Norm → LM Head 的消融实验，三者仍全部执行。
 
+也支持 `skip_attention_layers` 和 `skip_mlp_layers` 分别跳过残差分支。只配置子层选项时默认保留全部 Decoder 层；与整层配置组合时，子层索引必须属于保留层集合。分位置统计、Target 有效前缀指标和离线审计/组合搜索见 [校准指南](slim_verifier_calibration.md)。
+
 `kv_source` 默认是 `"target"`：每轮读取全层 Target 在当前 Query 之前的历史 KV，仅对当前 Query 执行减层 Forward。设为 `"replay"` 可恢复旧版行为，使用减层模型重新计算整个 Token 历史。对比时只切换这一项，保持层集合、草稿长度、输入和接受策略相同。该默认值变更意味着旧配置重新运行后也会使用 Target 历史 KV；启动日志打印 `kv_source`。
 
 `log_interval` 是非空 Verification Block 数量，不是请求数、Token 数或 Scheduler Step 数。`top_k` 自动取不超过词表大小的值。`profile_latency` 默认关闭；开启时使用 NPU Event，且在每个 Block 完成后同步结束 Event，适用于实验测量。
@@ -126,6 +128,8 @@ Target 诊断 Logits 从这次正常 Target Forward 的 Hidden States 额外调�
 
 `*` 分别为 `target` 和 `slim`。分母为 0 的空统计只返回 Block/Token 数，不输出伪造的平均值。窗口到达 `log_interval` 时同时输出 Window 和 Cumulative，随后只清空窗口。计数和概率在设备侧累积，到日志边界才回传紧凑汇总。主 Rank 的 `last_results` 保存最近 Batch 的 Request ID、预测位置、两套预测和接受掩码，另有 `slim_top1_match_mask`、策略名称以及概率比策略下的 `slim_probability_ratios`，仅供实验检查。
 
+日志另提供 `per_position`、KL(Target ∥ Slim)、Target 连续可接受前缀内的 Slim 拒绝率和共同连续接受长度。条件指标分母为零时返回 `null`。所有 Target 接受口径均明确标记为 `raw_top1_diagnostic`；定义见校准指南。
+
 没有输出 Target Verify Time、JS Divergence 或 Logit Margin，因为本阶段未测量这些量。`SlimVerifierEval.flush()` 可输出尾部不足一个窗口的数据；下面的 NPU 测试通过 Worker RPC 在实验结束时调用它。
 
 ## 测试
@@ -144,9 +148,9 @@ python -m pytest --confcutdir=tests/ut/slim_verifier tests/ut/slim_verifier -q
 python -m pytest tests/manual/test_slim_verifier_npu.py -v -s
 ```
 
-该测试使用 Qwen3-0.6B Target 和同检查点 Draft，分别测试 TP=1/2、Eager/Graph、两种 KV 来源、两种 Slim 判定策略、关闭/保留全部层/只保留第 0 层；检查真实全词表 Logits 的 BF16 数值误差、真实执行层、非空周期指标和 NPU Event 时间，并比较最终生成 Token ID 序列。Target KV 模式还逐层检查本请求的历史和当前 Query 缓存均未改变。还包括变长 Prompt、Chunked Prefill、Prefix Cache 和第二轮请求槽位复用。需要当前仓库匹配的 vLLM、CANN、torch_npu、检查点与相应数量的 NPU。
+该测试使用 Qwen3-0.6B Target 和同检查点 Draft，分别测试 TP=1/2、Eager/Graph、两种 KV 来源、两种 Slim 判定策略、关闭/保留全部层/只保留第 0 层/单独跳过 Attention 或 MLP；检查真实全词表 Logits 的 BF16 数值误差、真实执行层、非空周期指标和 NPU Event 时间，并比较最终生成 Token ID 序列。Target KV 模式还逐层检查本请求的历史和当前 Query 缓存均未改变。还包括变长 Prompt、Chunked Prefill、Prefix Cache 和第二轮请求槽位复用。文件另提供审计工具的 TP=1/2 冒烟测试。需要当前仓库匹配的 vLLM、CANN、torch_npu、检查点与相应数量的 NPU。
 
-当前 Windows 环境使用 Python 3.11.9、PyTorch 2.10.0+cpu、Transformers 4.51.3 运行上述测试，**85 项通过**。新增测试覆盖 NHD/HND 缓存、非连续物理 Block、前缀落在 Block 中部、原始层号/多 Group/请求重排、绝对 RoPE 位置和带前缀因果掩码；将当前 Query 的 Target 缓存填为 NaN，确认 Slim 不会读取它。另用官方 Hugging Face Qwen3 实现的 36 层小维度随机模型验证 FP32/BF16：全层生成历史 KV 后，保留全层、删除第 18 层、保留首尾层及跳过首层等配置的增量结果与 Slim 对齐。旧版完整历史重算与官方实现逐一删除 36 层的回归也保留。这些随机模型验证实现语义，不代表预训练 Qwen3-8B 的接受率。
+当前 Windows 环境使用 Python 3.11.9、PyTorch 2.10.0+cpu、Transformers 4.51.3 运行上述测试，**117 项通过**。测试覆盖 NHD/HND 缓存、非连续物理 Block、前缀落在 Block 中部、原始层号/多 Group/请求重排、绝对 RoPE 位置和带前缀因果掩码；将当前 Query 的 Target 缓存填为 NaN，确认 Slim 不会读取它。另用官方 Hugging Face Qwen3 实现的 36 层小维度随机模型验证 FP32/BF16：全层生成历史 KV 后，保留全层、删除第 18 层、保留首尾层及跳过首层等配置的增量结果与 Slim 对齐。旧版完整历史重算与官方实现逐一删除 36 层的回归也保留。新增子层消融、分位置指标、组合搜索、验证集和逐位置刷新 KV 的测试覆盖见校准指南。这些随机模型验证实现语义，不代表预训练 Qwen3-8B 的接受率。
 
 当前机器没有 NPU/torch_npu，未运行真实 NPU、完整仓库测试或全量 `format.sh ci`，不能据此宣称 NPU 数值已验证或接受率已改善。
 
