@@ -26,6 +26,7 @@ class SlimVerifierConfig:
     kv_source: str = "target"
     skip_attention_layers: tuple[int, ...] = ()
     skip_mlp_layers: tuple[int, ...] = ()
+    metrics_mode: str = "kl"
 
     def __post_init__(self):
         if any(type(i) is not int or i < 0 for i in self.keep_layers) or len(set(self.keep_layers)) != len(
@@ -49,6 +50,8 @@ class SlimVerifierConfig:
         validate_acceptance_strategy(self.acceptance_strategy, self.probability_ratio_threshold)
         if self.kv_source not in ("target", "replay"):
             raise ValueError("kv_source must be 'target' or 'replay'")
+        if self.metrics_mode not in ("kl", "acceptance"):
+            raise ValueError("metrics_mode must be 'kl' or 'acceptance'")
 
     @classmethod
     def from_additional_config(cls, additional_config: Mapping | None, num_layers: int):
@@ -72,6 +75,7 @@ class SlimVerifierConfig:
             "kv_source",
             "skip_attention_layers",
             "skip_mlp_layers",
+            "metrics_mode",
         }
         if unknown:
             raise ValueError(f"Unknown slim_verifier_eval options: {sorted(unknown)}")
@@ -106,6 +110,7 @@ class SlimVerifierConfig:
             kv_source=raw.get("kv_source", "target"),
             skip_attention_layers=tuple(raw.get("skip_attention_layers", [])),
             skip_mlp_layers=tuple(raw.get("skip_mlp_layers", [])),
+            metrics_mode=raw.get("metrics_mode", "kl"),
         )
 
 

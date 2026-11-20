@@ -278,7 +278,7 @@ def test_metrics_windows_empty_and_ties(caplog):
 
 def make_hook(target, kept=(0, 1, 2, 3), kv_source="replay"):
     hook = SlimVerifierEval.__new__(SlimVerifierEval)
-    hook.config = SlimVerifierConfig(kept, kv_source=kv_source)
+    hook.config = SlimVerifierConfig(kept, kv_source=kv_source, metrics_mode="acceptance")
     hook.verifier = SlimVerifier(target, hook.config)
     hook.vocab_size = 11
     hook.metrics = SlimVerifierMetrics()
@@ -378,6 +378,7 @@ def test_worker_initialization_uses_actual_layers_and_rejects_unsupported_modes(
                 "keep_layers": [3, 0],
                 "acceptance_strategy": "probability_ratio",
                 "probability_ratio_threshold": 0.7,
+                "metrics_mode": "acceptance",
             }
         },
     )

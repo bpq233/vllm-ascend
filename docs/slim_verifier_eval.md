@@ -1,5 +1,7 @@
 # VIA-SD 第一阶段：Slim Verifier 影子校验
 
+当前线上调试默认使用 `metrics_mode="kl"`，只输出 Draft/Slim/Target 三组 KL，详见 [三方 KL 使用说明](slim_verifier_kl.md)。本文的接受率、接受长度和分位置统计对应 `metrics_mode="acceptance"`；离线选层审计继续使用原有指标。
+
 本功能从当前 Target 的原始权重构建减层校验路径，对已经执行的同一批 Draft Token 进行额外的影子诊断。Slim 支持 Top-1 匹配或概率比阈值策略，Target 诊断仍使用 Top-1 匹配。结果只进入统计模块，不回传给采样器、调度器或 Draft Model。不实现分级接受、实际采样接受修正、重新生成、Target 回退或 DIMR 搜索。
 
 ## 支持范围
@@ -24,6 +26,7 @@
 additional_config = {
     "slim_verifier_eval": {
         "enabled": True,
+        "metrics_mode": "acceptance",
         "kv_source": "target",
         "keep_layers": [0, 4, 8, 12],
         "log_interval": 100,
@@ -61,7 +64,7 @@ Top-1 策略选用确定性 Argmax；概率比策略下，与最高 Logit 并列
 ```bash
 VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /path/to/target \
   --speculative-config '{"method":"draft_model","model":"/path/to/draft","num_speculative_tokens":3}' \
-  --additional-config '{"slim_verifier_eval":{"enabled":true,"keep_layers":[0,4,8,12],"log_interval":100,"top_k":5,"acceptance_strategy":"probability_ratio","probability_ratio_threshold":0.5}}'
+  --additional-config '{"slim_verifier_eval":{"enabled":true,"metrics_mode":"acceptance","keep_layers":[0,4,8,12],"log_interval":100,"top_k":5,"acceptance_strategy":"probability_ratio","probability_ratio_threshold":0.5}}'
 ```
 
 原有 `speculative_config` 的配置方式保持不变。例如已有 n-gram、EAGLE 或其他提案方式时，继续使用其原有配置，只添加 `slim_verifier_eval`。日志启动时打印实际总层数、保留层、跳过层和保留比例。
@@ -150,7 +153,7 @@ python -m pytest tests/manual/test_slim_verifier_npu.py -v -s
 
 该测试使用 Qwen3-0.6B Target 和同检查点 Draft，分别测试 TP=1/2、Eager/Graph、两种 KV 来源、两种 Slim 判定策略、关闭/保留全部层/只保留第 0 层/单独跳过 Attention 或 MLP；检查真实全词表 Logits 的 BF16 数值误差、真实执行层、非空周期指标和 NPU Event 时间，并比较最终生成 Token ID 序列。Target KV 模式还逐层检查本请求的历史和当前 Query 缓存均未改变。还包括变长 Prompt、Chunked Prefill、Prefix Cache 和第二轮请求槽位复用。文件另提供审计工具的 TP=1/2 冒烟测试。需要当前仓库匹配的 vLLM、CANN、torch_npu、检查点与相应数量的 NPU。
 
-当前 Windows 环境使用 Python 3.11.9、PyTorch 2.10.0+cpu、Transformers 4.51.3 运行上述测试，**117 项通过**。测试覆盖 NHD/HND 缓存、非连续物理 Block、前缀落在 Block 中部、原始层号/多 Group/请求重排、绝对 RoPE 位置和带前缀因果掩码；将当前 Query 的 Target 缓存填为 NaN，确认 Slim 不会读取它。另用官方 Hugging Face Qwen3 实现的 36 层小维度随机模型验证 FP32/BF16：全层生成历史 KV 后，保留全层、删除第 18 层、保留首尾层及跳过首层等配置的增量结果与 Slim 对齐。旧版完整历史重算与官方实现逐一删除 36 层的回归也保留。新增子层消融、分位置指标、组合搜索、验证集和逐位置刷新 KV 的测试覆盖见校准指南。这些随机模型验证实现语义，不代表预训练 Qwen3-8B 的接受率。
+当前 Windows 环境使用 Python 3.11.9、PyTorch 2.10.0+cpu、Transformers 4.51.3 运行上述测试，**130 项通过**。测试覆盖 NHD/HND 缓存、非连续物理 Block、前缀落在 Block 中部、原始层号/多 Group/请求重排、绝对 RoPE 位置和带前缀因果掩码；将当前 Query 的 Target 缓存填为 NaN，确认 Slim 不会读取它。另用官方 Hugging Face Qwen3 实现的 36 层小维度随机模型验证 FP32/BF16：全层生成历史 KV 后，保留全层、删除第 18 层、保留首尾层及跳过首层等配置的增量结果与 Slim 对齐。旧版完整历史重算与官方实现逐一删除 36 层的回归也保留。新增子层消融、分位置指标、组合搜索、验证集和逐位置刷新 KV 的测试覆盖见校准指南。这些随机模型验证实现语义，不代表预训练 Qwen3-8B 的接受率。
 
 当前机器没有 NPU/torch_npu，未运行真实 NPU、完整仓库测试或全量 `format.sh ci`，不能据此宣称 NPU 数值已验证或接受率已改善。
 
@@ -158,7 +161,7 @@ python -m pytest tests/manual/test_slim_verifier_npu.py -v -s
 
 这是准确性实验路径，不能用于宣称 VIA-SD 加速收益。默认模式下保留 K 层、历史长 P、当前 Query 长 Q 时，Attention 计算随 K·Q·(P+Q) 增长，投影和 MLP 仅作用于 Q 个 Token；仍需逐层收集历史 KV，并为 GQA 临时扩展 K/V。`replay` 模式则重算完整历史，Attention 计算随 K·(P+Q)² 增长。两种模式的峰值内存仍取决于上下文长度和 SDPA 实现，长上下文可能显著占用显存。
 
-还包括每个 Block 一次 Target 诊断 LM Head、一次 Slim LM Head，以及概率、全词表 Rank、Top-K 指标计算。每个 Batch 有一次实际 Query 起始位置回传；日志边界有紧凑统计回传；开启计时时每个 Block 另有 Event 同步。没有额外模型权重和持久 Slim KV，但这些临时激活未计入原 Target KV 容量规划，实验时应预留设备内存并降低 `gpu_memory_utilization`。未获得 NPU 实测数据，不报告速度或显存数值。
+还包括每个 Block 一次 Target 诊断 LM Head、一次 Slim LM Head。`acceptance` 模式额外计算概率、全词表 Rank 和 Top-K；`kl` 模式改为草稿原始 Logits 缓存和三组全词表 KL，缓存容量见 KL 调试说明。每个 Batch 有一次实际 Query 起始位置回传；日志边界有紧凑统计回传；接受率模式开启计时时每个 Block 另有 Event 同步。没有额外模型权重和持久 Slim KV，但仍需为诊断缓存和临时激活预留设备内存。未获得 NPU 实测数据，不报告速度或显存实测数值。
 
 不支持运行期间替换 Parameter 对象的热换权重、Sleep/Wake 或并发外部调用同一个 Runner 的实验；初版不处理这些生命周期下模块视图的重新绑定。上述功能没有被加入实际推理决策。
 
@@ -168,6 +171,8 @@ python -m pytest tests/manual/test_slim_verifier_npu.py -v -s
 - `vllm_ascend/spec_decode/slim_verifier.py`：共享权重、偏移因果掩码和减层 Forward。
 - `vllm_ascend/spec_decode/slim_verifier_cache.py`：按原始层号和请求 Block Table 只读收集 Target 前缀 KV。
 - `vllm_ascend/spec_decode/slim_verifier_metrics.py`：两套结果、指标与窗口日志。
+- `vllm_ascend/spec_decode/slim_verifier_draft.py`：独立记录草稿原始 Logits、Token 和位置。
+- `vllm_ascend/spec_decode/slim_verifier_kl.py`：三组有向 KL、Token 加权和独立窗口日志。
 - `vllm_ascend/spec_decode/slim_verifier_eval.py`：MRV2 Batch/前缀/位置对齐和影子调用。
 - `vllm_ascend/worker/v2/model_runner.py`：加载时创建与采样后调用。
 - `vllm_ascend/worker/v1/model_runner.py`：启用时明确报 MRV2 要求。

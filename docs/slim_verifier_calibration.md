@@ -10,6 +10,7 @@
 additional_config = {
     "slim_verifier_eval": {
         "enabled": True,
+        "metrics_mode": "acceptance",
         "kv_source": "target",
         "skip_attention_layers": [18],
         "skip_mlp_layers": [20, 24],
@@ -126,6 +127,7 @@ if candidate is None:
 additional_config = dict(llm_kwargs.get("additional_config") or {})
 additional_config["slim_verifier_eval"] = {
     **candidate["slim_verifier_eval"],
+    "metrics_mode": "acceptance",
     "log_interval": 100,
     "top_k": 5,
     "profile_latency": False,
@@ -136,7 +138,7 @@ llm = LLM(**llm_kwargs)
 
 保留原有草稿模型、`speculative_config` 和其他推理参数，启动时使用 `VLLM_USE_V2_MODEL_RUNNER=1 python test.py`。上面的代码替换整个 `slim_verifier_eval` 配置，避免旧 `skip_layers` 与新 `keep_layers` 同时存在；其他 `additional_config` 项会保留。加载后检查启动日志中的 `kv_source`、保留层和子层跳过列表，再查看 `[SlimVerifier] Window/Cumulative` 的新指标。
 
-如果暂时只诊断当前实现，原有层选择可直接继续使用，新增位置和前缀指标自动输出。仅需明确设置 `kv_source="target"`；使用概率比策略时设置 `acceptance_strategy="probability_ratio"` 和对应阈值。
+如果暂时只诊断当前实现，原有层选择可直接继续使用。设置 `metrics_mode="acceptance"` 输出位置和前缀指标，并明确设置 `kv_source="target"`；使用概率比策略时设置 `acceptance_strategy="probability_ratio"` 和对应阈值。线上默认的 `metrics_mode="kl"` 只输出三方 KL，详见 [KL 调试说明](slim_verifier_kl.md)。
 
 报告文件不会覆盖已有文件；重复运行请更换 `--output` 文件名，或省略该参数自动生成带时间戳的文件名。
 

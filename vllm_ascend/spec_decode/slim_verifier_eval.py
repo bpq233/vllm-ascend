@@ -6,6 +6,8 @@ import torch
 from vllm_ascend.spec_decode.slim_verifier import SlimVerifier
 from vllm_ascend.spec_decode.slim_verifier_cache import TargetPrefixKV
 from vllm_ascend.spec_decode.slim_verifier_config import SlimVerifierConfig
+from vllm_ascend.spec_decode.slim_verifier_draft import DraftLogitsCapture
+from vllm_ascend.spec_decode.slim_verifier_kl import SlimVerifierKLMetrics
 from vllm_ascend.spec_decode.slim_verifier_metrics import SlimVerifierMetrics
 
 
@@ -53,17 +55,21 @@ class SlimVerifierEval:
         self.verifier = SlimVerifier(target, self.config)
         self.vocab_size = target.config.vocab_size
         self.primary_rank = get_tensor_model_parallel_rank() == 0
-        self.metrics = (
-            SlimVerifierMetrics(
+        self.draft_capture = None
+        self.metrics = None
+        if self.config.metrics_mode == "kl":
+            DraftLogitsCapture.validate(getattr(runner, "speculator", None))
+            if self.primary_rank:
+                self.draft_capture = DraftLogitsCapture(runner.speculator, self.vocab_size)
+                self.metrics = SlimVerifierKLMetrics(self.config.log_interval, logger)
+        elif self.primary_rank:
+            self.metrics = SlimVerifierMetrics(
                 self.config.log_interval,
                 self.config.top_k,
                 logger,
                 acceptance_strategy=self.config.acceptance_strategy,
                 probability_ratio_threshold=self.config.probability_ratio_threshold,
             )
-            if self.primary_rank
-            else None
-        )
         self.last_results = []
         self.context = lambda n: set_ascend_forward_context(
             None, vc, num_tokens=n, num_actual_tokens=n, model_instance=target, skip_compiled=True
@@ -72,9 +78,20 @@ class SlimVerifierEval:
             count = len(target.model.layers)
             kept = self.config.keep_layers
             logger.info("[SlimVerifier] Enabled (kv_source=%s; shadow diagnostics only)", self.config.kv_source)
-            logger.info("[SlimVerifier] Target acceptance: Top-1 Diagnostic")
-            logger.info("[SlimVerifier] Slim acceptance strategy: %s", self.config.acceptance_strategy)
-            if self.config.acceptance_strategy == "probability_ratio":
+            logger.info("[SlimVerifier] Metrics mode: %s", self.config.metrics_mode)
+            if self.config.metrics_mode == "kl":
+                logger.info(
+                    "[SlimVerifier] KL(Draft || Slim), KL(Draft || Target), KL(Slim || Target); "
+                    "raw logits, temperature=1, vocabulary sum then token mean, units=nats"
+                )
+                logger.info(
+                    "[SlimVerifier] Private FP32 draft-logit capture: %.1f MiB on TP rank 0",
+                    self.draft_capture.logits.numel() * self.draft_capture.logits.element_size() / (1024**2),
+                )
+            else:
+                logger.info("[SlimVerifier] Target acceptance: Top-1 Diagnostic")
+                logger.info("[SlimVerifier] Slim acceptance strategy: %s", self.config.acceptance_strategy)
+            if self.config.metrics_mode == "acceptance" and self.config.acceptance_strategy == "probability_ratio":
                 logger.info(
                     "[SlimVerifier] Strict acceptance: q(x)/q(max) > %s",
                     self.config.probability_ratio_threshold,
@@ -143,7 +160,7 @@ class SlimVerifierEval:
             with self.context(inputs.numel()):
                 target_logits = self.verifier.target.compute_logits(hidden_states[indices])
                 start_event = end_event = None
-                if self.config.profile_latency:
+                if self.config.profile_latency and self.config.metrics_mode == "acceptance":
                     if hidden_states.device.type != "npu":
                         raise ValueError("profile_latency requires NPU Events on an NPU device")
                     start_event = torch.npu.Event(enable_timing=True)
@@ -163,10 +180,15 @@ class SlimVerifierEval:
                     raise RuntimeError("TP primary rank did not receive global model logits")
                 if target_logits.shape != (n, self.vocab_size) or slim_logits.shape != target_logits.shape:
                     raise RuntimeError("Slim Verifier requires complete global-vocabulary logits")
-                result = self.metrics.record(draft_tokens, target_logits, slim_logits, slim_ms)
-                result.request_id = batch.req_ids[req]
-                result.prediction_positions = positions
-                self.last_results.append(result)
+                if self.config.metrics_mode == "kl":
+                    state_index = int(batch.idx_mapping_np[req])
+                    draft_logits, aligned = self.draft_capture.read(state_index, positions, draft_tokens)
+                    self.metrics.record(draft_logits, slim_logits, target_logits, aligned)
+                else:
+                    result = self.metrics.record(draft_tokens, target_logits, slim_logits, slim_ms)
+                    result.request_id = batch.req_ids[req]
+                    result.prediction_positions = positions
+                    self.last_results.append(result)
 
     def flush(self) -> None:
         if self.metrics is not None:

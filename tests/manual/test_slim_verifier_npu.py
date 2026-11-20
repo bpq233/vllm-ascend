@@ -6,6 +6,7 @@ Run on an installed Ascend environment with the Qwen3-0.6B checkpoint:
 pytest tests/manual/test_slim_verifier_npu.py -v -s
 """
 
+import math
 from typing import Any
 
 import pytest
@@ -79,6 +80,56 @@ class SlimVerifierTestWorker:
 
 @pytest.mark.parametrize("tp_size", [1, 2])
 @pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "graph"])
+@wait_until_npu_memory_free()
+def test_slim_verifier_three_way_kl_npu(tp_size, enforce_eager, monkeypatch):
+    if not hasattr(torch, "npu") or torch.npu.device_count() < tp_size:
+        pytest.skip(f"Requires {tp_size} actual Ascend NPUs")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    baseline = None
+    for enabled in (False, True):
+        with VllmRunner(
+            MODEL,
+            tensor_parallel_size=tp_size,
+            dtype="bfloat16",
+            max_model_len=256,
+            max_num_seqs=3,
+            gpu_memory_utilization=0.6,
+            enforce_eager=enforce_eager,
+            seed=123,
+            enable_prefix_caching=True,
+            speculative_config={"method": "draft_model", "model": MODEL, "num_speculative_tokens": 3},
+            additional_config={
+                "slim_verifier_eval": {"enabled": enabled, "skip_layers": [], "metrics_mode": "kl", "log_interval": 1}
+            },
+            worker_extension_cls=f"{__name__}.SlimVerifierTestWorker",
+        ) as runner:
+            if enabled:
+                runner.model.collective_rpc("install_slim_probe", args=(False,))
+            outputs = (
+                runner.generate_greedy(PROMPTS, max_tokens=32),
+                runner.generate_greedy(PROMPTS[:1], max_tokens=16),
+            )
+            if not enabled:
+                baseline = outputs
+                continue
+            assert outputs == baseline
+            reports = runner.model.collective_rpc("read_slim_probe")
+            for report in reports:
+                metrics = report["metrics"]
+                if metrics is None:
+                    continue
+                assert metrics["draft_tokens"] > 0
+                for key in ("kl_draft_to_slim", "kl_draft_to_target", "kl_slim_to_target"):
+                    assert math.isfinite(metrics[key]) and metrics[key] >= 0
+                # All-layer Slim should reproduce Target, independent of how
+                # well the real drafter agrees with Target on these proposals.
+                assert metrics["kl_slim_to_target"] < 0.02
+                assert metrics["kl_draft_to_slim"] == pytest.approx(metrics["kl_draft_to_target"], abs=0.02)
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "graph"])
 @pytest.mark.parametrize("acceptance_strategy", ["top1", "probability_ratio"])
 @pytest.mark.parametrize("kv_source", ["target", "replay"])
 @wait_until_npu_memory_free()
@@ -113,6 +164,7 @@ def test_slim_verifier_npu(tp_size, enforce_eager, acceptance_strategy, kv_sourc
             "acceptance_strategy": acceptance_strategy,
             "probability_ratio_threshold": 0.5,
             "kv_source": kv_source,
+            "metrics_mode": "acceptance",
         }
         selection = {
             "full": {"skip_layers": []},
